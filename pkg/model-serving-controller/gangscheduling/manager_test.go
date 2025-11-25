@@ -750,8 +750,8 @@ func TestEqualResourceList(t *testing.T) {
 func TestEquslSubGroupNetworkTopology(t *testing.T) {
 	// test case 1: both parameters are nil or empty
 	t.Run("both nil or empty", func(t *testing.T) {
-		assert.True(t, equslSubGroupNetworkTopology(nil, nil))
-		assert.True(t, equslSubGroupNetworkTopology([]schedulingv1beta1.SubGroupPolicySpec{}, nil))
+		assert.True(t, equalSubGroupNetworkTopology(nil, nil))
+		assert.True(t, equalSubGroupNetworkTopology([]schedulingv1beta1.SubGroupPolicySpec{}, nil))
 	})
 
 	// test case 2: one parameter is nil or empty, the other is not
@@ -761,8 +761,8 @@ func TestEquslSubGroupNetworkTopology(t *testing.T) {
 			Mode:               "hard",
 			HighestTierAllowed: &highestTierAllowed,
 		}
-		assert.False(t, equslSubGroupNetworkTopology(nil, subGroupPolicy))
-		assert.False(t, equslSubGroupNetworkTopology([]schedulingv1beta1.SubGroupPolicySpec{}, subGroupPolicy))
+		assert.False(t, equalSubGroupNetworkTopology(nil, subGroupPolicy))
+		assert.False(t, equalSubGroupNetworkTopology([]schedulingv1beta1.SubGroupPolicySpec{}, subGroupPolicy))
 	})
 
 	// test case 3: MatchPolicy is nil
@@ -781,7 +781,7 @@ func TestEquslSubGroupNetworkTopology(t *testing.T) {
 			Mode:               "hard",
 			HighestTierAllowed: &highestTierAllowed,
 		}
-		assert.False(t, equslSubGroupNetworkTopology(subGroupPolicy, networkTopology))
+		assert.False(t, equalSubGroupNetworkTopology(subGroupPolicy, networkTopology))
 	})
 
 	// test case 4: MatchPolicy labels mismatch
@@ -807,7 +807,7 @@ func TestEquslSubGroupNetworkTopology(t *testing.T) {
 			Mode:               "hard",
 			HighestTierAllowed: &highestTierAllowed,
 		}
-		assert.False(t, equslSubGroupNetworkTopology(subGroupPolicy, networkTopology))
+		assert.False(t, equalSubGroupNetworkTopology(subGroupPolicy, networkTopology))
 	})
 
 	// test case 5: NetworkTopology mismatch
@@ -834,7 +834,7 @@ func TestEquslSubGroupNetworkTopology(t *testing.T) {
 			Mode:               "hard",
 			HighestTierAllowed: &highestTierAllowed1,
 		}
-		assert.False(t, equslSubGroupNetworkTopology(subGroupPolicy, networkTopology))
+		assert.False(t, equalSubGroupNetworkTopology(subGroupPolicy, networkTopology))
 	})
 
 	// test case 6: complete match
@@ -860,6 +860,6 @@ func TestEquslSubGroupNetworkTopology(t *testing.T) {
 			Mode:               "hard",
 			HighestTierAllowed: &highestTierAllowed,
 		}
-		assert.True(t, equslSubGroupNetworkTopology(subGroupPolicy, networkTopology))
+		assert.True(t, equalSubGroupNetworkTopology(subGroupPolicy, networkTopology))
 	})
 }

@@ -110,7 +110,8 @@ type ServingGroup struct {
 	// +optional
 	GangPolicy *GangPolicy `json:"gangPolicy,omitempty"`
 
-	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.	// +optional
+	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.
+	// +optional
 	NetworkTopology *NetworkTopology `json:"networkTopology,omitempty"`
 
 	// +kubebuilder:validation:MaxItems=4

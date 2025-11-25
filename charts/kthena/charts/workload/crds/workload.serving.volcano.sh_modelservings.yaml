@@ -142,19 +142,42 @@ spec:
                       scheduling policy for the roles of the group, it works only
                       when the scheduler supports network topology feature.\t// +optional"
                     properties:
-                      highestTierAllowed:
-                        default: 1
-                        description: HighestTierAllowed specifies the highest tier
-                          that a job allowed to cross when scheduling.
-                        type: integer
-                      mode:
-                        default: hard
-                        description: Mode specifies the mode of the network topology
-                          constrain.
-                        enum:
-                        - hard
-                        - soft
-                        type: string
+                      groupPolicy:
+                        description: GroupPolicy defines the network topology of the
+                          ServingGroup.
+                        properties:
+                          highestTierAllowed:
+                            default: 1
+                            description: HighestTierAllowed specifies the highest
+                              tier that a job allowed to cross when scheduling.
+                            type: integer
+                          mode:
+                            default: hard
+                            description: Mode specifies the mode of the network topology
+                              constrain.
+                            enum:
+                            - hard
+                            - soft
+                            type: string
+                        type: object
+                      rolePolicy:
+                        description: RolePolicy defines the network topology of the
+                          role.
+                        properties:
+                          highestTierAllowed:
+                            default: 1
+                            description: HighestTierAllowed specifies the highest
+                              tier that a job allowed to cross when scheduling.
+                            type: integer
+                          mode:
+                            default: hard
+                            description: Mode specifies the mode of the network topology
+                              constrain.
+                            enum:
+                            - hard
+                            - soft
+                            type: string
+                        type: object
                     type: object
                   restartGracePeriodSeconds:
                     default: 0

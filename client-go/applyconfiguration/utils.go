@@ -116,6 +116,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationworkloadv1alpha1.ModelStatusApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("ModelWorker"):
 		return &applyconfigurationworkloadv1alpha1.ModelWorkerApplyConfiguration{}
+	case workloadv1alpha1.SchemeGroupVersion.WithKind("NetworkTopology"):
+		return &applyconfigurationworkloadv1alpha1.NetworkTopologyApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("OptimizerConfiguration"):
 		return &applyconfigurationworkloadv1alpha1.OptimizerConfigurationApplyConfiguration{}
 	case workloadv1alpha1.SchemeGroupVersion.WithKind("OptimizerParam"):

@@ -576,6 +576,23 @@ _Appears in:_
 | `coordinator` | ModelWorkerTypeCoordinator represents a coordinator worker.<br /> |
 
 
+#### NetworkTopology
+
+
+
+NetworkTopologySpec defines the network topology affinity scheduling policy for the roles and group, it works only when the scheduler supports network topology feature.
+
+
+
+_Appears in:_
+- [ServingGroup](#servinggroup)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `groupPolicy` _[NetworkTopologySpec](#networktopologyspec)_ | GroupPolicy defines the network topology of the ServingGroup. |  |  |
+| `rolePolicy` _[NetworkTopologySpec](#networktopologyspec)_ | RolePolicy defines the network topology of the role. |  |  |
+
+
 #### OptimizerConfiguration
 
 
@@ -770,7 +787,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `restartGracePeriodSeconds` _integer_ | RestartGracePeriodSeconds defines the grace time for the controller to rebuild the ServingGroup when an error occurs<br />Defaults to 0 (ServingGroup will be rebuilt immediately after an error) | 0 |  |
 | `gangPolicy` _[GangPolicy](#gangpolicy)_ | GangPolicy defines the gang scheduler config. |  |  |
-| `networkTopology` _[NetworkTopologySpec](#networktopologyspec)_ | NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.	// +optional |  |  |
+| `networkTopology` _[NetworkTopology](#networktopology)_ | NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.	// +optional |  |  |
 | `roles` _[Role](#role) array_ |  |  | MaxItems: 4 <br />MinItems: 1 <br /> |
 
 

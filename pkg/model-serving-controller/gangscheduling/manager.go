@@ -120,7 +120,7 @@ func (m *Manager) createPodGroup(ctx context.Context, mi *workloadv1alpha1.Model
 		},
 	}
 
-	podGroup = m.buildNetworkTopologyPolicy(mi, podGroup)
+	podGroup = m.appendNetworkTopologyPolicy(mi, podGroup)
 
 	_, err := m.volcanoClient.SchedulingV1beta1().PodGroups(mi.Namespace).Create(ctx, podGroup, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
@@ -131,7 +131,7 @@ func (m *Manager) createPodGroup(ctx context.Context, mi *workloadv1alpha1.Model
 	return nil
 }
 
-func (m *Manager) buildNetworkTopologyPolicy(mi *workloadv1alpha1.ModelServing, podGroup *schedulingv1beta1.PodGroup) *schedulingv1beta1.PodGroup {
+func (m *Manager) appendNetworkTopologyPolicy(mi *workloadv1alpha1.ModelServing, podGroup *schedulingv1beta1.PodGroup) *schedulingv1beta1.PodGroup {
 	if mi.Spec.Template.NetworkTopology != nil {
 		// set NetworkTopology if configured in ModelServing
 		if mi.Spec.Template.NetworkTopology.GroupPolicy != nil {
@@ -301,7 +301,7 @@ func (m *Manager) updatePodGroupIfNeeded(ctx context.Context, existing *scheduli
 		}
 
 		if !equalSubGroupNetworkTopology(updated.Spec.SubGroupPolicy, mi.Spec.Template.NetworkTopology.RolePolicy) {
-			updated = m.buildNetworkTopologyPolicy(mi, updated)
+			updated = m.appendNetworkTopologyPolicy(mi, updated)
 			needsUpdate = true
 		}
 	}

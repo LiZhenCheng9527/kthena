@@ -36,10 +36,10 @@ type GangPolicy struct {
 
 // NetworkTopologySpec defines the network topology affinity scheduling policy for the roles and group, it works only when the scheduler supports network topology feature.
 type NetworkTopology struct {
-	// GroupPolicy defines the network topology of the ServingGroup.
+	// GroupPolicy defines the network topology scheduling requirement of  all the instances within the `ServingGroup`.
 	GroupPolicy *volcanoV1Beta1.NetworkTopologySpec `json:"groupPolicy,omitempty"`
 
-	// RolePolicy defines the network topology of the role.
+	// RolePolicy defines the fine-grained network topology scheduling requirement for instances of a `role`.
 	RolePolicy *volcanoV1Beta1.NetworkTopologySpec `json:"rolePolicy,omitempty"`
 }
 
@@ -110,7 +110,8 @@ type ServingGroup struct {
 	// +optional
 	GangPolicy *GangPolicy `json:"gangPolicy,omitempty"`
 
-	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the group, it works only when the scheduler supports network topology feature.
+	// NetworkTopology defines the network topology affinity scheduling policy for the roles of the `ServingGroup`,
+	// it works only when the scheduler supports network topology-aware scheduling.
 	// +optional
 	NetworkTopology *NetworkTopology `json:"networkTopology,omitempty"`
 

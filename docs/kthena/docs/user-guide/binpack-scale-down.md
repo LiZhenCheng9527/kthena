@@ -10,10 +10,10 @@ In Kthena, the Binpack Scale Down feature utilizes the `controller.kubernetes.io
 
 ### Prerequisites
 
-- A running Kubernetes cluster with Kthena installed. You can ues [Kind](https://kind.sigs.k8s.io/) or [minikube](https://minikube.sigs.k8s.io/docs/) to quickly set up a local cluster.
-- Create a modelServing. The replicas of servingGroup and Role is large than one.
+- A running Kubernetes cluster with Kthena installed. You can use [Kind](https://kind.sigs.k8s.io/) or [minikube](https://minikube.sigs.k8s.io/docs/) to quickly set up a local cluster.
+- Create a modelServing. The replicas of servingGroup and Role are large than one.
 
-### Geting Started
+### Getting Started
 
 After all pods managed by modelServing have been successfully deployed, use `kubectl get pod` to view the deployed pods.
 
@@ -37,7 +37,7 @@ Because kthena's binpack functionality relies on `controller.kubernetes.io/pod-d
 kubectl edit pod sample-1-decode-1-0
 ```
 
-Because kthena calculates the delectionCost for `Roles` and `ServingGroups` by summing the delectionCost of their respective pods, adding annotations to `sample-1-decode-1-0` will cause `sample-1` to score higher than `sample-0`. At this point, when we change the `ServingGroup` replicas from 2 to 1, we will observe that `sample-0` is deleted.
+Because kthena calculates the deletionCost for `Roles` and `ServingGroups` by summing the deletionCost of their respective pods, adding annotations to `sample-1-decode-1-0` will cause `sample-1` to score higher than `sample-0`. At this point, when we change the `ServingGroup` replicas from 2 to 1, we will observe that `sample-0` is deleted.
 
 ```sh
 kubectl get pod 
@@ -49,13 +49,14 @@ default              sample-1-prefill-0-0                                  1/1  
 default              sample-1-prefill-1-0                                  1/1     Running   0          23h
 ```
 
-Similarly, when we change the replicas for the role from 2 to 1, we will also see decode-0 and prefill-0 being deleted.
+Similarly, when we change the replicas for the `decode` Role from 2 to 1, we will also see `decode-0` and being deleted.
 
 ```sh
 kubectl get pod
 
 NAMESPACE            NAME                                                  READY   STATUS    RESTARTS   AGE
 default              sample-1-decode-1-0                                   1/1     Running   0          23h
+default              sample-1-prefill-0-0                                  1/1     Running   0          23h
 default              sample-1-prefill-1-0                                  1/1     Running   0          23h
 ```
 

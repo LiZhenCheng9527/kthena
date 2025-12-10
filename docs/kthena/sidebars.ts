@@ -62,6 +62,7 @@ const sidebars: SidebarsConfig = {
           ],
         },
         'user-guide/runtime',
+        'user-guide/binpack-scale-down',
         {
           type: 'category',
           label: 'Prefill Decode Disaggregation',

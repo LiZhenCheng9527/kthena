@@ -93,8 +93,6 @@ func (m *Manager) managePodGroups(ctx context.Context, mi *workloadv1alpha1.Mode
 	neededHandledPodGroupNameList := neededHandledPodGroupNameList(expectedReplicas, mi, servingGroupList)
 	// Create or update PodGroups for each ServingGroup
 	for _, podGroupName := range neededHandledPodGroupNameList {
-		// podGroupName := m.generatePodGroupName(mi.Name, i)
-
 		if existingPG, exists := existingPodGroups[podGroupName]; exists {
 			// Update existing PodGroup if needed
 			if err := m.updatePodGroupIfNeeded(ctx, existingPG, mi); err != nil {
@@ -113,8 +111,6 @@ func (m *Manager) managePodGroups(ctx context.Context, mi *workloadv1alpha1.Mode
 
 // createPodGroup creates a PodGroup for group-level gang scheduling
 func (m *Manager) createPodGroup(ctx context.Context, mi *workloadv1alpha1.ModelServing, podGroupName string) error {
-	// podGroupName := m.generatePodGroupName(mi.Name, groupIndex)
-
 	// Calculate total pods and resources for this ServingGroup
 	minMember, minTaskMember, minResources := m.calculateRequirements(mi, podGroupName)
 
@@ -173,11 +169,7 @@ func (m *Manager) calculateRequirements(mi *workloadv1alpha1.ModelServing, podGr
 		roleReplicas := int(*role.Replicas)
 		minRoleReplicas := roleReplicas // Default to all replicas
 
-		if mi.Spec.Template.GangPolicy == nil {
-			return minMember, minTaskMember, minResources
-		}
-
-		if mi.Spec.Template.GangPolicy.MinRoleReplicas != nil {
+		if mi.Spec.Template.GangPolicy != nil && mi.Spec.Template.GangPolicy.MinRoleReplicas != nil {
 			if minReplicas, exists := mi.Spec.Template.GangPolicy.MinRoleReplicas[role.Name]; exists {
 				minRoleReplicas = int(minReplicas)
 			}
@@ -200,9 +192,7 @@ func (m *Manager) calculateRequirements(mi *workloadv1alpha1.ModelServing, podGr
 		needHandledRoleNameList := needHandledRoleNameList(expectReplicas, roleList, role.Name)
 
 		// Only include role replicas up to the minimum required
-		// for roleIndex := 0; roleIndex < minRoleReplicas && roleIndex < roleReplicas; roleIndex++ {
 		for _, taskName := range needHandledRoleNameList {
-			// taskName := m.GenerateTaskName(role.Name, roleIndex)
 			podsPerTask := 1 + int(role.WorkerReplicas) // entry + workers
 			minTaskMember[taskName] = int32(podsPerTask)
 			minMember += podsPerTask

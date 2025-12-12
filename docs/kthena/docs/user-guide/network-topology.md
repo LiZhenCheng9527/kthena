@@ -31,7 +31,7 @@ spec:
     highestTierAllowed: 1
 ```
 
-In kthena's model serving, provides fields to configure Network Topology constraints for Serving Groups and Roles. For example, the following configuration means the ServingGroup can be deployed within HyperNodes of tier 2 or lower, such as s2. The Role can be deployed within HyperNodes of tier 1 or lower, such as s0 and s1.
+kthena's model serving, provides fields to configure Network Topology constraints for Serving Groups and Roles. For example, the following configuration means the ServingGroup can be deployed within HyperNodes of tier 2 or lower, such as s2. The Role can be deployed within HyperNodes of tier 1 or lower, such as s0 and s1.
 
 ```yaml
 spec:
@@ -55,9 +55,9 @@ spec:
 
 1. Create hyperNode resources
 
-We need to create a HyperNode resource to represent the network topology of our local cluster. The cluster I used for the demonstration example is a three-node Kubernetes cluster create by KinD, with the three nodes named `kthena-control-plane`, `kthena-worker`, and `kthena-worker2`.
+We need to create a HyperNode resource to represent the network topology of our local cluster. The cluster I used for the demonstration example is a three-node Kubernetes cluster created by KinD, with the three nodes named `kthena-control-plane`, `kthena-worker`, and `kthena-worker2`.
 
-The hypernode I created is as follows:
+The `HyperNode` I created is as follows:
 
 ```yaml
 apiVersion: topology.volcano.sh/v1alpha1
@@ -107,7 +107,7 @@ nodeName: kthena-worker
 nodeName: kthena-worker
 ```
 
-As can be seen, Kthena creates a `PodGroup`, and then Volcano deploys all pods to the compliant `Kthena-worker` based on the network topology policy configured within the PodGroup.
+As can be seen, Kthena creates a `PodGroup`, and then Volcano deploys all pods to the compliant `kthena-worker` based on the network topology policy configured within the PodGroup.
 
 If the deployed model serving instance lacks a NetworkTopology policy, the pod will be deployed randomly in either `kthena-worker` or `kthena-worker2`.
 
@@ -124,12 +124,12 @@ nodeName: kthena-worker2
 nodeName: kthena-worker
 ```
 
-**NOTO:** When using Network Topology Aware Scheduling with your own configuration, ensure that the provided `resources` in `role.entryTemplate` and `role.workerTemplate`.
+**NOTE:** When using Network Topology Aware Scheduling with your own configuration, ensure that `resources` are specified in `role.entryTemplate` and `role.workerTemplate`.
 
 ## Clean up
 
 ```bash
 kubectl delete modelserving sample
 
-kubectl delete hypernode s0 s1
+kubectl delete hypernode s0 s2
 ```

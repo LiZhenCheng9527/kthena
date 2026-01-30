@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 )
@@ -82,24 +83,18 @@ func GenerateRoleID(roleName string, idx int) string {
 	return roleName + "-" + strconv.Itoa(idx)
 }
 
-func generateEntryPodName(groupName, roleName string) string {
-	// entry-pod number starts from 0
-	// For example, EntryPodName is vllm-sample-0-prefill-1-0, represents the entry-pod in the second replica of the prefill role
-	return groupName + "-" + roleName + "-" + "0"
-}
-
 func GenerateControllerRevisionName(msName, revision string) string {
 	return msName + "-" + revision
 }
 
-func generateWorkerPodName(groupName, roleName string, podIndex int) string {
+func GeneratePodName(groupName, roleName string, podIndex int) string {
 	// worker-pod number starts from 1
 	// For example, WorkerPodName is vllm-sample-0-prefill-1-1, represents the first worker-pod in the second replica of the prefill role
 	return groupName + "-" + roleName + "-" + strconv.Itoa(podIndex)
 }
 
 func GenerateEntryPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, groupName string, roleIndex int, revision string) *corev1.Pod {
-	entryPodName := generateEntryPodName(groupName, GenerateRoleID(role.Name, roleIndex))
+	entryPodName := GeneratePodName(groupName, GenerateRoleID(role.Name, roleIndex), 0)
 	entryPod := createBasePod(role, ms, entryPodName, groupName, revision, roleIndex)
 	entryPod.ObjectMeta.Labels[workloadv1alpha1.EntryLabelKey] = Entry
 	addPodLabelAndAnnotation(entryPod, role.EntryTemplate.Metadata)
@@ -112,7 +107,7 @@ func GenerateEntryPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServ
 }
 
 func GenerateWorkerPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, entryPod *corev1.Pod, groupName string, roleIndex, podIndex int, revision string) *corev1.Pod {
-	workerPodName := generateWorkerPodName(groupName, GenerateRoleID(role.Name, roleIndex), podIndex)
+	workerPodName := GeneratePodName(groupName, GenerateRoleID(role.Name, roleIndex), podIndex)
 	workerPod := createBasePod(role, ms, workerPodName, groupName, revision, roleIndex)
 	addPodLabelAndAnnotation(workerPod, role.WorkerTemplate.Metadata)
 	workerPod.Spec = role.WorkerTemplate.Spec
@@ -230,7 +225,7 @@ func newModelServingOwnerRef(ms *workloadv1alpha1.ModelServing) metav1.OwnerRefe
 }
 
 func CreateHeadlessService(ctx context.Context, k8sClient kubernetes.Interface, ms *workloadv1alpha1.ModelServing, serviceSelector map[string]string, groupName, roleLabel string, roleIndex int) error {
-	serviceName := generateEntryPodName(groupName, GenerateRoleID(roleLabel, roleIndex))
+	serviceName := GeneratePodName(groupName, GenerateRoleID(roleLabel, roleIndex), 0)
 	headlessService := corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      serviceName,
@@ -275,6 +270,19 @@ func GetModelServingAndGroupByLabel(podLabels map[string]string) (string, string
 	return modelServingName, servingGroupName, true
 }
 
+// IsOwnedByModelServingWithUID returns true when the object is owned by the ModelServing with the provided UID.
+func IsOwnedByModelServingWithUID(obj metav1.Object, uid types.UID) bool {
+	for _, ownerRef := range obj.GetOwnerReferences() {
+		if ownerRef.APIVersion == workloadv1alpha1.SchemeGroupVersion.String() &&
+			ownerRef.Kind == workloadv1alpha1.ModelServingKind.Kind &&
+			ownerRef.UID == uid {
+			return true
+		}
+	}
+	klog.Warningf("object %s/%s is not owned by ModelServing with UID %s", obj.GetNamespace(), obj.GetName(), uid)
+	return false
+}
+
 // IsPodRunningAndReady returns true if pod is in the PodRunning Phase, if it has a condition of PodReady.
 func IsPodRunningAndReady(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodRunning && isPodReady(pod)
@@ -289,17 +297,17 @@ func CheckPodRevision(pod *corev1.Pod, revision string) bool {
 	return podRevision == revision
 }
 
-// PodRevision returns the revision label of the pod.
-func PodRevision(pod *corev1.Pod) string {
-	return pod.Labels[workloadv1alpha1.RevisionLabelKey]
+// ObjectRevision returns the revision label of the resource.
+func ObjectRevision(obj metav1.Object) string {
+	return obj.GetLabels()[workloadv1alpha1.RevisionLabelKey]
 }
 
-// GetRoleName returns the role name of the pod.
+// GetRoleName returns the role name of the resource.
 func GetRoleName(resource metav1.Object) string {
 	return resource.GetLabels()[workloadv1alpha1.RoleLabelKey]
 }
 
-// GetRoleID returns the role id of the pod.
+// GetRoleID returns the role id of the resource.
 func GetRoleID(resource metav1.Object) string {
 	return resource.GetLabels()[workloadv1alpha1.RoleIDKey]
 }
@@ -512,6 +520,8 @@ func getIndexKeyFromObject(obj interface{}) (map[string]string, string, bool) {
 	case *corev1.Pod:
 		return v.GetLabels(), v.GetNamespace(), true
 	case *corev1.Service:
+		return v.GetLabels(), v.GetNamespace(), true
+	case *schedulingv1beta1.PodGroup:
 		return v.GetLabels(), v.GetNamespace(), true
 	default:
 		return nil, "", false

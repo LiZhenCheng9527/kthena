@@ -37,7 +37,9 @@ import (
 	kubetesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	volcanofake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	volcanoinformers "volcano.sh/apis/pkg/client/informers/externalversions"
 
 	kthenafake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	informersv1alpha1 "github.com/volcano-sh/kthena/client-go/informers/externalversions"
@@ -49,6 +51,138 @@ import (
 type resourceSpec struct {
 	name   string
 	labels map[string]string
+}
+
+func TestCreateOrUpdatePodGroupByServingGroupRequeue(t *testing.T) {
+	controller := &ModelServingController{
+		podGroupManager: &podgroupmanager.Manager{},
+	}
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms",
+			Namespace: "default",
+		},
+	}
+
+	called := false
+	var delay time.Duration
+	patches := gomonkey.NewPatches()
+	patches.ApplyMethod(reflect.TypeOf(controller.podGroupManager), "CreateOrUpdatePodGroup", func(_ *podgroupmanager.Manager, _ context.Context, _ *workloadv1alpha1.ModelServing, _ string) (error, time.Duration) {
+		return fmt.Errorf("retry"), 2 * time.Second
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "enqueueModelServingAfter", func(_ *ModelServingController, _ *workloadv1alpha1.ModelServing, duration time.Duration) {
+		called = true
+		delay = duration
+	})
+	defer patches.Reset()
+
+	err := controller.createOrUpdatePodGroupByServingGroup(context.Background(), ms, "ms-0")
+	assert.NoError(t, err)
+	assert.True(t, called)
+	assert.Equal(t, 2*time.Second, delay)
+}
+
+func TestCreatePodAlreadyExistsRequeues(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	podInformer := informerFactory.Core().V1().Pods()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+	informerFactory.WaitForCacheSync(stopCh)
+
+	controller := &ModelServingController{
+		kubeClientSet: kubeClient,
+		podsLister:    podInformer.Lister(),
+		podsInformer:  podInformer.Informer(),
+	}
+
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms",
+			Namespace: "default",
+			UID:       types.UID("new-uid"),
+		},
+	}
+
+	existing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms-entry-0",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: workloadv1alpha1.SchemeGroupVersion.String(),
+					Kind:       workloadv1alpha1.ModelServingKind.Kind,
+					UID:        types.UID("old-uid"),
+				},
+			},
+		},
+	}
+
+	_, err := kubeClient.CoreV1().Pods("default").Create(context.Background(), existing, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, podInformer.Informer().GetIndexer().Add(existing))
+
+	newPod := existing.DeepCopy()
+	newPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: workloadv1alpha1.SchemeGroupVersion.String(),
+			Kind:       workloadv1alpha1.ModelServingKind.Kind,
+			UID:        ms.UID,
+		},
+	}
+
+	called := false
+	patches := gomonkey.NewPatches()
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "enqueueModelServingAfter", func(_ *ModelServingController, _ *workloadv1alpha1.ModelServing, _ time.Duration) {
+		called = true
+	})
+	defer patches.Reset()
+
+	err = controller.createPod(context.Background(), ms, "ms-0", "role", "role-0", newPod, true, nil, "entry")
+	assert.NoError(t, err)
+	assert.True(t, called)
+}
+
+func TestDeletePodGroupEnqueues(t *testing.T) {
+	controller := &ModelServingController{}
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms",
+			Namespace: "default",
+			UID:       types.UID("ms-uid"),
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ms-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				workloadv1alpha1.ModelServingNameLabelKey: ms.Name,
+				workloadv1alpha1.GroupNameLabelKey:        "ms-0",
+			},
+		},
+	}
+
+	called := false
+	patches := gomonkey.NewPatches()
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "getModelServingAndResourceDetails", func(_ *ModelServingController, _ metav1.Object) (*workloadv1alpha1.ModelServing, string, string, string) {
+		return ms, "ms-0", "", ""
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "shouldSkipHandling", func(_ *ModelServingController, _ *workloadv1alpha1.ModelServing, _ string, _ metav1.Object) bool {
+		return false
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "handleDeletionInProgress", func(_ *ModelServingController, _ *workloadv1alpha1.ModelServing, _ string, _ string, _ string) bool {
+		return false
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(controller), "enqueueModelServing", func(_ *ModelServingController, _ *workloadv1alpha1.ModelServing) {
+		called = true
+	})
+	defer patches.Reset()
+
+	controller.deletePodGroup(podGroup)
+	assert.True(t, called)
 }
 
 func TestIsServingGroupOutdated(t *testing.T) {
@@ -240,10 +374,14 @@ func TestIsServingGroupDeleted(t *testing.T) {
 	groupName := "test-ms-0"
 	otherGroupName := "other-group"
 
+	// TODO: Add a Test Helper to setup controller test environment
 	kubeClient := kubefake.NewSimpleClientset()
+	volcanoClient := volcanofake.NewSimpleClientset()
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	podInformer := kubeInformerFactory.Core().V1().Pods()
 	serviceInformer := kubeInformerFactory.Core().V1().Services()
+	podGroupInformerFactory := volcanoinformers.NewSharedInformerFactory(volcanoClient, 0)
+	podGroupInformer := podGroupInformerFactory.Scheduling().V1beta1().PodGroups()
 
 	err := podInformer.Informer().AddIndexers(cache.Indexers{
 		GroupNameKey: utils.GroupNameIndexFunc,
@@ -257,12 +395,23 @@ func TestIsServingGroupDeleted(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
+	err = podGroupInformer.Informer().AddIndexers(cache.Indexers{
+		GroupNameKey: utils.GroupNameIndexFunc,
+	})
+	assert.NoError(t, err)
+
 	store := datastore.New()
+	manager := podgroupmanager.NewManager(kubeClient, volcanoClient, apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD()), store, nil)
+	if manager != nil {
+		manager.PodGroupInformer = podGroupInformer.Informer()
+		manager.PodGroupLister = podGroupInformer.Lister()
+	}
 	controller := &ModelServingController{
 		podsInformer:     podInformer.Informer(),
 		servicesInformer: serviceInformer.Informer(),
 		podsLister:       podInformer.Lister(),
 		servicesLister:   serviceInformer.Lister(),
+		podGroupManager:  manager,
 		store:            store,
 	}
 
@@ -270,6 +419,8 @@ func TestIsServingGroupDeleted(t *testing.T) {
 	defer close(stop)
 	kubeInformerFactory.Start(stop)
 	kubeInformerFactory.WaitForCacheSync(stop)
+	podGroupInformerFactory.Start(stop)
+	podGroupInformerFactory.WaitForCacheSync(stop)
 
 	ms := &workloadv1alpha1.ModelServing{
 		ObjectMeta: metav1.ObjectMeta{

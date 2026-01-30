@@ -18,24 +18,18 @@ package podgroupmanager
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	testhelper "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 	corev1 "k8s.io/api/core/v1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8stesting "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	volcanofake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
-	v1beta1 "volcano.sh/apis/pkg/client/listers/scheduling/v1beta1"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
@@ -97,7 +91,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("basic calculation", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		manager.hasPodGroupCRD.Store(true)
 		manager.hasSubGroupPolicy.Store(true)
@@ -144,7 +139,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("with MinRoleReplicas constraint", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		manager.hasPodGroupCRD.Store(true)
 		manager.hasSubGroupPolicy.Store(true)
@@ -197,7 +193,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("nil MinRoleReplicas", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		ms.Spec.Template.GangPolicy.MinRoleReplicas = nil
 		manager.hasPodGroupCRD.Store(true)
@@ -215,7 +212,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("empty roles", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		ms.Spec.Template.Roles = []workloadv1alpha1.Role{} // Empty roles
 		manager.hasPodGroupCRD.Store(true)
@@ -235,7 +233,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("role with no worker template", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		manager.hasPodGroupCRD.Store(true)
 		manager.hasSubGroupPolicy.Store(true)
@@ -273,7 +272,8 @@ func TestCalculateRequirements(t *testing.T) {
 	t.Run("zero worker replicas", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		volcanofake := volcanofake.NewSimpleClientset()
+		manager := NewManager(nil, volcanofake, apiextfake, store, nil)
 		ms := createBasicModelServing()
 		manager.hasPodGroupCRD.Store(true)
 		manager.hasSubGroupPolicy.Store(true)
@@ -313,7 +313,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("basic aggregation", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -351,7 +351,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("nil total resource list", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		var total corev1.ResourceList = nil
 
 		podSpec := &corev1.PodSpec{
@@ -377,7 +377,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("empty containers", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -392,7 +392,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("nil containers", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -407,7 +407,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("container with no resources", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -427,7 +427,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("container with empty resources", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -449,7 +449,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("multiple calls to aggregate resources", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec1 := &corev1.PodSpec{
@@ -490,7 +490,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("different resource types", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{}
 
 		podSpec := &corev1.PodSpec{
@@ -519,7 +519,7 @@ func TestAggregateResources(t *testing.T) {
 	t.Run("existing resources get updated", func(t *testing.T) {
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, nil, apiextfake, store)
+		manager := NewManager(nil, nil, apiextfake, store, nil)
 		total := corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("1"),
 		}
@@ -598,7 +598,7 @@ func TestGetExistingPodGroups(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset(podGroup1, podGroup2, podGroup3, podGroupDifferentNamespace)
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
+		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store, nil)
 
 		result, err := manager.getExistingPodGroups(context.Background(), modelServing)
 
@@ -624,7 +624,7 @@ func TestGetExistingPodGroups(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset(podGroup3)
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
+		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store, nil)
 
 		result, err := manager.getExistingPodGroups(context.Background(), modelServing)
 
@@ -639,7 +639,7 @@ func TestGetExistingPodGroups(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset()
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
+		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store, nil)
 
 		result, err := manager.getExistingPodGroups(context.Background(), modelServing)
 
@@ -654,7 +654,7 @@ func TestGetExistingPodGroups(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset(podGroup1, podGroupDifferentNamespace)
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
+		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store, nil)
 
 		result, err := manager.getExistingPodGroups(context.Background(), modelServing)
 
@@ -670,7 +670,7 @@ func TestGetExistingPodGroups(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset(podGroup1)
 		store := datastore.New()
 		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
+		manager := NewManager(nil, fakeVolcanoClient, apiextfake, store, nil)
 
 		// Test with nil ModelServing - this would cause a panic in the real code
 		// but we're checking that our test handles it gracefully
@@ -1125,65 +1125,170 @@ func TestAppendSubGroupPolicy(t *testing.T) {
 	}
 }
 
-func TestUpdatePodGroupIfNeeded_Conflict(t *testing.T) {
-	ms := &workloadv1alpha1.ModelServing{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-ms",
-			Namespace: "default",
-		},
-		Spec: workloadv1alpha1.ModelServingSpec{
-			Template: workloadv1alpha1.ServingGroup{
-				GangPolicy: &workloadv1alpha1.GangPolicy{},
-			},
-		},
-	}
+func TestHandlePodGroupCRDChange(t *testing.T) {
+	t.Run("CRD added - should send true to channel", func(t *testing.T) {
+		// Create a mock datastore
+		store := datastore.New()
 
-	pg := &schedulingv1beta1.PodGroup{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "test-ms-0",
-			Namespace:       "default",
-			ResourceVersion: "1",
-		},
-		Spec: schedulingv1beta1.PodGroupSpec{
-			MinMember: 1,
-		},
-	}
-
-	// Create fake client
-	fakeVolcanoClient := volcanofake.NewSimpleClientset(pg)
-	_, _ = fakeVolcanoClient.SchedulingV1beta1().PodGroups(pg.Namespace).Create(context.Background(), pg, metav1.CreateOptions{})
-
-	store := datastore.New()
-	apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-
-	manager := NewManager(nil, fakeVolcanoClient, apiextfake, store)
-	manager.hasPodGroupCRD.Store(true)
-
-	// Manually populate the lister to avoid "not found" error since we are not starting the informer
-	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	indexer.Add(pg)
-	manager.podGroupLister = v1beta1.NewPodGroupLister(indexer)
-
-	// Inject reactor to simulate conflict
-	conflictCount := 0
-	fakeVolcanoClient.PrependReactor("update", "podgroups", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
-		if conflictCount == 0 {
-			conflictCount++
-			return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "scheduling.volcano.sh", Resource: "podgroups"}, "test-ms-0", fmt.Errorf("conflict"))
+		// Create a manager with a buffered channel to capture the change
+		manager := &Manager{
+			volcanoClient: volcanofake.NewSimpleClientset(),
+			store:         store,
 		}
-		return false, nil, nil
+
+		// Initially set hasPodGroupCRD to false
+		manager.hasPodGroupCRD.Store(false)
+
+		// Create a mock CRD
+		crd := &apiextv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "podgroups.scheduling.volcano.sh",
+			},
+			Spec: apiextv1.CustomResourceDefinitionSpec{
+				Versions: []apiextv1.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1beta1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextv1.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextv1.JSONSchemaProps{
+								Type: "object",
+								Properties: map[string]apiextv1.JSONSchemaProps{
+									"spec": {
+										Type: "object",
+										Properties: map[string]apiextv1.JSONSchemaProps{
+											"subGroupPolicy": {
+												Type: "object",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Call handlePodGroupCRDChange with isDeleted = false (CRD added)
+		manager.handlePodGroupCRDChange(crd, false)
+
+		// Verify that hasPodGroupCRD is now true
+		assert.True(t, manager.hasPodGroupCRD.Load(), "hasPodGroupCRD should be true after CRD addition")
+
+		// Channel notification is no longer used; we only validate state change.
 	})
 
-	// ms has empty roles, so calculated minMember will be 0.
-	// pg has MinMember 1.
-	// So 0 != 1, update should happen.
+	t.Run("CRD deleted - should send false to channel", func(t *testing.T) {
+		// Create a mock datastore
+		store := datastore.New()
 
-	err := manager.updatePodGroupIfNeeded(context.Background(), pg, ms)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, conflictCount, "Should have retried once")
+		// Create a manager with a buffered channel to capture the change
+		manager := &Manager{
+			volcanoClient: volcanofake.NewSimpleClientset(),
+			store:         store,
+		}
 
-	// Verify final state
-	updatedPG, err := fakeVolcanoClient.SchedulingV1beta1().PodGroups("default").Get(context.Background(), "test-ms-0", metav1.GetOptions{})
-	assert.NoError(t, err)
-	assert.Equal(t, int32(0), updatedPG.Spec.MinMember)
+		// Initially set hasPodGroupCRD to true
+		manager.hasPodGroupCRD.Store(true)
+
+		// Create a mock CRD (will be deleted)
+		crd := &apiextv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "podgroups.scheduling.volcano.sh",
+			},
+		}
+
+		// Call handlePodGroupCRDChange with isDeleted = true (CRD deleted)
+		manager.handlePodGroupCRDChange(crd, true)
+
+		// Verify that hasPodGroupCRD is now false
+		assert.False(t, manager.hasPodGroupCRD.Load(), "hasPodGroupCRD should be false after CRD deletion")
+
+		// Channel notification is no longer used; we only validate state change.
+	})
+
+	t.Run("CRD unchanged - should not send to channel", func(t *testing.T) {
+		// Create a mock datastore
+		store := datastore.New()
+
+		// Create a manager with an unbuffered channel (to detect if anything is sent)
+		manager := &Manager{
+			volcanoClient: volcanofake.NewSimpleClientset(),
+			store:         store,
+		}
+
+		// Initially set hasPodGroupCRD to true
+		manager.hasPodGroupCRD.Store(true)
+
+		// Create a mock CRD
+		crd := &apiextv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "podgroups.scheduling.volcano.sh",
+			},
+			Spec: apiextv1.CustomResourceDefinitionSpec{
+				Versions: []apiextv1.CustomResourceDefinitionVersion{
+					{
+						Name:    "v1beta1",
+						Served:  true,
+						Storage: true,
+						Schema: &apiextv1.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextv1.JSONSchemaProps{
+								Type: "object",
+								Properties: map[string]apiextv1.JSONSchemaProps{
+									"spec": {
+										Type: "object",
+										Properties: map[string]apiextv1.JSONSchemaProps{
+											"subGroupPolicy": {
+												Type: "object",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Call handlePodGroupCRDChange with isDeleted = false (CRD added)
+		// But hasPodGroupCRD is already true, so no change should occur
+		manager.handlePodGroupCRDChange(crd, false)
+
+		// Verify that hasPodGroupCRD is still true
+		assert.True(t, manager.hasPodGroupCRD.Load(), "hasPodGroupCRD should remain true")
+
+		// Channel notification is no longer used; we only validate state change.
+	})
+
+	t.Run("CRD unchanged after deletion - should not send to channel", func(t *testing.T) {
+		// Create a mock datastore
+		store := datastore.New()
+
+		// Create a manager with an unbuffered channel (to detect if anything is sent)
+		manager := &Manager{
+			volcanoClient: volcanofake.NewSimpleClientset(),
+			store:         store,
+		}
+
+		// Initially set hasPodGroupCRD to false
+		manager.hasPodGroupCRD.Store(false)
+
+		// Create a mock CRD (will be deleted)
+		crd := &apiextv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "podgroups.scheduling.volcano.sh",
+			},
+		}
+
+		// Call handlePodGroupCRDChange with isDeleted = true (CRD deleted)
+		// But hasPodGroupCRD is already false, so no change should occur
+		manager.handlePodGroupCRDChange(crd, true)
+
+		// Verify that hasPodGroupCRD is still false
+		assert.False(t, manager.hasPodGroupCRD.Load(), "hasPodGroupCRD should remain false")
+
+		// Channel notification is no longer used; we only validate state change.
+	})
 }

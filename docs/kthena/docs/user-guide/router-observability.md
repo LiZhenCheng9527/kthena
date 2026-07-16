@@ -96,6 +96,30 @@ Raw user identifiers are deliberately not exported. The `user_id` label is
 fixed to `_all`, keeping cardinality bounded and avoiding exposure of user
 identity through the metrics endpoint.
 
+### Metric schema migration
+
+This release adds `model_route`, `backend_type`, `backend_name`, and
+`upstream_model` to the existing request, request-duration, and token metrics.
+It also adds destination labels to
+`kthena_router_active_upstream_requests`. The metric names are unchanged, but
+the label sets are not. Prometheus therefore starts new time series after the
+Router upgrade; old counter series do not continue under the new labels.
+
+Update dashboards, alerts, recording rules, and tests that match an exact label
+set. To reproduce the previous aggregate view, sum over the destination labels:
+
+```promql
+sum by (model, path, status_code, error_type) (
+  rate(kthena_router_requests_total[5m])
+)
+```
+
+The label values come from Kubernetes objects and fixed enums, not request IDs,
+URLs, Secret names, or error text. Cardinality still grows with the product of
+ModelRoutes, backends, upstream models, paths, status codes, and error types.
+Estimate those combinations before upgrading, especially for clusters with many
+routes or long Prometheus retention.
+
 ### Tokenizer and cache-aware scheduling
 
 | Metric | Type | Labels | Description |

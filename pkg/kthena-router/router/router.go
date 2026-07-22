@@ -451,7 +451,6 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 					if proxyErr.origin != "" {
 						accesslog.SetErrorOrigin(c, proxyErr.origin)
 					}
-					accesslog.SetErrorOrigin(c, "router")
 					c.Set("finishReason", proxyErr.reason)
 					if !c.Writer.Written() {
 						c.AbortWithStatusJSON(proxyErr.statusCode, proxyErr.message)

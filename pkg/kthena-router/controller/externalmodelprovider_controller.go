@@ -40,6 +40,7 @@ import (
 	listerv1alpha1 "github.com/volcano-sh/kthena/client-go/listers/networking/v1alpha1"
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
 )
 
 type ExternalModelProviderController struct {
@@ -52,17 +53,12 @@ type ExternalModelProviderController struct {
 	registration                 cache.ResourceEventHandlerRegistration
 	secretRegistration           cache.ResourceEventHandlerRegistration
 
-	workqueue   workqueue.TypedRateLimitingInterface[any]
+	workqueue   workqueue.TypedRateLimitingInterface[QueueItem]
 	initialSync *atomic.Bool
 	store       datastore.Store
 }
 
 const externalModelProviderSecretRefIndex = "externalModelProviderSecretRef"
-
-type externalModelProviderQueueItem struct {
-	resourceType ResourceType
-	key          string
-}
 
 func NewExternalModelProviderController(
 	kthenaClient clientset.Interface,
@@ -85,7 +81,7 @@ func NewExternalModelProviderController(
 		secretLister:                 secretInformer.Lister(),
 		externalModelProviderSynced:  externalModelProviderInformer.Informer().HasSynced,
 		secretSynced:                 secretInformer.Informer().HasSynced,
-		workqueue:                    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]()),
+		workqueue:                    workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[QueueItem]()),
 		initialSync:                  &atomic.Bool{},
 		store:                        store,
 	}
@@ -95,8 +91,13 @@ func NewExternalModelProviderController(
 		AddFunc: controller.enqueueExternalModelProvider,
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueExternalModelProvider(new)
+			controller.enqueueProviderSecret(old)
+			controller.enqueueProviderSecret(new)
 		},
-		DeleteFunc: controller.enqueueExternalModelProvider,
+		DeleteFunc: func(obj interface{}) {
+			controller.enqueueExternalModelProvider(obj)
+			controller.enqueueProviderSecret(obj)
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to add event handler for externalmodelprovider controller: %w", err)
@@ -124,7 +125,7 @@ func (c *ExternalModelProviderController) Run(stopCh <-chan struct{}) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 	// add initialSync signal
-	c.workqueue.Add(initialSyncSignal)
+	c.workqueue.Add(QueueItem{})
 
 	go wait.Until(c.runWorker, time.Second, stopCh)
 
@@ -148,50 +149,34 @@ func (c *ExternalModelProviderController) processNextWorkItem() bool {
 	}
 	defer c.workqueue.Done(obj)
 
-	if obj == initialSyncSignal {
+	if obj.ResourceType == "" && obj.Key == "" {
 		klog.V(2).Info("initial external model providers have been synced")
 		c.workqueue.Forget(obj)
 		c.initialSync.Store(true)
 		return true
 	}
 
-	if key, ok := obj.(string); ok {
-		if err := c.syncHandler(key); err != nil {
-			if c.workqueue.NumRequeues(key) < maxRetries {
-				klog.V(2).Infof("error syncing externalModelProvider %q: %s, requeuing", key, err.Error())
-				c.workqueue.AddRateLimited(key)
-				return true
-			}
-			klog.V(2).Infof("giving up on syncing externalModelProvider %q after %d retries: %s", key, maxRetries, err)
-		}
+	var err error
+	switch obj.ResourceType {
+	case ResourceTypeExternalModelProvider:
+		err = c.syncHandler(obj.Key)
+	case ResourceTypeSecret:
+		err = c.syncSecretHandler(obj.Key)
+	default:
 		c.workqueue.Forget(obj)
+		utilruntime.HandleError(fmt.Errorf("unexpected resource type in workqueue: %s", obj.ResourceType))
 		return true
 	}
 
-	if item, ok := obj.(externalModelProviderQueueItem); ok {
-		var err error
-		switch item.resourceType {
-		case ResourceTypeSecret:
-			err = c.syncSecretHandler(item.key)
-		default:
-			c.workqueue.Forget(obj)
-			utilruntime.HandleError(fmt.Errorf("unexpected resource type in workqueue: %s", item.resourceType))
+	if err != nil {
+		if c.workqueue.NumRequeues(obj) < maxRetries {
+			klog.V(2).Infof("error syncing %s %q: %v, requeuing", obj.ResourceType, obj.Key, err)
+			c.workqueue.AddRateLimited(obj)
 			return true
 		}
-		if err != nil {
-			if c.workqueue.NumRequeues(item) < maxRetries {
-				klog.V(2).Infof("error syncing %s %q: %v, requeuing", item.resourceType, item.key, err)
-				c.workqueue.AddRateLimited(item)
-				return true
-			}
-			klog.V(2).Infof("giving up on syncing %s %q after %d retries: %v", item.resourceType, item.key, maxRetries, err)
-		}
-		c.workqueue.Forget(obj)
-		return true
+		klog.V(2).Infof("giving up on syncing %s %q after %d retries: %v", obj.ResourceType, obj.Key, maxRetries, err)
 	}
-
 	c.workqueue.Forget(obj)
-	utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
 	return true
 }
 
@@ -202,15 +187,34 @@ func (c *ExternalModelProviderController) syncHandler(key string) error {
 		return nil
 	}
 
+	providerName := types.NamespacedName{Namespace: namespace, Name: name}
+	previousProvider := c.store.GetExternalModelProvider(providerName)
 	provider, err := c.externalModelProviderLister.ExternalModelProviders(namespace).Get(name)
 	if errors.IsNotFound(err) {
-		_ = c.store.DeleteExternalModelProvider(types.NamespacedName{Namespace: namespace, Name: name})
-		return nil
+		if previousSecretName, ok := providerSecretName(previousProvider); ok {
+			if err := c.syncSecret(previousSecretName); err != nil {
+				return err
+			}
+		}
+		return c.store.DeleteExternalModelProvider(providerName)
 	}
 	if err != nil {
 		return err
 	}
 
+	if secretName, ok := providerSecretName(provider); ok {
+		if err := c.syncSecret(secretName); err != nil {
+			return err
+		}
+	}
+	if previousSecretName, ok := providerSecretName(previousProvider); ok {
+		currentSecretName, hasCurrentSecret := providerSecretName(provider)
+		if !hasCurrentSecret || previousSecretName != currentSecretName {
+			if err := c.syncSecret(previousSecretName); err != nil {
+				return err
+			}
+		}
+	}
 	if err := c.store.AddOrUpdateExternalModelProvider(provider); err != nil {
 		return err
 	}
@@ -225,34 +229,58 @@ func (c *ExternalModelProviderController) syncSecretHandler(key string) error {
 		return nil
 	}
 
-	secret, err := c.secretLister.Secrets(namespace).Get(name)
-	if errors.IsNotFound(err) {
-		_ = c.store.DeleteSecret(types.NamespacedName{Namespace: namespace, Name: name})
-		return c.reconcileProvidersForSecret(types.NamespacedName{Namespace: namespace, Name: name})
-	}
-	if err != nil {
-		return err
-	}
-
-	if err := c.store.AddOrUpdateSecret(secret); err != nil {
-		return err
-	}
-
-	return c.reconcileProvidersForSecret(types.NamespacedName{Namespace: namespace, Name: name})
-}
-
-func (c *ExternalModelProviderController) reconcileProvidersForSecret(secretName types.NamespacedName) error {
+	secretName := types.NamespacedName{Namespace: namespace, Name: name}
 	providers, err := c.externalModelProvidersForSecret(secretName)
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	if err := c.syncSecretForProviders(secretName, providers); err != nil {
+		return err
+	}
+
 	for _, provider := range providers {
-		if err := c.reconcileProviderStatus(provider); err != nil && firstErr == nil {
-			firstErr = err
+		c.workqueue.Add(QueueItem{
+			ResourceType: ResourceTypeExternalModelProvider,
+			Key:          types.NamespacedName{Namespace: provider.Namespace, Name: provider.Name}.String(),
+		})
+	}
+	return nil
+}
+
+func (c *ExternalModelProviderController) syncSecret(secretName types.NamespacedName) error {
+	providers, err := c.externalModelProvidersForSecret(secretName)
+	if err != nil {
+		return err
+	}
+	return c.syncSecretForProviders(secretName, providers)
+}
+
+func (c *ExternalModelProviderController) syncSecretForProviders(secretName types.NamespacedName, providers []*networkingv1alpha1.ExternalModelProvider) error {
+	if len(providers) == 0 {
+		return c.store.DeleteSecret(secretName)
+	}
+
+	secret, err := c.secretLister.Secrets(secretName.Namespace).Get(secretName.Name)
+	if errors.IsNotFound(err) {
+		return c.store.DeleteSecret(secretName)
+	}
+	if err != nil {
+		return err
+	}
+
+	projected := secret.DeepCopy()
+	projected.Data = make(map[string][]byte, len(providers))
+	for _, provider := range providers {
+		if provider.Spec.Auth == nil {
+			continue
+		}
+		key := provider.Spec.Auth.SecretRef.Key
+		if value, ok := secret.Data[key]; ok {
+			projected.Data[key] = append([]byte(nil), value...)
 		}
 	}
-	return firstErr
+	projected.StringData = nil
+	return c.store.AddOrUpdateSecret(projected)
 }
 
 func (c *ExternalModelProviderController) externalModelProvidersForSecret(secretName types.NamespacedName) ([]*networkingv1alpha1.ExternalModelProvider, error) {
@@ -284,6 +312,16 @@ func externalModelProviderSecretRefIndexFunc(obj interface{}) ([]string, error) 
 		Namespace: provider.Namespace,
 		Name:      provider.Spec.Auth.SecretRef.Name,
 	}.String()}, nil
+}
+
+func providerSecretName(provider *networkingv1alpha1.ExternalModelProvider) (types.NamespacedName, bool) {
+	if provider == nil || provider.Spec.Auth == nil || provider.Spec.Auth.SecretRef.Name == "" {
+		return types.NamespacedName{}, false
+	}
+	return types.NamespacedName{
+		Namespace: provider.Namespace,
+		Name:      provider.Spec.Auth.SecretRef.Name,
+	}, true
 }
 
 func (c *ExternalModelProviderController) reconcileProviderStatus(provider *networkingv1alpha1.ExternalModelProvider) error {
@@ -333,6 +371,11 @@ func (c *ExternalModelProviderController) reconcileProviderStatus(provider *netw
 		readyCondition.Reason = credentialCondition.Reason
 		readyCondition.Message = credentialCondition.Message
 	}
+	if err := providers.ValidateConfiguration(provider); err != nil {
+		readyCondition.Status = metav1.ConditionFalse
+		readyCondition.Reason = networkingv1alpha1.ExternalModelProviderReasonConfigurationInvalid
+		readyCondition.Message = "External provider configuration is invalid"
+	}
 
 	apimeta.SetStatusCondition(&status.Conditions, credentialCondition)
 	apimeta.SetStatusCondition(&status.Conditions, readyCondition)
@@ -356,7 +399,7 @@ func (c *ExternalModelProviderController) enqueueExternalModelProvider(obj inter
 		utilruntime.HandleError(err)
 		return
 	}
-	c.workqueue.Add(key)
+	c.workqueue.Add(QueueItem{ResourceType: ResourceTypeExternalModelProvider, Key: key})
 }
 
 func (c *ExternalModelProviderController) enqueueSecret(obj interface{}) {
@@ -365,5 +408,33 @@ func (c *ExternalModelProviderController) enqueueSecret(obj interface{}) {
 		utilruntime.HandleError(err)
 		return
 	}
-	c.workqueue.Add(externalModelProviderQueueItem{resourceType: ResourceTypeSecret, key: key})
+	c.workqueue.Add(QueueItem{ResourceType: ResourceTypeSecret, Key: key})
+}
+
+func (c *ExternalModelProviderController) enqueueProviderSecret(obj interface{}) {
+	provider, err := externalModelProviderFromEvent(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	secretName, ok := providerSecretName(provider)
+	if !ok {
+		return
+	}
+	c.workqueue.Add(QueueItem{ResourceType: ResourceTypeSecret, Key: secretName.String()})
+}
+
+func externalModelProviderFromEvent(obj interface{}) (*networkingv1alpha1.ExternalModelProvider, error) {
+	if provider, ok := obj.(*networkingv1alpha1.ExternalModelProvider); ok {
+		return provider, nil
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, fmt.Errorf("expected ExternalModelProvider event, got %T", obj)
+	}
+	provider, ok := tombstone.Obj.(*networkingv1alpha1.ExternalModelProvider)
+	if !ok {
+		return nil, fmt.Errorf("expected ExternalModelProvider in tombstone, got %T", tombstone.Obj)
+	}
+	return provider, nil
 }

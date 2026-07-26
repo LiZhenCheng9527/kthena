@@ -52,6 +52,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/connectors"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
@@ -1209,7 +1210,7 @@ func TestRouter_HandlerFunc_ExternalProviderPassesThroughNon2xx(t *testing.T) {
 	assert.Equal(t, "upstream_response", reason)
 }
 
-func TestRouter_HandlerFunc_ExternalProviderRequestBuildFailure(t *testing.T) {
+func TestRouter_HandlerFunc_ExternalProviderInvalidConfiguration(t *testing.T) {
 	store := datastore.New()
 	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
 	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
@@ -1236,10 +1237,10 @@ func TestRouter_HandlerFunc_ExternalProviderRequestBuildFailure(t *testing.T) {
 
 	router.HandlerFunc()(c)
 
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	reason, ok := c.Get("finishReason")
 	assert.True(t, ok)
-	assert.Equal(t, "provider_request_build", reason)
+	assert.Equal(t, "provider_config", reason)
 	assert.NotContains(t, w.Body.String(), "://invalid")
 }
 
@@ -1292,6 +1293,8 @@ func TestProxyExternalRequest_AnthropicStreamAggregatesUsage(t *testing.T) {
 		fmt.Fprint(w, "\n")
 		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":22}}\n")
 		fmt.Fprint(w, "\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n")
+		fmt.Fprint(w, "\n")
 	}))
 	defer upstream.Close()
 
@@ -1303,8 +1306,11 @@ func TestProxyExternalRequest_AnthropicStreamAggregatesUsage(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, upstream.URL, nil)
 	assert.NoError(t, err)
 
-	var got TokenUsage
-	err = proxyExternalRequest(c, req, aiv1alpha1.Anthropic, false, true, "default/anthropic-provider", func(usage TokenUsage) {
+	adapter, err := providers.NewAdapter(aiv1alpha1.Anthropic)
+	assert.NoError(t, err)
+
+	var got providers.TokenUsage
+	err = proxyExternalRequest(c, req, adapter.ResponseParser("/v1/messages"), false, true, "default/anthropic-provider", func(usage providers.TokenUsage) {
 		got = usage
 	})
 	assert.NoError(t, err)
@@ -1340,10 +1346,12 @@ func TestProxyExternalRequest_OpenAIResponsesStreamAggregatesUsage(t *testing.T)
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 			upstreamRequest, err := http.NewRequest(http.MethodPost, upstream.URL, nil)
 			assert.NoError(t, err)
+			adapter, err := providers.NewAdapter(providerType)
+			assert.NoError(t, err)
 
-			var got TokenUsage
+			var got providers.TokenUsage
 			callbackCount := 0
-			err = proxyExternalRequest(c, upstreamRequest, providerType, false, true, "default/openai-provider", func(usage TokenUsage) {
+			err = proxyExternalRequest(c, upstreamRequest, adapter.ResponseParser("/v1/responses"), false, true, "default/openai-provider", func(usage providers.TokenUsage) {
 				got = usage
 				callbackCount++
 			})

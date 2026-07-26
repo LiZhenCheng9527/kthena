@@ -39,6 +39,7 @@ const (
 	ExternalModelProviderConditionCredentialsResolved = "CredentialsResolved"
 
 	ExternalModelProviderReasonReady                 = "Ready"
+	ExternalModelProviderReasonConfigurationInvalid  = "ConfigurationInvalid"
 	ExternalModelProviderReasonCredentialNotRequired = "CredentialNotRequired"
 	ExternalModelProviderReasonCredentialResolved    = "CredentialResolved"
 	ExternalModelProviderReasonCredentialNotFound    = "CredentialNotFound"

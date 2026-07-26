@@ -26,11 +26,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	kubefake "k8s.io/client-go/kubernetes/fake"
-	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -141,7 +139,7 @@ func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 		assert.Nil(t, storedProvider)
 	})
 
-	t.Run("SecretSync", func(t *testing.T) {
+	t.Run("UnreferencedSecretIsNotStored", func(t *testing.T) {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "default",
@@ -168,10 +166,7 @@ func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 
 		err = controller.syncSecretHandler("default/provider-secret")
 		assert.NoError(t, err)
-
-		storedSecret := store.GetSecret(types.NamespacedName{Namespace: "default", Name: "provider-secret"})
-		assert.NotNil(t, storedSecret)
-		assert.Equal(t, []byte("test-key"), storedSecret.Data["api-key"])
+		assert.Nil(t, store.GetSecret(types.NamespacedName{Namespace: "default", Name: "provider-secret"}))
 
 		err = kubeClient.CoreV1().Secrets("default").Delete(
 			context.Background(), "provider-secret", metav1.DeleteOptions{})
@@ -259,6 +254,8 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 
 	err = controller.syncSecretHandler("default/provider-secret")
 	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonReady)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonCredentialResolved)
 
@@ -276,12 +273,15 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 
 	err = controller.syncSecretHandler("default/provider-secret")
 	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialKeyNotFound)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialKeyNotFound)
 
 	secretWithRotatedKey := secret.DeepCopy()
 	secretWithRotatedKey.Data = map[string][]byte{
-		"api-key": []byte("rotated-key"),
+		"api-key":      []byte("rotated-key"),
+		"unreferenced": []byte("must-not-be-cached"),
 	}
 	_, err = kubeClient.CoreV1().Secrets("default").Update(context.Background(), secretWithRotatedKey, metav1.UpdateOptions{})
 	assert.NoError(t, err)
@@ -293,9 +293,12 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 
 	err = controller.syncSecretHandler("default/provider-secret")
 	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
 	storedSecret := store.GetSecret(types.NamespacedName{Namespace: "default", Name: "provider-secret"})
 	if assert.NotNil(t, storedSecret) {
 		assert.Equal(t, []byte("rotated-key"), storedSecret.Data["api-key"])
+		assert.NotContains(t, storedSecret.Data, "unreferenced")
 	}
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonReady)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonCredentialResolved)
@@ -310,8 +313,53 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 
 	err = controller.syncSecretHandler("default/provider-secret")
 	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialNotFound)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialNotFound)
+}
+
+func TestExternalModelProviderController_StatusForInvalidConfiguration(t *testing.T) {
+	provider := &aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "invalid-provider",
+			Generation: 1,
+		},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType: aiv1alpha1.OpenAI,
+			BaseURL:      "http://api.example.com",
+		},
+	}
+	kthenaClient := kthenafake.NewSimpleClientset(provider)
+	kubeClient := kubefake.NewSimpleClientset()
+	controller, err := NewExternalModelProviderController(
+		kthenaClient,
+		informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0),
+		informers.NewSharedInformerFactory(kubeClient, 0),
+		datastore.New(),
+	)
+	assert.NoError(t, err)
+
+	assert.NoError(t, controller.reconcileProviderStatus(provider))
+	assertProviderCondition(
+		t,
+		kthenaClient,
+		provider.Namespace,
+		provider.Name,
+		aiv1alpha1.ExternalModelProviderConditionReady,
+		metav1.ConditionFalse,
+		aiv1alpha1.ExternalModelProviderReasonConfigurationInvalid,
+	)
+	assertProviderCondition(
+		t,
+		kthenaClient,
+		provider.Namespace,
+		provider.Name,
+		aiv1alpha1.ExternalModelProviderConditionCredentialsResolved,
+		metav1.ConditionTrue,
+		aiv1alpha1.ExternalModelProviderReasonCredentialNotRequired,
+	)
 }
 
 func assertProviderCondition(t *testing.T, client *kthenafake.Clientset, namespace, name, conditionType string, status metav1.ConditionStatus, reason string) {
@@ -358,13 +406,13 @@ func TestExternalModelProviderController_WorkQueueProcessing(t *testing.T) {
 
 	t.Run("InitialSyncSignal", func(t *testing.T) {
 		assert.False(t, controller.HasSynced())
-		controller.workqueue.Add(initialSyncSignal)
+		controller.workqueue.Add(QueueItem{})
 		controller.processNextWorkItem()
 		assert.True(t, controller.HasSynced())
 	})
 
 	t.Run("UnknownResourceType", func(t *testing.T) {
-		controller.workqueue.Add(12345)
+		controller.workqueue.Add(QueueItem{ResourceType: "Unknown", Key: "default/object"})
 		result := controller.processNextWorkItem()
 		assert.True(t, result)
 	})
@@ -385,7 +433,7 @@ func TestExternalModelProviderController_SuccessForgetsRetryHistory(t *testing.T
 
 	controller.workqueue.ShutDown()
 	controller.workqueue = workqueue.NewTypedRateLimitingQueue(
-		workqueue.NewTypedItemExponentialFailureRateLimiter[any](0, 0),
+		workqueue.NewTypedItemExponentialFailureRateLimiter[QueueItem](0, 0),
 	)
 	defer controller.workqueue.ShutDown()
 
@@ -393,14 +441,14 @@ func TestExternalModelProviderController_SuccessForgetsRetryHistory(t *testing.T
 	provider.Spec.Auth = nil
 	assert.NoError(t, controller.externalModelProviderIndexer.Add(provider))
 
-	key := "default/openai-provider"
-	controller.workqueue.AddRateLimited(key)
-	assert.Equal(t, 1, controller.workqueue.NumRequeues(key))
+	item := QueueItem{ResourceType: ResourceTypeExternalModelProvider, Key: "default/openai-provider"}
+	controller.workqueue.AddRateLimited(item)
+	assert.Equal(t, 1, controller.workqueue.NumRequeues(item))
 	assert.True(t, controller.processNextWorkItem())
-	assert.Zero(t, controller.workqueue.NumRequeues(key))
+	assert.Zero(t, controller.workqueue.NumRequeues(item))
 }
 
-func TestExternalModelProviderController_ReconcileSecretContinuesAfterStatusFailure(t *testing.T) {
+func TestExternalModelProviderController_SecretSyncEnqueuesAffectedProviders(t *testing.T) {
 	secretName := types.NamespacedName{Namespace: "default", Name: "provider-secret"}
 	providers := []*aiv1alpha1.ExternalModelProvider{
 		{
@@ -422,7 +470,7 @@ func TestExternalModelProviderController_ReconcileSecretContinuesAfterStatusFail
 			}},
 		},
 	}
-	kthenaClient := kthenafake.NewSimpleClientset(providers[0], providers[1])
+	kthenaClient := kthenafake.NewSimpleClientset()
 	kubeClient := kubefake.NewSimpleClientset()
 	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
@@ -437,19 +485,20 @@ func TestExternalModelProviderController_ReconcileSecretContinuesAfterStatusFail
 		Data:       map[string][]byte{"api-key": []byte("key")},
 	}))
 
-	var updated []string
-	kthenaClient.PrependReactor("update", "externalmodelproviders", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		provider := action.(clienttesting.UpdateAction).GetObject().(*aiv1alpha1.ExternalModelProvider)
-		updated = append(updated, provider.Name)
-		if provider.Name == "first-provider" {
-			return true, nil, errors.New("status update failed")
-		}
-		return false, nil, nil
-	})
-
-	err = controller.reconcileProvidersForSecret(secretName)
-	assert.EqualError(t, err, "status update failed")
-	assert.ElementsMatch(t, []string{"first-provider", "second-provider"}, updated)
+	err = controller.syncSecretHandler(secretName.String())
+	assert.NoError(t, err)
+	var got []QueueItem
+	for controller.workqueue.Len() > 0 {
+		item, shutdown := controller.workqueue.Get()
+		assert.False(t, shutdown)
+		got = append(got, item)
+		controller.workqueue.Done(item)
+		controller.workqueue.Forget(item)
+	}
+	assert.ElementsMatch(t, []QueueItem{
+		{ResourceType: ResourceTypeExternalModelProvider, Key: "default/first-provider"},
+		{ResourceType: ResourceTypeExternalModelProvider, Key: "default/second-provider"},
+	}, got)
 }
 
 func TestExternalModelProviderController_EnqueueDeletedFinalStateUnknown(t *testing.T) {
@@ -470,7 +519,7 @@ func TestExternalModelProviderController_EnqueueDeletedFinalStateUnknown(t *test
 		tombstoneKey string
 		object       interface{}
 		enqueue      func(interface{})
-		want         interface{}
+		want         QueueItem
 	}{
 		{
 			name:         "ExternalModelProvider",
@@ -480,7 +529,10 @@ func TestExternalModelProviderController_EnqueueDeletedFinalStateUnknown(t *test
 				Name:      "openai-provider",
 			}},
 			enqueue: controller.enqueueExternalModelProvider,
-			want:    "default/openai-provider",
+			want: QueueItem{
+				ResourceType: ResourceTypeExternalModelProvider,
+				Key:          "default/openai-provider",
+			},
 		},
 		{
 			name:         "Secret",
@@ -490,9 +542,9 @@ func TestExternalModelProviderController_EnqueueDeletedFinalStateUnknown(t *test
 				Name:      "provider-secret",
 			}},
 			enqueue: controller.enqueueSecret,
-			want: externalModelProviderQueueItem{
-				resourceType: ResourceTypeSecret,
-				key:          "default/provider-secret",
+			want: QueueItem{
+				ResourceType: ResourceTypeSecret,
+				Key:          "default/provider-secret",
 			},
 		},
 	}
@@ -512,6 +564,34 @@ func TestExternalModelProviderController_EnqueueDeletedFinalStateUnknown(t *test
 				controller.workqueue.Forget(item)
 			}
 		})
+	}
+}
+
+func TestExternalModelProviderController_EnqueueProviderSecretFromTombstone(t *testing.T) {
+	kthenaClient := kthenafake.NewSimpleClientset()
+	kubeClient := kubefake.NewSimpleClientset()
+	controller, err := NewExternalModelProviderController(
+		kthenaClient,
+		informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0),
+		informers.NewSharedInformerFactory(kubeClient, 0),
+		datastore.New(),
+	)
+	assert.NoError(t, err)
+
+	controller.enqueueProviderSecret(cache.DeletedFinalStateUnknown{
+		Key: "default/openai-provider",
+		Obj: providerWithSecretRef("default", "openai-provider", "provider-secret"),
+	})
+
+	if assert.Equal(t, 1, controller.workqueue.Len()) {
+		item, shutdown := controller.workqueue.Get()
+		assert.False(t, shutdown)
+		assert.Equal(t, QueueItem{
+			ResourceType: ResourceTypeSecret,
+			Key:          "default/provider-secret",
+		}, item)
+		controller.workqueue.Done(item)
+		controller.workqueue.Forget(item)
 	}
 }
 
@@ -545,6 +625,104 @@ func TestExternalModelProviderController_ProvidersForSecretUsesReferenceIndex(t 
 	if assert.Len(t, got, 1) {
 		assert.Equal(t, "provider-a", got[0].Name)
 	}
+}
+
+func TestExternalModelProviderController_ProviderSyncManagesReferencedSecrets(t *testing.T) {
+	kthenaClient := kthenafake.NewSimpleClientset()
+	kubeClient := kubefake.NewSimpleClientset()
+	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
+	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	store := datastore.New()
+	controller, err := NewExternalModelProviderController(
+		kthenaClient,
+		kthenaInformerFactory,
+		kubeInformerFactory,
+		store,
+	)
+	assert.NoError(t, err)
+	controller.kthenaClient = nil
+
+	providerName := types.NamespacedName{Namespace: "default", Name: "provider"}
+	oldProvider := providerWithSecretRef(providerName.Namespace, providerName.Name, "old-secret")
+	newProvider := providerWithSecretRef(providerName.Namespace, providerName.Name, "new-secret")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(oldProvider))
+	assert.NoError(t, store.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "old-secret"},
+		Data:       map[string][]byte{"api-key": []byte("old")},
+	}))
+	assert.NoError(t, controller.externalModelProviderIndexer.Add(newProvider))
+
+	secretInformer := kubeInformerFactory.Core().V1().Secrets()
+	assert.NoError(t, secretInformer.Informer().GetIndexer().Add(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "new-secret"},
+		Data: map[string][]byte{
+			"api-key":      []byte("new"),
+			"unreferenced": []byte("must-not-be-cached"),
+		},
+	}))
+
+	assert.NoError(t, controller.syncHandler(providerName.String()))
+	assert.Nil(t, store.GetSecret(types.NamespacedName{Namespace: "default", Name: "old-secret"}))
+	stored := store.GetSecret(types.NamespacedName{Namespace: "default", Name: "new-secret"})
+	if assert.NotNil(t, stored) {
+		assert.Equal(t, map[string][]byte{"api-key": []byte("new")}, stored.Data)
+	}
+
+	assert.NoError(t, controller.externalModelProviderIndexer.Delete(newProvider))
+	assert.NoError(t, controller.syncHandler(providerName.String()))
+	assert.Nil(t, store.GetExternalModelProvider(providerName))
+	assert.Nil(t, store.GetSecret(types.NamespacedName{Namespace: "default", Name: "new-secret"}))
+}
+
+func TestExternalModelProviderController_ProviderSyncRetainsOldReferenceForRetry(t *testing.T) {
+	kthenaClient := kthenafake.NewSimpleClientset()
+	kubeClient := kubefake.NewSimpleClientset()
+	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
+	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	baseStore := datastore.New()
+	store := &failSecretDeleteStore{Store: baseStore, fail: true}
+	controller, err := NewExternalModelProviderController(
+		kthenaClient,
+		kthenaInformerFactory,
+		kubeInformerFactory,
+		store,
+	)
+	assert.NoError(t, err)
+	controller.kthenaClient = nil
+
+	providerName := types.NamespacedName{Namespace: "default", Name: "provider"}
+	oldProvider := providerWithSecretRef(providerName.Namespace, providerName.Name, "old-secret")
+	newProvider := providerWithSecretRef(providerName.Namespace, providerName.Name, "new-secret")
+	assert.NoError(t, baseStore.AddOrUpdateExternalModelProvider(oldProvider))
+	assert.NoError(t, baseStore.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "old-secret"},
+		Data:       map[string][]byte{"api-key": []byte("old")},
+	}))
+	assert.NoError(t, controller.externalModelProviderIndexer.Add(newProvider))
+	assert.NoError(t, kubeInformerFactory.Core().V1().Secrets().Informer().GetIndexer().Add(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "new-secret"},
+		Data:       map[string][]byte{"api-key": []byte("new")},
+	}))
+
+	assert.Error(t, controller.syncHandler(providerName.String()))
+	assert.Equal(t, "old-secret", baseStore.GetExternalModelProvider(providerName).Spec.Auth.SecretRef.Name)
+
+	store.fail = false
+	assert.NoError(t, controller.syncHandler(providerName.String()))
+	assert.Equal(t, "new-secret", baseStore.GetExternalModelProvider(providerName).Spec.Auth.SecretRef.Name)
+	assert.Nil(t, baseStore.GetSecret(types.NamespacedName{Namespace: "default", Name: "old-secret"}))
+}
+
+type failSecretDeleteStore struct {
+	datastore.Store
+	fail bool
+}
+
+func (s *failSecretDeleteStore) DeleteSecret(name types.NamespacedName) error {
+	if s.fail {
+		return errors.New("injected Secret deletion failure")
+	}
+	return s.Store.DeleteSecret(name)
 }
 
 func providerWithSecretRef(namespace, name, secretName string) *aiv1alpha1.ExternalModelProvider {

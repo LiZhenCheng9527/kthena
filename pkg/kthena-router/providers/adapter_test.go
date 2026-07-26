@@ -42,6 +42,7 @@ func TestOpenAIAdapterBuildRequest(t *testing.T) {
 	req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
 	req.Header.Set("X-Should-Not-Forward", "no")
 	req.Header.Set("x-api-key", "downstream-key")
+	req.Header.Set("Anthropic-Version", "must-not-leak")
 	providerModel := "gpt-4o-mini"
 	provider := &networkingv1alpha1.ExternalModelProvider{
 		ObjectMeta: metav1.ObjectMeta{
@@ -98,6 +99,7 @@ func TestOpenAIAdapterBuildRequest(t *testing.T) {
 	assert.Equal(t, "Bearer provider-key", upstream.Header.Get("Authorization"))
 	assert.Equal(t, "", upstream.Header.Get("Cookie"))
 	assert.Equal(t, "", upstream.Header.Get("x-api-key"))
+	assert.Equal(t, "", upstream.Header.Get("Anthropic-Version"))
 	assert.Equal(t, "", upstream.Header.Get("X-Should-Not-Forward"))
 	assert.Equal(t, "text/event-stream", upstream.Header.Get("Accept"))
 	assert.Equal(t, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00", upstream.Header.Get("Traceparent"))
@@ -174,6 +176,52 @@ func TestOpenAIAdapterBuildRequestMergesStreamingUsageOption(t *testing.T) {
 	tokenUsageInjected, exists := c.Get(common.TokenUsageKey)
 	assert.True(t, exists)
 	assert.Equal(t, true, tokenUsageInjected)
+}
+
+func TestOpenAIAdapterBuildRequestPreservesInvalidStreamingUsageOptions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	provider := &networkingv1alpha1.ExternalModelProvider{
+		Spec: networkingv1alpha1.ExternalModelProviderSpec{
+			ProviderType: networkingv1alpha1.OpenAI,
+			BaseURL:      "https://api.example.com",
+		},
+	}
+	adapter, err := NewAdapter(provider.Spec.ProviderType)
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		streamOptions interface{}
+	}{
+		{
+			name:          "stream options is not an object",
+			streamOptions: "invalid",
+		},
+		{
+			name: "include usage is not a boolean",
+			streamOptions: map[string]interface{}{
+				"include_usage": "invalid",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			upstream, err := adapter.BuildRequest(c, req, provider, nil, map[string]interface{}{
+				"model":          "m",
+				"stream":         true,
+				"stream_options": tt.streamOptions,
+			})
+			assert.NoError(t, err)
+
+			var got map[string]interface{}
+			assert.NoError(t, json.NewDecoder(upstream.Body).Decode(&got))
+			assert.Equal(t, tt.streamOptions, got["stream_options"])
+			_, tokenUsageInjected := c.Get(common.TokenUsageKey)
+			assert.False(t, tokenUsageInjected)
+		})
+	}
 }
 
 func TestOpenAIAdapterBuildRequestDoesNotDuplicateV1WhenBaseURLHasPath(t *testing.T) {
@@ -388,6 +436,95 @@ func TestAnthropicAdapterBuildRequestDoesNotDuplicateV1(t *testing.T) {
 	assert.Equal(t, "https://api.example.com/v1/messages?trace=true", upstream.URL.String())
 }
 
+func TestAnthropicAdapterForwardsProtocolVersionHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	provider := &networkingv1alpha1.ExternalModelProvider{
+		Spec: networkingv1alpha1.ExternalModelProviderSpec{
+			ProviderType: networkingv1alpha1.Anthropic,
+			BaseURL:      "https://api.anthropic.com",
+		},
+	}
+
+	adapter, err := NewAdapter(provider.Spec.ProviderType)
+	assert.NoError(t, err)
+	upstream, err := adapter.BuildRequest(c, req, provider, nil, map[string]interface{}{"model": "m"})
+	assert.NoError(t, err)
+	assert.Equal(t, "2023-06-01", upstream.Header.Get("Anthropic-Version"))
+}
+
+func TestOpenAIAdapterResponseParser(t *testing.T) {
+	adapter, err := NewAdapter(networkingv1alpha1.OpenAI)
+	assert.NoError(t, err)
+
+	t.Run("chat completions", func(t *testing.T) {
+		parser := adapter.ResponseParser("/v1/chat/completions")
+
+		usage, ok := parser.ParseStreamLine(`data: {"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+		assert.True(t, ok)
+		assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, usage)
+
+		usage, ok = parser.ParseBody([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`))
+		assert.True(t, ok)
+		assert.Equal(t, TokenUsage{PromptTokens: 7, CompletionTokens: 5, TotalTokens: 12}, usage)
+
+		usage, ok = parser.ParseBody([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":0,"total_tokens":7}}`))
+		assert.True(t, ok)
+		assert.Equal(t, TokenUsage{PromptTokens: 7, TotalTokens: 7}, usage)
+
+		parser.RecordStreamLineWritten("data: [DONE]\n")
+		assert.True(t, parser.StreamCompleted())
+	})
+
+	t.Run("responses", func(t *testing.T) {
+		parser := adapter.ResponseParser("/v1/responses")
+
+		_, ok := parser.ParseStreamLine(`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}`)
+		assert.False(t, ok)
+		_, ok = parser.FinalStreamUsage()
+		assert.False(t, ok, "usage from an incomplete stream must not be recorded")
+		parser.RecordStreamLineWritten(`data: {"type":"response.completed"}`)
+		assert.True(t, parser.StreamCompleted())
+
+		usage, ok := parser.FinalStreamUsage()
+		assert.True(t, ok)
+		assert.Equal(t, TokenUsage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15}, usage)
+
+		usage, ok = adapter.ResponseParser("/v1/responses").ParseBody([]byte(`{"usage":{"input_tokens":8,"output_tokens":2}}`))
+		assert.True(t, ok)
+		assert.Equal(t, TokenUsage{PromptTokens: 8, CompletionTokens: 2, TotalTokens: 10}, usage)
+	})
+}
+
+func TestAnthropicAdapterResponseParser(t *testing.T) {
+	adapter, err := NewAdapter(networkingv1alpha1.Anthropic)
+	assert.NoError(t, err)
+	parser := adapter.ResponseParser("/v1/messages")
+
+	_, ok := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1}}}`)
+	assert.False(t, ok)
+	_, ok = parser.ParseStreamLine(`data: {"type":"message_delta","usage":{"output_tokens":22}}`)
+	assert.False(t, ok)
+	_, ok = parser.FinalStreamUsage()
+	assert.False(t, ok, "usage from an incomplete stream must not be recorded")
+	parser.RecordStreamLineWritten(`data: {"type":"message_stop"}`)
+	assert.True(t, parser.StreamCompleted())
+
+	usage, ok := parser.FinalStreamUsage()
+	assert.True(t, ok)
+	assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, usage)
+
+	usage, ok = adapter.ResponseParser("/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":4}}`))
+	assert.True(t, ok)
+	assert.Equal(t, TokenUsage{PromptTokens: 9, CompletionTokens: 4, TotalTokens: 13}, usage)
+
+	usage, ok = adapter.ResponseParser("/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":0}}`))
+	assert.True(t, ok)
+	assert.Equal(t, TokenUsage{PromptTokens: 9, TotalTokens: 9}, usage)
+}
+
 func TestBuildRequestRequiresConfiguredSecretKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -410,6 +547,8 @@ func TestBuildRequestRequiresConfiguredSecretKey(t *testing.T) {
 	assert.NoError(t, err)
 	_, err = adapter.BuildRequest(c, req, provider, secret, map[string]interface{}{"model": "m"})
 	assert.Error(t, err)
+	var configurationError *ConfigurationError
+	assert.ErrorAs(t, err, &configurationError)
 }
 
 func TestBuildRequestRejectsProtocolPathMismatch(t *testing.T) {
@@ -469,6 +608,63 @@ func TestBuildRequestRejectsReservedStaticHeaders(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestBuildRequestRejectsInvalidRuntimeConfiguration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name    string
+		baseURL string
+		headers map[string]string
+	}{
+		{
+			name:    "plain HTTP URL",
+			baseURL: "http://api.example.com",
+		},
+		{
+			name:    "URL without host",
+			baseURL: "https:///v1",
+		},
+		{
+			name:    "URL with userinfo",
+			baseURL: "https://user@example.com",
+		},
+		{
+			name:    "URL with query",
+			baseURL: "https://api.example.com?debug=true",
+		},
+		{
+			name:    "invalid header name",
+			baseURL: "https://api.example.com",
+			headers: map[string]string{"Bad Header": "value"},
+		},
+		{
+			name:    "invalid header value",
+			baseURL: "https://api.example.com",
+			headers: map[string]string{"X-Tenant": "tenant-a\r\nX-Injected: true"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			provider := &networkingv1alpha1.ExternalModelProvider{
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      tt.baseURL,
+					Headers:      tt.headers,
+				},
+			}
+			adapter, err := NewAdapter(provider.Spec.ProviderType)
+			assert.NoError(t, err)
+
+			_, err = adapter.BuildRequest(c, req, provider, nil, map[string]interface{}{"model": "m"})
+			var configurationError *ConfigurationError
+			assert.ErrorAs(t, err, &configurationError)
+		})
+	}
+}
+
 func TestDoTLSVerificationPolicy(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -502,4 +698,24 @@ func TestDoTLSVerificationPolicy(t *testing.T) {
 			assert.Equal(t, "ok", string(body))
 		}
 	})
+}
+
+func TestProviderTransportHandlesCustomDefaultTransport(t *testing.T) {
+	custom := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, nil
+	})
+
+	_, preservesCustomTransport := providerTransport(custom, false).(roundTripperFunc)
+	assert.True(t, preservesCustomTransport)
+	_, isolatesInsecureTransport := providerTransport(custom, true).(*http.Transport)
+	assert.True(t, isolatesInsecureTransport)
+	assert.NotPanics(t, func() {
+		_ = providerTransport(custom, true)
+	})
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

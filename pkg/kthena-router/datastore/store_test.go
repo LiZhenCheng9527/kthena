@@ -1975,6 +1975,17 @@ func TestSelectDestination_EmptyTargets(t *testing.T) {
 	assert.Contains(t, err.Error(), "no target models specified in rule")
 }
 
+func TestSelectDestination_NilTarget(t *testing.T) {
+	s := &store{}
+	_, err := s.selectDestination([]*aiv1alpha1.TargetModel{nil})
+	assert.EqualError(t, err, "target model must not be nil")
+}
+
+func TestModelTargetFromDestination_NilTarget(t *testing.T) {
+	_, err := modelTargetFromDestination("default", nil)
+	assert.EqualError(t, err, "target backend must not be nil")
+}
+
 func TestToWeightedSlice_SingleTarget(t *testing.T) {
 	weight := uint32(100)
 	targets := []*aiv1alpha1.TargetModel{

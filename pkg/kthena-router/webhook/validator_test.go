@@ -654,6 +654,22 @@ func TestValidateModelRoute(t *testing.T) {
 	}
 }
 
+func TestValidateModelRouteRejectsNilTargetModel(t *testing.T) {
+	validator := NewKthenaRouterValidator(fake.NewSimpleClientset(), 8080)
+	allowed, reason := validator.validateModelRoute(&networkingv1alpha1.ModelRoute{
+		Spec: networkingv1alpha1.ModelRouteSpec{
+			ModelName: "test-model",
+			Rules: []*networkingv1alpha1.Rule{{
+				TargetModels: []*networkingv1alpha1.TargetModel{nil},
+			}},
+		},
+	})
+
+	assert.False(t, allowed)
+	assert.Contains(t, reason, "spec.rules[0].targetModels[0]")
+	assert.Contains(t, reason, "target model must not be nil")
+}
+
 func TestValidateModelServer(t *testing.T) {
 	tests := []struct {
 		name           string

@@ -34,6 +34,7 @@ import (
 	"k8s.io/klog/v2"
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 )
 
 const timeout = 30 * time.Second
@@ -224,6 +225,10 @@ func (v *KthenaRouterValidator) validateModelRoute(modelRoute *networkingv1alpha
 		totalWeight := uint32(0)
 		for j, targetModel := range rule.TargetModels {
 			targetModelField := ruleField.Child("targetModels").Index(j)
+			if targetModel == nil {
+				allErrs = append(allErrs, field.Invalid(targetModelField, targetModel, "target model must not be nil"))
+				continue
+			}
 			hasModelServer := targetModel.ModelServerName != ""
 			hasExternalProvider := targetModel.ExternalModelProviderName != ""
 			if hasModelServer == hasExternalProvider {
@@ -347,7 +352,7 @@ func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networki
 			allErrs = append(allErrs, field.Invalid(headerField, header, "header name is invalid"))
 			continue
 		}
-		if isReservedProviderHeader(header) {
+		if common.IsReservedProviderHeader(header) {
 			allErrs = append(allErrs, field.Invalid(headerField, header, "header is reserved and cannot be configured as a static header"))
 		}
 		if strings.ContainsAny(value, "\r\n") {
@@ -376,30 +381,6 @@ func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networki
 		return false, fmt.Sprintf("validation failed:\n%s", strings.Join(messages, "\n"))
 	}
 	return true, ""
-}
-
-func isReservedProviderHeader(header string) bool {
-	reservedHeaders := []string{
-		"Authorization",
-		"Proxy-Authorization",
-		"Cookie",
-		"X-API-Key",
-		"Host",
-		"Content-Length",
-		"Connection",
-		"Keep-Alive",
-		"Proxy-Connection",
-		"Transfer-Encoding",
-		"Upgrade",
-		"Trailer",
-		"TE",
-	}
-	for _, reserved := range reservedHeaders {
-		if strings.EqualFold(header, reserved) {
-			return true
-		}
-	}
-	return false
 }
 
 func (v *KthenaRouterValidator) shutdown() {

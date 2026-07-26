@@ -47,7 +47,6 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/filters/auth"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/filters/ratelimit"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/filters/tokenizer"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/handlers"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler"
@@ -762,7 +761,7 @@ func (r *Router) proxy(
 	ctx *framework.Context,
 	stream bool,
 	port int32,
-	onUsage func(u TokenUsage),
+	onUsage func(u providers.TokenUsage),
 ) error {
 	modelServerName := fmt.Sprintf("%s/%s", ctx.ModelServerName.Namespace, ctx.ModelServerName.Name)
 
@@ -849,7 +848,7 @@ func (r *Router) proxyModelEndpoint(
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, func(usage TokenUsage) {
+		err := r.proxy(c, decodeRequest, ctx, stream, port, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -914,6 +913,10 @@ func (r *Router) proxyExternalProvider(
 
 	adapter, err := providers.NewAdapter(provider.Spec.ProviderType)
 	if err != nil {
+		var configurationError *providers.ConfigurationError
+		if errors.As(err, &configurationError) {
+			return newExternalProxyError(http.StatusServiceUnavailable, "provider_config", fmt.Sprintf("external provider %s is not ready", providerName))
+		}
 		return newExternalProxyError(http.StatusInternalServerError, "provider_request_build", "failed to build external provider request")
 	}
 	upstreamRequest, err := adapter.BuildRequest(c, req, provider, secret, modelRequest)
@@ -922,12 +925,17 @@ func (r *Router) proxyExternalProvider(
 		if errors.As(err, &unsupportedPath) {
 			return newExternalProxyError(http.StatusBadRequest, "request_protocol", unsupportedPath.Error())
 		}
+		var configurationError *providers.ConfigurationError
+		if errors.As(err, &configurationError) {
+			return newExternalProxyError(http.StatusServiceUnavailable, "provider_config", fmt.Sprintf("external provider %s is not ready", providerName))
+		}
 		return newExternalProxyError(http.StatusInternalServerError, "provider_request_build", "failed to build external provider request")
 	}
 
 	userID := c.GetString(common.UserIdKey)
+	responseParser := adapter.ResponseParser(req.URL.Path)
 
-	return proxyExternalRequest(c, upstreamRequest, provider.Spec.ProviderType, provider.Spec.InsecureSkipVerify, isStreaming(modelRequest), providerName, func(usage TokenUsage) {
+	return proxyExternalRequest(c, upstreamRequest, responseParser, provider.Spec.InsecureSkipVerify, isStreaming(modelRequest), providerName, func(usage providers.TokenUsage) {
 		if usage.TotalTokens <= 0 {
 			return
 		}
@@ -955,10 +963,6 @@ func (r *Router) getProviderSecret(provider *v1alpha1.ExternalModelProvider) (*c
 	secret := r.store.GetSecret(secretName)
 	if secret == nil {
 		return nil, fmt.Errorf("secret %s not found", secretName)
-	}
-	key := provider.Spec.Auth.SecretRef.Key
-	if value, ok := secret.Data[key]; !ok || len(value) == 0 {
-		return nil, fmt.Errorf("secret %s key %s not found", secretName, key)
 	}
 	return secret, nil
 }
@@ -1025,7 +1029,7 @@ func proxyRequest(
 	podIP string,
 	port int32,
 	stream bool,
-	onUsage func(u TokenUsage),
+	onUsage func(u providers.TokenUsage),
 ) error {
 	resp, err := doRequest(req, podIP, port)
 	if resp != nil {
@@ -1034,17 +1038,21 @@ func proxyRequest(
 	if err != nil {
 		return fmt.Errorf("decode request error: %w", err)
 	}
-	return forwardResponse(c, resp, stream, onUsage)
+	adapter, err := providers.NewAdapter(v1alpha1.OpenAI)
+	if err != nil {
+		return err
+	}
+	return forwardResponseWithUsageParser(c, resp, stream, adapter.ResponseParser(req.URL.Path), onUsage)
 }
 
 func proxyExternalRequest(
 	c *gin.Context,
 	req *http.Request,
-	providerType v1alpha1.ExternalProviderType,
+	parser providers.ResponseUsageParser,
 	insecureSkipVerify bool,
 	stream bool,
 	providerName string,
-	onUsage func(u TokenUsage),
+	onUsage func(u providers.TokenUsage),
 ) error {
 	resp, err := providers.Do(req, insecureSkipVerify)
 	if err != nil {
@@ -1061,186 +1069,18 @@ func proxyExternalRequest(
 		c.Set("finishReason", "upstream_response")
 	}
 
-	var forwardErr error
-	switch {
-	case providerType == v1alpha1.Anthropic:
-		forwardErr = forwardResponseWithUsageParser(c, resp, stream, &anthropicUsageParser{}, onUsage)
-	case (providerType == "" || providerType == v1alpha1.OpenAI) && c.Request != nil && c.Request.URL.Path == "/v1/responses":
-		forwardErr = forwardResponseWithUsageParser(c, resp, stream, &openAIResponsesUsageParser{}, onUsage)
-	default:
-		forwardErr = forwardResponse(c, resp, stream, onUsage)
-	}
-	if forwardErr != nil {
+	if err := forwardResponseWithUsageParser(c, resp, stream, parser, onUsage); err != nil {
 		return newExternalProxyError(http.StatusBadGateway, "response_forwarding", fmt.Sprintf("failed to forward response from external provider %s", providerName))
 	}
 	return nil
-}
-
-// TokenUsage is the router-level token accounting view extracted from an
-// upstream response, independent from any provider response shape.
-type TokenUsage struct {
-	PromptTokens     int `json:"prompt_tokens,omitempty"`
-	CompletionTokens int `json:"completion_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens,omitempty"`
-}
-
-type responseUsageParser interface {
-	ParseStreamLine(line string) (TokenUsage, bool)
-	ParseBody(body []byte) (TokenUsage, bool)
-	FinalStreamUsage() (TokenUsage, bool)
-}
-
-type streamCompletionParser interface {
-	RecordStreamLineWritten(line string)
-	StreamCompleted() bool
-}
-
-type openAIUsageParser struct {
-	completed bool
-}
-
-func (openAIUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
-	parsed := handlers.ParseStreamRespForUsage(line)
-	return tokenUsageFromOpenAIResponse(parsed), parsed.Usage.CompletionTokens > 0
-}
-
-func (openAIUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
-	parsed, _ := handlers.ParseOpenAIResponseBody(body)
-	if parsed == nil || parsed.Usage.CompletionTokens <= 0 {
-		return TokenUsage{}, false
-	}
-	return tokenUsageFromOpenAIResponse(*parsed), true
-}
-
-func (openAIUsageParser) FinalStreamUsage() (TokenUsage, bool) {
-	return TokenUsage{}, false
-}
-
-func (p *openAIUsageParser) RecordStreamLineWritten(line string) {
-	p.completed = p.completed || strings.TrimSpace(line) == "data: [DONE]"
-}
-
-func (p *openAIUsageParser) StreamCompleted() bool {
-	return p.completed
-}
-
-type openAIResponsesUsageParser struct {
-	latest    TokenUsage
-	completed bool
-}
-
-func (p *openAIResponsesUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
-	parsed := handlers.ParseOpenAIResponsesStreamRespForUsage(line)
-	usage := tokenUsageFromOpenAIResponse(parsed)
-	if usage.TotalTokens > 0 {
-		p.latest = usage
-	}
-	return TokenUsage{}, false
-}
-
-func (p *openAIResponsesUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
-	parsed, _ := handlers.ParseOpenAIResponsesResponseBody(body)
-	if parsed == nil {
-		return TokenUsage{}, false
-	}
-	usage := tokenUsageFromOpenAIResponse(*parsed)
-	return usage, usage.TotalTokens > 0
-}
-
-func (p *openAIResponsesUsageParser) FinalStreamUsage() (TokenUsage, bool) {
-	return p.latest, p.latest.TotalTokens > 0
-}
-
-func (p *openAIResponsesUsageParser) StreamCompleted() bool {
-	return p.completed
-}
-
-func (p *openAIResponsesUsageParser) RecordStreamLineWritten(line string) {
-	p.completed = p.completed || isJSONStreamEvent(line, "response.completed")
-}
-
-func isJSONStreamEvent(line, eventType string) bool {
-	const dataPrefix = "data:"
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, dataPrefix) {
-		return false
-	}
-	var event struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, dataPrefix))), &event); err != nil {
-		return false
-	}
-	return event.Type == eventType
-}
-
-type anthropicUsageParser struct {
-	latest    TokenUsage
-	completed bool
-}
-
-func (p *anthropicUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
-	parsed := handlers.ParseAnthropicStreamRespForUsage(line)
-	if parsed.Usage.TotalTokens <= 0 {
-		return TokenUsage{}, false
-	}
-	if parsed.Usage.PromptTokens > 0 {
-		p.latest.PromptTokens = parsed.Usage.PromptTokens
-	}
-	if parsed.Usage.CompletionTokens > 0 {
-		p.latest.CompletionTokens = parsed.Usage.CompletionTokens
-	}
-	p.latest.TotalTokens = p.latest.PromptTokens + p.latest.CompletionTokens
-	return TokenUsage{}, false
-}
-
-func (p *anthropicUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
-	parsed, _ := handlers.ParseAnthropicResponseBody(body)
-	if parsed == nil || parsed.Usage.CompletionTokens <= 0 {
-		return TokenUsage{}, false
-	}
-	return tokenUsageFromOpenAIResponse(*parsed), true
-}
-
-func (p *anthropicUsageParser) FinalStreamUsage() (TokenUsage, bool) {
-	return p.latest, p.latest.TotalTokens > 0
-}
-
-func (p *anthropicUsageParser) RecordStreamLineWritten(line string) {
-	p.completed = p.completed || isJSONStreamEvent(line, "message_stop")
-}
-
-func (p *anthropicUsageParser) StreamCompleted() bool {
-	return p.completed
-}
-
-func tokenUsageFromOpenAIResponse(resp handlers.OpenAIResponse) TokenUsage {
-	usage := TokenUsage{
-		PromptTokens:     resp.Usage.PromptTokens,
-		CompletionTokens: resp.Usage.CompletionTokens,
-		TotalTokens:      resp.Usage.TotalTokens,
-	}
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	}
-	return usage
-}
-
-func forwardResponse(
-	c *gin.Context,
-	resp *http.Response,
-	stream bool,
-	onUsage func(TokenUsage),
-) error {
-	return forwardResponseWithUsageParser(c, resp, stream, &openAIUsageParser{}, onUsage)
 }
 
 func forwardResponseWithUsageParser(
 	c *gin.Context,
 	resp *http.Response,
 	stream bool,
-	parser responseUsageParser,
-	onUsage func(TokenUsage),
+	parser providers.ResponseUsageParser,
+	onUsage func(providers.TokenUsage),
 ) error {
 	copyResponseHeaders(c, resp.Header, stream)
 	c.Status(resp.StatusCode)
@@ -1248,7 +1088,6 @@ func forwardResponseWithUsageParser(
 	if stream {
 		reader := bufio.NewReader(resp.Body)
 		var streamErr error
-		completed, _ := parser.(streamCompletionParser)
 		clientDisconnected := c.Stream(func(w io.Writer) bool {
 			line, err := reader.ReadBytes('\n')
 			if len(line) > 0 {
@@ -1272,13 +1111,11 @@ func forwardResponseWithUsageParser(
 					streamErr = io.ErrShortWrite
 					return false
 				}
-				if completed != nil {
-					completed.RecordStreamLineWritten(string(line))
-				}
+				parser.RecordStreamLineWritten(string(line))
 			}
 			if err != nil {
 				if err != io.EOF {
-					if !errors.Is(err, context.Canceled) || completed == nil || !completed.StreamCompleted() {
+					if !errors.Is(err, context.Canceled) || !parser.StreamCompleted() {
 						klog.Errorf("error reading stream body: %v", err)
 						streamErr = err
 					}
@@ -1287,7 +1124,7 @@ func forwardResponseWithUsageParser(
 			}
 			return true
 		})
-		if clientDisconnected && streamErr == nil && (completed == nil || !completed.StreamCompleted()) {
+		if clientDisconnected && streamErr == nil && !parser.StreamCompleted() {
 			streamErr = context.Canceled
 		}
 		if usage, ok := parser.FinalStreamUsage(); ok && onUsage != nil {

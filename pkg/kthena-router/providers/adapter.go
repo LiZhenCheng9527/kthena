@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/http/httpguts"
 	corev1 "k8s.io/api/core/v1"
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -35,6 +36,25 @@ import (
 
 type Adapter interface {
 	BuildRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, modelRequest map[string]interface{}) (*http.Request, error)
+	ResponseParser(path string) ResponseUsageParser
+}
+
+// TokenUsage is the provider-neutral token accounting view returned by a
+// response parser.
+type TokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
+}
+
+// ResponseUsageParser normalizes provider-specific response bodies and stream
+// events into TokenUsage while tracking whether a streaming response completed.
+type ResponseUsageParser interface {
+	ParseStreamLine(line string) (TokenUsage, bool)
+	ParseBody(body []byte) (TokenUsage, bool)
+	FinalStreamUsage() (TokenUsage, bool)
+	RecordStreamLineWritten(line string)
+	StreamCompleted() bool
 }
 
 type UnsupportedPathError struct {
@@ -46,6 +66,25 @@ func (e *UnsupportedPathError) Error() string {
 	return fmt.Sprintf("provider type %q does not support path %q", e.ProviderType, e.Path)
 }
 
+// ConfigurationError identifies invalid or unavailable provider configuration.
+// Router-facing code can classify it without knowing credential or header
+// details owned by a protocol adapter.
+type ConfigurationError struct {
+	err error
+}
+
+func (e *ConfigurationError) Error() string {
+	return e.err.Error()
+}
+
+func (e *ConfigurationError) Unwrap() error {
+	return e.err
+}
+
+func newConfigurationError(format string, args ...interface{}) error {
+	return &ConfigurationError{err: fmt.Errorf(format, args...)}
+}
+
 func NewAdapter(providerType networkingv1alpha1.ExternalProviderType) (Adapter, error) {
 	switch providerType {
 	case "", networkingv1alpha1.OpenAI:
@@ -53,11 +92,30 @@ func NewAdapter(providerType networkingv1alpha1.ExternalProviderType) (Adapter, 
 	case networkingv1alpha1.Anthropic:
 		return anthropicAdapter{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider type %q", providerType)
+		return nil, newConfigurationError("unsupported provider type %q", providerType)
 	}
 }
 
-func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, modelRequest map[string]interface{}, rewriteBody bool) (*http.Request, error) {
+// ValidateConfiguration validates provider settings that are required by every
+// request. It is used both by reconciliation and as defense in depth in the
+// request-building path.
+func ValidateConfiguration(provider *networkingv1alpha1.ExternalModelProvider) error {
+	if provider == nil {
+		return newConfigurationError("provider is nil")
+	}
+	if _, err := NewAdapter(provider.Spec.ProviderType); err != nil {
+		return err
+	}
+	if _, err := parseProviderBaseURL(provider.Spec.BaseURL); err != nil {
+		return newConfigurationError("invalid provider base URL: %w", err)
+	}
+	if err := validateStaticHeaders(provider.Spec.Headers); err != nil {
+		return err
+	}
+	return nil
+}
+
+func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, modelRequest map[string]interface{}, upstreamURL *url.URL, rewriteBody bool) (*http.Request, error) {
 	if provider.Spec.Model != nil && *provider.Spec.Model != "" {
 		modelRequest["model"] = *provider.Spec.Model
 		rewriteBody = true
@@ -79,11 +137,6 @@ func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkin
 		}
 	}
 
-	upstreamURL, err := buildProviderURL(provider.Spec.BaseURL, req.URL.Path, req.URL.RawQuery, provider.Spec.ProviderType)
-	if err != nil {
-		return nil, err
-	}
-
 	reqCopy := req.Clone(req.Context())
 	reqCopy.URL = upstreamURL
 	reqCopy.Host = upstreamURL.Host
@@ -100,29 +153,43 @@ func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkin
 	return reqCopy, nil
 }
 
-func buildProviderURL(baseURL, requestPath, rawQuery string, providerType networkingv1alpha1.ExternalProviderType) (*url.URL, error) {
+func parseProviderBaseURL(baseURL string) (*url.URL, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
 	}
+	if parsed.Scheme != "https" || parsed.Host == "" || parsed.Opaque != "" {
+		return nil, fmt.Errorf("provider base URL must use https and include a host")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return nil, fmt.Errorf("provider base URL must not contain userinfo, query, or fragment")
+	}
+	return parsed, nil
+}
+
+func appendProviderPath(parsed *url.URL, requestPath, rawQuery string) *url.URL {
+	upstreamURL := *parsed
 	basePath := strings.TrimRight(parsed.Path, "/")
 	pathSuffix := strings.TrimLeft(requestPath, "/")
-	baseIncludesAPIVersion := providerType == networkingv1alpha1.Anthropic && strings.HasSuffix(basePath, "/v1")
-	if basePath != "" && (providerType == "" || providerType == networkingv1alpha1.OpenAI || baseIncludesAPIVersion) {
-		pathSuffix = strings.TrimPrefix(pathSuffix, "v1/")
-		if pathSuffix == "v1" {
-			pathSuffix = ""
-		}
-	}
 	if pathSuffix == "" {
-		parsed.Path = basePath
+		upstreamURL.Path = basePath
 	} else if basePath == "" {
-		parsed.Path = "/" + pathSuffix
+		upstreamURL.Path = "/" + pathSuffix
 	} else {
-		parsed.Path = basePath + "/" + pathSuffix
+		upstreamURL.Path = basePath + "/" + pathSuffix
 	}
-	parsed.RawQuery = rawQuery
-	return parsed, nil
+	upstreamURL.RawPath = ""
+	upstreamURL.RawQuery = rawQuery
+	return &upstreamURL
+}
+
+func trimAPIVersionPrefix(requestPath string) string {
+	path := strings.TrimLeft(requestPath, "/")
+	path = strings.TrimPrefix(path, "v1/")
+	if path == "v1" {
+		return ""
+	}
+	return path
 }
 
 func providerToken(provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret) (string, error) {
@@ -130,12 +197,12 @@ func providerToken(provider *networkingv1alpha1.ExternalModelProvider, secret *c
 		return "", nil
 	}
 	if secret == nil {
-		return "", fmt.Errorf("secret %s is not loaded", provider.Spec.Auth.SecretRef.Name)
+		return "", newConfigurationError("secret %s is not loaded", provider.Spec.Auth.SecretRef.Name)
 	}
 	key := provider.Spec.Auth.SecretRef.Key
 	value, ok := secret.Data[key]
 	if !ok || len(value) == 0 {
-		return "", fmt.Errorf("secret key %s is not found", key)
+		return "", newConfigurationError("secret key %s is not found", key)
 	}
 	return string(value), nil
 }
@@ -154,11 +221,26 @@ func sanitizeRequestHeaders(headers http.Header) http.Header {
 }
 
 func applyStaticHeaders(headers http.Header, staticHeaders map[string]string) error {
+	if err := validateStaticHeaders(staticHeaders); err != nil {
+		return err
+	}
 	for key, value := range staticHeaders {
-		if isReservedHeader(key) {
-			return fmt.Errorf("static header %q is reserved", key)
-		}
 		headers.Set(key, value)
+	}
+	return nil
+}
+
+func validateStaticHeaders(staticHeaders map[string]string) error {
+	for key, value := range staticHeaders {
+		if !httpguts.ValidHeaderFieldName(key) {
+			return newConfigurationError("static header %q has an invalid name", key)
+		}
+		if common.IsReservedProviderHeader(key) {
+			return newConfigurationError("static header %q is reserved", key)
+		}
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return newConfigurationError("static header %q has an invalid value", key)
+		}
 	}
 	return nil
 }
@@ -172,19 +254,9 @@ func isAllowedForwardHeader(header string) bool {
 	return false
 }
 
-func isReservedHeader(header string) bool {
-	for _, reserved := range reservedForwardHeaders {
-		if strings.EqualFold(header, reserved) {
-			return true
-		}
-	}
-	return false
-}
-
 var allowedForwardHeaders = []string{
 	"Content-Type",
 	"Accept",
-	"Anthropic-Version",
 	"X-Request-Id",
 	"Traceparent",
 	"Tracestate",
@@ -196,35 +268,39 @@ var allowedForwardHeaders = []string{
 	"X-B3-Flags",
 }
 
-var reservedForwardHeaders = []string{
-	"Authorization",
-	"Proxy-Authorization",
-	"Cookie",
-	"X-API-Key",
-	"Host",
-	"Content-Length",
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Connection",
-	"Transfer-Encoding",
-	"Upgrade",
-	"Trailer",
-	"TE",
-}
-
 var secureClient = newProviderClient(false)
 var insecureClient = newProviderClient(true)
 
 func newProviderClient(insecureSkipVerify bool) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if insecureSkipVerify {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
-	}
 	return &http.Client{
-		Transport: transport,
+		Transport: providerTransport(http.DefaultTransport, insecureSkipVerify),
+		// Do not set Client.Timeout: external streaming responses can be
+		// long-lived. The downstream request context still cancels the upstream
+		// request when the client disconnects.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+}
+
+func providerTransport(base http.RoundTripper, insecureSkipVerify bool) http.RoundTripper {
+	if transport, ok := base.(*http.Transport); ok {
+		cloned := transport.Clone()
+		if insecureSkipVerify {
+			cloned.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+		}
+		return cloned
+	}
+	if !insecureSkipVerify {
+		return base
+	}
+	// A custom RoundTripper cannot be cloned or have its TLS policy adjusted.
+	// Use an isolated transport for the opt-in insecure policy instead of
+	// panicking or mutating a replaceable package-level variable.
+	return &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 	}
 }
 
@@ -233,4 +309,31 @@ func Do(req *http.Request, insecureSkipVerify bool) (*http.Response, error) {
 		return insecureClient.Do(req)
 	}
 	return secureClient.Do(req)
+}
+
+func isJSONStreamEvent(line, eventType string) bool {
+	payload, ok := streamDataPayload(line)
+	if !ok {
+		return false
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return false
+	}
+	return event.Type == eventType
+}
+
+func streamDataPayload(line string) ([]byte, bool) {
+	const dataPrefix = "data:"
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, dataPrefix) {
+		return nil, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, dataPrefix))
+	if payload == "" || payload == "[DONE]" {
+		return nil, false
+	}
+	return []byte(payload), true
 }

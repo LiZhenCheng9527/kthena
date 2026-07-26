@@ -1420,6 +1420,9 @@ func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey str
 }
 
 func modelTargetFromDestination(namespace string, target *aiv1alpha1.TargetModel) (ModelTarget, error) {
+	if target == nil {
+		return ModelTarget{}, fmt.Errorf("target backend must not be nil")
+	}
 	hasModelServer := target.ModelServerName != ""
 	hasExternalProvider := target.ExternalModelProviderName != ""
 	if hasModelServer == hasExternalProvider {
@@ -1558,6 +1561,15 @@ func (s *store) selectDestination(targets []*aiv1alpha1.TargetModel) (*aiv1alpha
 }
 
 func toWeightedSlice(targets []*aiv1alpha1.TargetModel) ([]uint32, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no target models specified")
+	}
+	for _, target := range targets {
+		if target == nil {
+			return nil, fmt.Errorf("target model must not be nil")
+		}
+	}
+
 	var isWeighted bool
 	if targets[0].Weight != nil {
 		isWeighted = true

@@ -17,7 +17,10 @@ limitations under the License.
 package providers
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	corev1 "k8s.io/api/core/v1"
@@ -29,10 +32,14 @@ type anthropicAdapter struct{}
 
 func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, modelRequest map[string]interface{}) (*http.Request, error) {
 	if req.URL.Path != "/v1/messages" {
-		return nil, &UnsupportedPathError{ProviderType: provider.Spec.ProviderType, Path: req.URL.Path}
+		return nil, &UnsupportedPathError{ProviderType: networkingv1alpha1.Anthropic, Path: req.URL.Path}
 	}
 	rewriteBody := provider.Spec.Model != nil && *provider.Spec.Model != ""
-	upstream, err := buildProviderRequest(c, req, provider, secret, modelRequest, rewriteBody)
+	upstreamURL, err := anthropicProviderURL(provider.Spec.BaseURL, req.URL.Path, req.URL.RawQuery)
+	if err != nil {
+		return nil, err
+	}
+	upstream, err := buildProviderRequest(c, req, provider, modelRequest, upstreamURL, rewriteBody)
 	if err != nil {
 		return nil, err
 	}
@@ -43,5 +50,92 @@ func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider
 	if token != "" {
 		upstream.Header.Set("x-api-key", token)
 	}
+	if version := req.Header.Get("Anthropic-Version"); upstream.Header.Get("Anthropic-Version") == "" && version != "" {
+		upstream.Header.Set("Anthropic-Version", version)
+	}
 	return upstream, nil
+}
+
+func (anthropicAdapter) ResponseParser(string) ResponseUsageParser {
+	return &anthropicUsageParser{}
+}
+
+func anthropicProviderURL(baseURL, requestPath, rawQuery string) (*url.URL, error) {
+	parsed, err := parseProviderBaseURL(baseURL)
+	if err != nil {
+		return nil, newConfigurationError("invalid provider base URL: %w", err)
+	}
+	if strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/v1") {
+		requestPath = trimAPIVersionPrefix(requestPath)
+	}
+	return appendProviderPath(parsed, requestPath, rawQuery), nil
+}
+
+type anthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+type anthropicResponse struct {
+	Usage anthropicUsage `json:"usage"`
+}
+
+type anthropicStreamResponse struct {
+	Message *anthropicResponse `json:"message"`
+	Usage   anthropicUsage     `json:"usage"`
+}
+
+type anthropicUsageParser struct {
+	latest    TokenUsage
+	completed bool
+}
+
+func (p *anthropicUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
+	payload, ok := streamDataPayload(line)
+	if !ok {
+		return TokenUsage{}, false
+	}
+	var response anthropicStreamResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return TokenUsage{}, false
+	}
+
+	usage := response.Usage
+	if response.Message != nil {
+		usage.InputTokens += response.Message.Usage.InputTokens
+		usage.OutputTokens += response.Message.Usage.OutputTokens
+	}
+	if usage.InputTokens > 0 {
+		p.latest.PromptTokens = usage.InputTokens
+	}
+	if usage.OutputTokens > 0 {
+		p.latest.CompletionTokens = usage.OutputTokens
+	}
+	p.latest.TotalTokens = p.latest.PromptTokens + p.latest.CompletionTokens
+	return TokenUsage{}, false
+}
+
+func (p *anthropicUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
+	var response anthropicResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return TokenUsage{}, false
+	}
+	usage := TokenUsage{
+		PromptTokens:     response.Usage.InputTokens,
+		CompletionTokens: response.Usage.OutputTokens,
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	return usage, usage.TotalTokens > 0
+}
+
+func (p *anthropicUsageParser) FinalStreamUsage() (TokenUsage, bool) {
+	return p.latest, p.completed && p.latest.TotalTokens > 0
+}
+
+func (p *anthropicUsageParser) RecordStreamLineWritten(line string) {
+	p.completed = p.completed || isJSONStreamEvent(line, "message_stop")
+}
+
+func (p *anthropicUsageParser) StreamCompleted() bool {
+	return p.completed
 }

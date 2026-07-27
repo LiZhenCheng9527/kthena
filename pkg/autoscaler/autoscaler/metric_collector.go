@@ -31,6 +31,7 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -110,7 +111,7 @@ func (collector *MetricCollector) UpdateMetrics(
 		pastHistograms = make(map[string]HistogramInfo)
 	}
 	currentHistograms := make(map[string]HistogramInfo)
-	unreadyPods := make(map[string]struct{})
+	unreadyPods := sets.New[string]()
 
 	// Group pod metrics by identical PodMetricSource (uri/port/selector) so we
 	// scrape each ready pod endpoint once per reconcile and extract every
@@ -129,7 +130,7 @@ func (collector *MetricCollector) UpdateMetrics(
 			continue
 		}
 		for podKey := range groupUnreadyPods {
-			unreadyPods[podKey] = struct{}{}
+			unreadyPods.Insert(podKey)
 		}
 		for policyKey, v := range values {
 			readyInstancesMetric[policyKey] = v

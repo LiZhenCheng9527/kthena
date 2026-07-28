@@ -1744,11 +1744,15 @@ func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.Mo
 			}
 			return
 		}
+		if newPod.UID != errPod.UID {
+			klog.V(4).Infof("pod %s has been replaced after grace time", errPod.Name)
+			return
+		}
 
 		if !utils.IsPodRunningAndReady(newPod) {
 			// pod has not recovered after the grace period, needs to be rebuilt
 			// After this pod has been deleted, we will rebuild the ServingGroup in deletePod function
-			err = c.kubeClientSet.CoreV1().Pods(ms.Namespace).Delete(context.TODO(), newPod.Name, metav1.DeleteOptions{})
+			err = c.kubeClientSet.CoreV1().Pods(ms.Namespace).Delete(context.TODO(), newPod.Name, *metav1.NewPreconditionDeleteOptions(string(errPod.UID)))
 			if err != nil {
 				klog.Errorf("cannot delete pod %s after grace time, err: %v", newPod.Name, err)
 				return
@@ -1759,7 +1763,7 @@ func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.Mo
 		// grace period is not set or the grace period is 0, the deletion will be executed immediately.
 		defer c.graceMap.Delete(utils.GetNamespaceName(errPod))
 
-		err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).Delete(context.TODO(), errPod.Name, metav1.DeleteOptions{})
+		err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).Delete(context.TODO(), errPod.Name, *metav1.NewPreconditionDeleteOptions(string(errPod.UID)))
 		if err != nil {
 			klog.Errorf("cannot delete pod %s when it error, err: %v", errPod.Name, err)
 			return

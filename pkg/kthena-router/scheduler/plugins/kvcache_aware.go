@@ -42,6 +42,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/tokenization"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
@@ -241,7 +242,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	}
 
 	redisStart := time.Now()
-	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model)
+	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model, recentlyReadyOwners(pods, time.Now()))
 	redisDuration := time.Since(redisStart)
 	if err != nil {
 		if ctx.MetricsRecorder != nil {
@@ -292,8 +293,10 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 }
 
 // queryRedisForBlocks queries Redis to find which pods have cached the given token block hashes
-// Returns a map from block hash to list of pod names that have cached that block
-func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string) (map[uint64][]string, error) {
+// Returns a map from block hash to list of pod names that have cached that block.
+// ownerReadySince holds the Ready time of recently restarted candidates; when non-empty the
+// write timestamps are fetched too, to drop ownership recorded before a pod's current start.
+func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string, ownerReadySince map[string]int64) (map[uint64][]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -307,15 +310,27 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	klog.V(2).Infof("KVCacheAware.queryRedis: querying %d block hashes for model=%q", len(blockHashes), modelName)
 
 	pipe := t.redisClient.Pipeline()
-	cmds := make([]*redis.StringSliceCmd, len(blockHashes))
 	keys := make([]string, len(blockHashes))
+	// Only one of these is populated, depending on whether write timestamps are needed.
+	needTimestamps := len(ownerReadySince) > 0
+	var fieldCmds []*redis.StringSliceCmd
+	var entryCmds []*redis.MapStringStringCmd
+	if needTimestamps {
+		entryCmds = make([]*redis.MapStringStringCmd, len(blockHashes))
+	} else {
+		fieldCmds = make([]*redis.StringSliceCmd, len(blockHashes))
+	}
 
 	// Build pipeline commands for batch Redis query
 	for i, hash := range blockHashes {
 		block := KVCacheAwareBlock{ModelName: modelName, ChunkHash: hash}
 		key := block.String(t.keyPrefix)
 		keys[i] = key
-		cmds[i] = pipe.HKeys(ctx, key)
+		if needTimestamps {
+			entryCmds[i] = pipe.HGetAll(ctx, key)
+		} else {
+			fieldCmds[i] = pipe.HKeys(ctx, key)
+		}
 	}
 
 	if len(keys) > 0 {
@@ -329,9 +344,22 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	}
 
 	// Process results and extract pod names
-	for i, cmd := range cmds {
-		pods, err := cmd.Result()
-		if err != nil || len(pods) == 0 {
+	for i := range blockHashes {
+		var pods []string
+		if needTimestamps {
+			entries, err := entryCmds[i].Result()
+			if err != nil || len(entries) == 0 {
+				continue
+			}
+			pods = freshOwners(entries, ownerReadySince)
+		} else {
+			owners, err := fieldCmds[i].Result()
+			if err != nil || len(owners) == 0 {
+				continue
+			}
+			pods = owners
+		}
+		if len(pods) == 0 {
 			continue
 		}
 
@@ -411,6 +439,60 @@ func (t *KVCacheAware) deleteStaleFields(staleFields map[string][]string) {
 	if _, err := pipe.Exec(ctx); err != nil {
 		klog.V(4).Infof("KVCacheAware.gcStaleFields: failed to delete stale fields: %v", err)
 	}
+}
+
+// podReadySinceUnix reports when the pod's Ready condition last became true, or 0 if it is
+// not Ready. Callers treat 0 as unknown and skip the staleness check for that pod.
+func podReadySinceUnix(pod *corev1.Pod) int64 {
+	if pod == nil {
+		return 0
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return cond.LastTransitionTime.Unix()
+		}
+	}
+	return 0
+}
+
+// recentlyReadyOwners maps candidate pod names to their Ready time, limited to pods that
+// became Ready within the GC freshness window. Older pods cannot hold ownership predating
+// their current start since gcStaleFields already aged it out, so the map stays empty in
+// steady state and the query keeps using HKeys.
+func recentlyReadyOwners(pods []*datastore.PodInfo, now time.Time) map[string]int64 {
+	cutoff := now.Add(-kvCacheFieldFreshDuration).Unix()
+	var owners map[string]int64
+	for _, p := range pods {
+		readySince := podReadySinceUnix(p.GetPod())
+		if readySince <= cutoff {
+			continue
+		}
+		if owners == nil {
+			owners = make(map[string]int64, len(pods))
+		}
+		owners[p.GetPodNamespacedName().Name] = readySince
+	}
+	return owners
+}
+
+// freshOwners drops ownership written before the owning pod's current Ready time. Owners not
+// in ownerReadySince are kept; they have not restarted recently, or Score filters them out.
+func freshOwners(entries map[string]string, ownerReadySince map[string]int64) []string {
+	owners := make([]string, 0, len(entries))
+	for owner, writtenAt := range entries {
+		readySince, tracked := ownerReadySince[extractPodNameFromIdentifier(owner)]
+		if tracked {
+			written, err := strconv.ParseInt(writtenAt, 10, 64)
+			// An unparsable timestamp proves nothing, so keep it and leave it to gcStaleFields.
+			if err == nil && written < readySince {
+				klog.V(4).Infof("KVCacheAware.queryRedis: dropping ownership by %s written at %d, pod ready since %d",
+					owner, written, readySince)
+				continue
+			}
+		}
+		owners = append(owners, owner)
+	}
+	return owners
 }
 
 func extractPodNameFromIdentifier(podIdentifier string) string {

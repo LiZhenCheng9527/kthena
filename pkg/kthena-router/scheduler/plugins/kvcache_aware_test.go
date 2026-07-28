@@ -434,7 +434,7 @@ func TestKVCacheAware_QueryRedisForBlocks_ReturnsRedisOwners(t *testing.T) {
 		t.Fatalf("failed to seed redis: %v", err)
 	}
 
-	result, err := plugin.queryRedisForBlocks([]uint64{hash}, "qwen")
+	result, err := plugin.queryRedisForBlocks([]uint64{hash}, "qwen", nil)
 	if err != nil {
 		t.Fatalf("queryRedisForBlocks returned error: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestKVCacheAware_QueryRedisForBlocks_KeepsNamespacedOwners(t *testing.T) {
 		t.Fatalf("failed to seed redis: %v", err)
 	}
 
-	result, err := plugin.queryRedisForBlocks([]uint64{hash}, "qwen")
+	result, err := plugin.queryRedisForBlocks([]uint64{hash}, "qwen", nil)
 	if err != nil {
 		t.Fatalf("queryRedisForBlocks returned error: %v", err)
 	}
@@ -2410,5 +2410,194 @@ func TestKVCacheAware_CandidateFilteringRestrictsLongestMatch(t *testing.T) {
 	}
 	if _, candidateLongest := plugin.calculatePodScores(blockHashes, candidateScoped); candidateLongest != 2 {
 		t.Errorf("candidate-restricted longestMatch = %d, want 2 (pod1 holds only the first 2 blocks)", candidateLongest)
+	}
+}
+
+func readyPod(name string, ready bool, readySince time.Time) *datastore.PodInfo {
+	status := v1.ConditionFalse
+	if ready {
+		status = v1.ConditionTrue
+	}
+	return &datastore.PodInfo{
+		Pod: &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-namespace"},
+			Status: v1.PodStatus{
+				Conditions: []v1.PodCondition{{
+					Type:               v1.PodReady,
+					Status:             status,
+					LastTransitionTime: metav1.NewTime(readySince),
+				}},
+			},
+		},
+	}
+}
+
+func TestPodReadySinceUnix(t *testing.T) {
+	readySince := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	tests := []struct {
+		name string
+		pod  *v1.Pod
+		want int64
+	}{
+		{name: "nil pod", pod: nil, want: 0},
+		{name: "no conditions", pod: &v1.Pod{}, want: 0},
+		{name: "ready", pod: readyPod("p", true, readySince).Pod, want: readySince.Unix()},
+		{name: "not ready", pod: readyPod("p", false, readySince).Pod, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := podReadySinceUnix(tt.pod); got != tt.want {
+				t.Errorf("podReadySinceUnix() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecentlyReadyOwners(t *testing.T) {
+	now := time.Now()
+	justRestarted := now.Add(-time.Minute).Truncate(time.Second)
+	longRunning := now.Add(-2 * kvCacheFieldFreshDuration).Truncate(time.Second)
+
+	tests := []struct {
+		name string
+		pods []*datastore.PodInfo
+		want map[string]int64
+	}{
+		{
+			name: "steady state pods are omitted so timestamps are not fetched",
+			pods: []*datastore.PodInfo{readyPod("old", true, longRunning)},
+			want: nil,
+		},
+		{
+			name: "recently ready pod is tracked",
+			pods: []*datastore.PodInfo{readyPod("fresh", true, justRestarted)},
+			want: map[string]int64{"fresh": justRestarted.Unix()},
+		},
+		{
+			name: "not ready pod is omitted",
+			pods: []*datastore.PodInfo{readyPod("down", false, justRestarted)},
+			want: nil,
+		},
+		{
+			name: "only the recently ready pod is tracked",
+			pods: []*datastore.PodInfo{
+				readyPod("old", true, longRunning),
+				readyPod("fresh", true, justRestarted),
+			},
+			want: map[string]int64{"fresh": justRestarted.Unix()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := recentlyReadyOwners(tt.pods, now)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("recentlyReadyOwners() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFreshOwners(t *testing.T) {
+	const readySince = int64(1000)
+
+	tests := []struct {
+		name            string
+		entries         map[string]string
+		ownerReadySince map[string]int64
+		want            []string
+	}{
+		{
+			name:            "ownership written before the restart is dropped",
+			entries:         map[string]string{"pod-1.default": "999"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{},
+		},
+		{
+			name:            "ownership written after the restart is kept",
+			entries:         map[string]string{"pod-1.default": "1001"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{"pod-1.default"},
+		},
+		{
+			name:            "ownership written exactly at the restart is kept",
+			entries:         map[string]string{"pod-1.default": "1000"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{"pod-1.default"},
+		},
+		{
+			name:            "untracked owner is kept",
+			entries:         map[string]string{"pod-2.default": "1"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{"pod-2.default"},
+		},
+		{
+			name:            "unparsable timestamp is kept",
+			entries:         map[string]string{"pod-1.default": "not-a-number"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{"pod-1.default"},
+		},
+		{
+			name:            "bare pod name identifier is matched",
+			entries:         map[string]string{"pod-1": "999"},
+			ownerReadySince: map[string]int64{"pod-1": readySince},
+			want:            []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := freshOwners(tt.entries, tt.ownerReadySince)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("freshOwners() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A pod that restarts keeps its name and returns Ready, so candidate filtering in Score cannot
+// drop it and its ownership is too recent for gcStaleFields. Only the write timestamp separates
+// the pod that still holds the blocks from the one that lost them on restart.
+func TestKVCacheAware_QueryRedisForBlocks_DropsOwnershipFromBeforeRestart(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	plugin := &KVCacheAware{keyPrefix: kvCacheKeyPrefix, redisClient: client}
+
+	ctx := context.Background()
+	hash := uint64(222)
+	key := KVCacheAwareBlock{ModelName: "qwen", ChunkHash: hash}.String(kvCacheKeyPrefix)
+
+	now := time.Now()
+	writtenAt := now.Add(-10 * time.Minute)
+	restartedAt := now.Add(-5 * time.Minute)
+
+	if err := client.HSet(ctx, key,
+		"restarted.default", fmt.Sprintf("%d", writtenAt.Unix()),
+		"stable.default", fmt.Sprintf("%d", writtenAt.Unix()),
+	).Err(); err != nil {
+		t.Fatalf("failed to seed redis: %v", err)
+	}
+
+	owners := recentlyReadyOwners([]*datastore.PodInfo{
+		readyPod("restarted", true, restartedAt),
+		readyPod("stable", true, now.Add(-2*kvCacheFieldFreshDuration)),
+	}, now)
+
+	result, err := plugin.queryRedisForBlocks([]uint64{hash}, "qwen", owners)
+	if err != nil {
+		t.Fatalf("queryRedisForBlocks returned error: %v", err)
+	}
+
+	if want := []string{"stable.default"}; !reflect.DeepEqual(result[hash], want) {
+		t.Errorf("queryRedisForBlocks() = %v, want %v", result[hash], want)
 	}
 }

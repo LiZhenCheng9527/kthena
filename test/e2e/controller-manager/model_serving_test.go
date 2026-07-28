@@ -2197,6 +2197,78 @@ func TestModelServingRoleRollingUpdateMaxUnavailable(t *testing.T) {
 	}
 }
 
+// TestModelServingRoleRollingUpdateServingGroupMaxUnavailable verifies the
+// top-level maxUnavailable limits how many ServingGroups can enter a Role update.
+func TestModelServingRoleRollingUpdateServingGroupMaxUnavailable(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	const badImage = "nginx:role-rollingupdate-sg-maxunavailable-bad-image"
+	replicas := int32(3)
+	roleReplicas := int32(1)
+	maxUnavailable := intstr.FromInt(1)
+	modelServing := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-role-rolling-sg-maxunavailable", Namespace: testNamespace},
+		Spec: workload.ModelServingSpec{
+			Replicas:       &replicas,
+			RecoveryPolicy: workload.RoleRecreate,
+			RolloutStrategy: &workload.RolloutStrategy{
+				Type: workload.RoleRollingUpdate,
+				RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+					MaxUnavailable: &maxUnavailable,
+				},
+			},
+			Template: workload.ServingGroup{Roles: []workload.Role{{
+				Name:     "prefill",
+				Replicas: &roleReplicas,
+				EntryTemplate: workload.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  "test-container",
+					Image: nginxImage,
+					Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 80}},
+				}}}},
+			}}},
+		},
+	}
+
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+	current, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	updated := current.DeepCopy()
+	updated.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = badImage
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updated, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	countUpdatingGroups := func() (int, bool) {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: modelServingLabelSelector(modelServing.Name),
+		})
+		if err != nil {
+			return 0, false
+		}
+		groups := map[string]struct{}{}
+		for _, pod := range pods.Items {
+			if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Image == badImage {
+				groups[pod.Labels[workload.GroupNameLabelKey]] = struct{}{}
+			}
+		}
+		return len(groups), true
+	}
+
+	require.Eventually(t, func() bool {
+		updatingGroups, ok := countUpdatingGroups()
+		t.Logf("RoleRollingUpdate updating ServingGroups=%d", updatingGroups)
+		return ok && updatingGroups == 1
+	}, 2*time.Minute, 2*time.Second, "exactly one ServingGroup should start updating")
+
+	stableUntil := time.Now().Add(30 * time.Second)
+	for time.Now().Before(stableUntil) {
+		updatingGroups, ok := countUpdatingGroups()
+		require.True(t, ok)
+		require.LessOrEqual(t, updatingGroups, 1,
+			"RoleRollingUpdate must not exceed the ServingGroup maxUnavailable budget")
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // TestModelServingRoleRollingUpdatePartition verifies RoleRollingUpdate respects role-level partition.
 // Align with ServingGroup semantics: partition protects replicas whose ordinals are in [0, partition).
 func TestModelServingRoleRollingUpdatePartition(t *testing.T) {

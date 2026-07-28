@@ -154,11 +154,6 @@ func validateRollingUpdateConfiguration(ms *workloadv1alpha1.ModelServing) field
 	}
 
 	rollingUpdateConfigurationPath := field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration")
-	if ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate {
-		allErrs = append(allErrs, field.Forbidden(rollingUpdateConfigurationPath, "rollingUpdateConfiguration is only valid when rolloutStrategy.type is ServingGroupRollingUpdate"))
-		return allErrs
-	}
-
 	maxUnavailable := ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable
 	maxUnavailablePath := rollingUpdateConfigurationPath.Child("maxUnavailable")
 	allErrs = append(allErrs, validateIntOrPercent(maxUnavailable, maxUnavailablePath)...)

@@ -53,6 +53,11 @@ func TestGetServingGroupStatusPriority(t *testing.T) {
 			expected: PriorityServingGroupScaling,
 		},
 		{
+			name:     "Rolling has highest deletion priority",
+			status:   datastore.ServingGroupRolling,
+			expected: PriorityServingGroupRolling,
+		},
+		{
 			name:     "NotFound has highest deletion priority",
 			status:   datastore.ServingGroupNotFound,
 			expected: PriorityServingGroupNotFound,
@@ -186,7 +191,7 @@ func TestGetPodDeletionCost(t *testing.T) {
 }
 
 // Tests that Running serving groups are always protected from deletion
-// compared to all other statuses (Creating, Deleting, Scaling, NotFound).
+// compared to all other statuses (Creating, Deleting, Scaling, Rolling, NotFound).
 func TestRunningStatusHasLowerDeletionPriorityThanOthers(t *testing.T) {
 	runningPriority := getServingGroupStatusPriority(datastore.ServingGroupRunning)
 
@@ -194,6 +199,7 @@ func TestRunningStatusHasLowerDeletionPriorityThanOthers(t *testing.T) {
 		datastore.ServingGroupCreating,
 		datastore.ServingGroupDeleting,
 		datastore.ServingGroupScaling,
+		datastore.ServingGroupRolling,
 		datastore.ServingGroupNotFound,
 	}
 

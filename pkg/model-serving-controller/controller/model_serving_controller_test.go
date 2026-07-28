@@ -811,6 +811,7 @@ func TestIsServingGroupDeleted(t *testing.T) {
 		pods               []resourceSpec
 		services           []resourceSpec
 		servingGroupStatus datastore.ServingGroupStatus
+		roleRollingUpdate  bool
 		want               bool
 	}{
 		{
@@ -826,6 +827,17 @@ func TestIsServingGroupDeleted(t *testing.T) {
 			services:           nil,
 			servingGroupStatus: datastore.ServingGroupDeleting,
 			want:               true,
+		},
+		{
+			name:               "ServingGroup status is Rolling during ServingGroupRollingUpdate - no resources - should return true",
+			servingGroupStatus: datastore.ServingGroupRolling,
+			want:               true,
+		},
+		{
+			name:               "ServingGroup status is Rolling during RoleRollingUpdate - no resources - should return false",
+			servingGroupStatus: datastore.ServingGroupRolling,
+			roleRollingUpdate:  true,
+			want:               false,
 		},
 		{
 			name: "ServingGroup status is Deleting - target group pods exist - should return false",
@@ -899,6 +911,10 @@ func TestIsServingGroupDeleted(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			ms.Spec.RolloutStrategy = nil
+			if tc.roleRollingUpdate {
+				ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate}
+			}
 			// Clean indexers before each test
 			for _, obj := range podIndexer.List() {
 				err := podIndexer.Delete(obj)
@@ -6628,6 +6644,14 @@ func TestDeleteServingGroupRollbackOnFailure(t *testing.T) {
 			expectError:           false,
 			expectEnqueueCalled:   false,
 			description:           "all deletions succeed, no rollback needed",
+		},
+		{
+			name:                "rolling_update_preserves_rolling_status",
+			initialSgStatus:     datastore.ServingGroupRolling,
+			expectedFinalStatus: datastore.ServingGroupRolling,
+			expectError:         false,
+			expectEnqueueCalled: false,
+			description:         "ServingGroupRollingUpdate should preserve Rolling while deleting resources",
 		},
 	}
 

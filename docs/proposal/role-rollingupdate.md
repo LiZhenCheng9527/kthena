@@ -52,7 +52,9 @@ Support for role-based rolling updates:
 
 - Support Partition. Partitioning is still supported at the serving group level. However, even in role-based rolling updates, partition ensures that some servingGroups remain unchanged.
 - Support ControllerRevision history for Roles. Maybe servingGroup ControllerRevision is enough.
-- Support MaxUnavailable
+- Support two-level MaxUnavailable. The top-level rollout configuration limits
+    unavailable ServingGroups, while each Role can independently limit unavailable
+    role replicas inside a selected ServingGroup.
 - Perform a rolling update step by step in descending order of Role IDs.
 
 #### Non-Goals
@@ -163,6 +165,43 @@ for _, role := range servingGroup.Spec.Template.Roles {
 }
 ```
 
+#### ServingGroup-level update budget
+
+`spec.rolloutStrategy.rollingUpdateConfiguration.maxUnavailable` applies to both
+`ServingGroupRollingUpdate` and `RoleRollingUpdate`. For Role rolling updates it
+limits how many ServingGroups can be unavailable at the same time. The controller
+calculates the number of ServingGroups that may be processed as:
+
+```text
+minAvailable = max(0, spec.replicas - maxUnavailable)
+maxScaleDown = max(0, observedServingGroups - minAvailable - newServingGroupUnavailable)
+```
+
+The controller selects the groups for the current reconciliation before
+performing any deletion. Existing `Rolling` groups are selected first and are
+always continued because their updates are already in progress. The remaining
+slots are filled first with outdated non-running groups and then with outdated
+running groups. Within each category, groups with larger ordinals are selected
+first. Unavailable groups already on the new revision reduce `maxScaleDown`.
+Old-revision non-running groups do not reduce it, but each selected group still
+occupies one processing slot for the current reconciliation.
+
+The top-level `partition` also applies to both strategies and protects
+ServingGroups whose ordinals are lower than the partition. Role-level
+`maxUnavailable` and `partition` remain a second, independent limit within each
+selected ServingGroup.
+
+When a ServingGroup is selected for Role rolling update, its datastore status is
+changed from `Running` to `Rolling`. It remains `Rolling` across all Role update
+batches. The status changes back to `Running` only after no unprotected outdated
+Role remains and all Role replicas are ready. This prevents a temporarily ready
+batch from releasing the ServingGroup-level availability slot too early.
+
+For `ServingGroupRollingUpdate`, the ServingGroup also remains `Rolling` while
+its resources are deleted. The deletion handlers treat this as whole-group
+deletion in that strategy, while `RoleRollingUpdate` continues to use `Rolling`
+for role-level replacement without deleting the ServingGroup itself.
+
 Rollback is out of scope for this proposal and may be addressed in a future enhancement.
 
 #### Test Plan
@@ -181,6 +220,8 @@ challenging to test, should be called out.
 -->
 
 - Add unit tests for main functions
+- Verify that Role rolling updates respect the top-level ServingGroup
+    `maxUnavailable` and `partition` together with Role-level limits.
 - Add E2E tests for RoleRollingUpdate
 
 ### Alternatives

@@ -647,7 +647,7 @@ func (c *ModelServingController) syncServingGroupReplicas(ctx context.Context, m
 		klog.V(2).Infof("manageServingGroupReplicas: scaling up modelServing=%s (%d -> %d)", utils.GetNamespaceName(ms), curReplicas, expectedCount)
 		// update pod groups if needed
 		for _, servingGroup := range servingGroupList {
-			if servingGroup.Status != datastore.ServingGroupDeleting {
+			if servingGroup.Status != datastore.ServingGroupDeleting && !isServingGroupRollingDeletion(ms, servingGroup.Status) {
 				if err := c.createOrUpdatePodGroupByServingGroup(ctx, ms, servingGroup.Name); err != nil {
 					return fmt.Errorf("failed to update PodGroup for ServingGroup %s: %v", servingGroup.Name, err)
 				}
@@ -672,7 +672,7 @@ func (c *ModelServingController) syncServingGroupReplicas(ctx context.Context, m
 			return fmt.Errorf("cannot get servingGroup of modelServing: %s from map: %v", ms.GetName(), err)
 		}
 		for _, servingGroup := range servingGroupList {
-			if servingGroup.Status != datastore.ServingGroupDeleting {
+			if servingGroup.Status != datastore.ServingGroupDeleting && !isServingGroupRollingDeletion(ms, servingGroup.Status) {
 				if err := c.createOrUpdatePodGroupByServingGroup(ctx, ms, servingGroup.Name); err != nil {
 					return fmt.Errorf("failed to update PodGroup for ServingGroup %s: %v", servingGroup.Name, err)
 				}
@@ -811,7 +811,7 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 // the new revision otherwise. It traverses every Role to align actual pods to expected status.
 //
 // Main processing steps:
-// 1. Iterate over all existing ServingGroups and skip those already marked as "Deleting".
+// 1. Iterate over all existing ServingGroups and skip those being deleted.
 // 2. Identify if the current ServingGroup falls under the rollout Partition protection.
 // 3. Fallback to an older revision (ControllerRevision) if the group is protected by the partition.
 // 4. Update memory caches and use `manageRoleReplicas` to add/remove out-of-sync Pods and Services for each role.
@@ -822,7 +822,8 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 	}
 	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 	for index, servingGroup := range servingGroupList {
-		if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroup.Name) == datastore.ServingGroupDeleting {
+		status := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroup.Name)
+		if status == datastore.ServingGroupDeleting || isServingGroupRollingDeletion(ms, status) {
 			// Deleting ServingGroup will be recreated after the deletion is complete, so there is no need to scale the roles
 			continue
 		}
@@ -1362,6 +1363,22 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 		return fmt.Errorf("failed to check ServingGroup status, err: %v", err)
 	}
 	if ready {
+		if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName) == datastore.ServingGroupRolling {
+			if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate {
+				finished, _, err := c.tryFinishRoleRollingUpdate(ms, servingGroupName, utils.ModelServingRevision(ms))
+				if err != nil {
+					return fmt.Errorf("failed to finish RoleRollingUpdate for ServingGroup %s: %v", servingGroupName, err)
+				}
+				if finished {
+					c.enqueueModelServing(ms)
+				} else {
+					klog.V(4).Infof("ServingGroup %s remains Rolling until all outdated Roles are updated", servingGroupName)
+				}
+			} else {
+				klog.V(4).Infof("ServingGroup %s remains Rolling while it is replaced", servingGroupName)
+			}
+			return nil
+		}
 		// All pods in the ServingGroup are running, so the ServingGroup status also needs to be set to running
 		err = c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupRunning)
 		klog.V(4).Infof("ServingGroup: %s/%s status updated to Running", ms.GetName(), servingGroupName)
@@ -1627,7 +1644,8 @@ func isOwnedByModelServing(metaObj metav1.Object) bool {
 // Returns true if the resource deletion is already in progress and the caller should stop further handling.
 func (c *ModelServingController) handleDeletionInProgress(ms *workloadv1alpha1.ModelServing, servingGroupName, roleName, roleID string) bool {
 	// check ServingGroup status
-	if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName) == datastore.ServingGroupDeleting {
+	groupStatus := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
+	if groupStatus == datastore.ServingGroupDeleting || isServingGroupRollingDeletion(ms, groupStatus) {
 		// ServingGroup is already in the deletion process, only checking whether the deletion is completed
 		if c.isServingGroupDeleted(ms, servingGroupName) {
 			// ServingGroup has been deleted, so the storage needs to be updated and need to reconcile.
@@ -1657,8 +1675,8 @@ func (c *ModelServingController) handleDeletionInProgress(ms *workloadv1alpha1.M
 
 func (c *ModelServingController) isServingGroupDeleted(ms *workloadv1alpha1.ModelServing, servingGroupName string) bool {
 	status := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
-	if status != datastore.ServingGroupDeleting {
-		// It will be Determined whether all resource have been deleted only when the group status is deleting.
+	if status != datastore.ServingGroupDeleting && !isServingGroupRollingDeletion(ms, status) {
+		// Determine whether all resources have been deleted only when the group is being deleted.
 		return false
 	}
 	// check whether the ServingGroup deletion has been completed
@@ -1836,7 +1854,9 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 				continue
 			}
 
-			if groups[index].Status == datastore.ServingGroupRunning {
+			if groups[index].Status == datastore.ServingGroupRolling {
+				progressingGroups = append(progressingGroups, index)
+			} else if groups[index].Status == datastore.ServingGroupRunning {
 				available = available + 1
 			} else if ok, err := c.checkServingGroupReady(latestMS, groups[index].Name); ok && err == nil {
 				// some scenarios, pod events may not trigger group status updates, such as role scaling down.
@@ -2116,7 +2136,7 @@ func (c *ModelServingController) syncHeadlessServices(ctx context.Context, ms *w
 	}
 
 	for _, sg := range servingGroups {
-		if sg.Status == datastore.ServingGroupDeleting {
+		if sg.Status == datastore.ServingGroupDeleting || isServingGroupRollingDeletion(ms, sg.Status) {
 			continue
 		}
 		for _, role := range ms.Spec.Template.Roles {
@@ -2295,13 +2315,16 @@ func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *wor
 		}
 	}
 
-	// update ServingGroup status to Deleting before deleting pods and services.
-	// To avoid unnecessary recreation of headless services.
-	err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupDeleting)
-	if err != nil {
-		klog.ErrorS(err, "Failed to update ServingGroup status", "namespace", ms.Namespace, "servingGroup", servingGroupName)
-		return err
+	// Keep Rolling while a ServingGroupRollingUpdate deletes the whole group so
+	// the rollout state remains visible. Other deletion paths use Deleting.
+	if !isServingGroupRollingDeletion(ms, status) {
+		err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupDeleting)
+		if err != nil {
+			klog.ErrorS(err, "Failed to update ServingGroup status", "namespace", ms.Namespace, "servingGroup", servingGroupName)
+			return err
+		}
 	}
+	var err error
 	defer func() {
 		if err != nil {
 			// Due to the failure to delete the role.

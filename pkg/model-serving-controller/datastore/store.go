@@ -84,6 +84,7 @@ const (
 	ServingGroupCreating ServingGroupStatus = "Creating"
 	ServingGroupDeleting ServingGroupStatus = "Deleting"
 	ServingGroupScaling  ServingGroupStatus = "Scaling"
+	ServingGroupRolling  ServingGroupStatus = "Rolling"
 	ServingGroupNotFound ServingGroupStatus = "NotFound"
 )
 

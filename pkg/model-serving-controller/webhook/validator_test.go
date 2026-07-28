@@ -235,6 +235,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
 							},
 						},
 					},
@@ -243,7 +244,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 			want: field.ErrorList(nil),
 		},
 		{
-			name: "rejects configuration for role rolling update",
+			name: "allows serving group configuration for role rolling update",
 			args: args{
 				ms: &workloadv1alpha1.ModelServing{
 					Spec: workloadv1alpha1.ModelServingSpec{
@@ -255,17 +256,13 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
 							},
 						},
 					},
 				},
 			},
-			want: field.ErrorList{
-				field.Forbidden(
-					field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration"),
-					"rollingUpdateConfiguration is only valid when rolloutStrategy.type is ServingGroupRollingUpdate",
-				),
-			},
+			want: field.ErrorList(nil),
 		},
 		{
 			name: "invalid maxUnavailable format",

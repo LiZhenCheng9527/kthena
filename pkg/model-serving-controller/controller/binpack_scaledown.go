@@ -38,6 +38,7 @@ const (
 	PriorityServingGroupCreating = 0
 	PriorityServingGroupDeleting = 0
 	PriorityServingGroupScaling  = 0
+	PriorityServingGroupRolling  = 0
 	PriorityServingGroupNotFound = 0
 	PriorityServingGroupRunning  = 1
 
@@ -78,6 +79,8 @@ func getServingGroupStatusPriority(status datastore.ServingGroupStatus) int {
 		return PriorityServingGroupDeleting
 	case datastore.ServingGroupScaling:
 		return PriorityServingGroupScaling
+	case datastore.ServingGroupRolling:
+		return PriorityServingGroupRolling
 	case datastore.ServingGroupNotFound:
 		return PriorityServingGroupNotFound
 	default:

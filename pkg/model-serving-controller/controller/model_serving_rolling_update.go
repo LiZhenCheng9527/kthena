@@ -17,10 +17,8 @@ limitations under the License.
 package controller
 
 import (
-	"cmp"
 	"context"
 	"fmt"
-	"slices"
 
 	"k8s.io/klog/v2"
 
@@ -28,6 +26,11 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
+
+func isServingGroupRollingDeletion(ms *workloadv1alpha1.ModelServing, status datastore.ServingGroupStatus) bool {
+	return status == datastore.ServingGroupRolling &&
+		(ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.Type == workloadv1alpha1.ServingGroupRollingUpdate)
+}
 
 // manageRollingUpdate resolves the lifecycle aspect of an update, checking outdated sets,
 // enforcing strict Unavailable quota constraints, and actively evicting ServingGroups
@@ -45,56 +48,75 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 	}
 
 	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
-	// Separate outdated groups into two categories: not-running and running
-	// We prioritize updating not-running outdated groups first
-	var notRunningOutdatedGroups []datastore.ServingGroup
-	var runningOutdatedGroups []datastore.ServingGroup
-	if partition >= len(servingGroupList) {
-		// All servingGroups are protected by partition, so we should not update any group. Return directly.
+	if partition > len(servingGroupList) {
 		return nil
 	}
 	groupsAfterPartition := servingGroupList[partition:]
 
+	// Separate groups by processing priority. Rolling groups are always continued;
+	// new candidates are selected from not-running groups before running groups.
+	var rollingGroups []datastore.ServingGroup
+	var notRunningOutdatedGroups []datastore.ServingGroup
+	var runningOutdatedGroups []datastore.ServingGroup
 	newServingGroupUnavailableCount := 0
 	for _, sg := range groupsAfterPartition {
-		if sg.Status != datastore.ServingGroupRunning {
-			if sg.Revision == revision {
-				newServingGroupUnavailableCount++
-			} else {
-				notRunningOutdatedGroups = append(notRunningOutdatedGroups, sg)
+		if sg.Status == datastore.ServingGroupRolling {
+			rollingGroups = append(rollingGroups, sg)
+			continue
+		}
+
+		outdated := sg.Revision != revision
+		// The assumption here is that updates will proceed normally when the `role`'s partition is sorted in descending order.
+		if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate {
+			_, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ms, sg)
+			if err != nil {
+				return err
 			}
-		} else if sg.Revision != revision {
+			outdated = hasOutdatedRoles
+		}
+		if !outdated {
+			if sg.Status != datastore.ServingGroupRunning {
+				newServingGroupUnavailableCount++
+			}
+			// not-outdated servingGroup only to count the unavailable ones
+			continue
+		}
+
+		if sg.Status != datastore.ServingGroupRunning {
+			notRunningOutdatedGroups = append(notRunningOutdatedGroups, sg)
+		} else {
 			runningOutdatedGroups = append(runningOutdatedGroups, sg)
 		}
 	}
 
-	maxScaleDown := 0
-	if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.Type == workloadv1alpha1.ServingGroupRollingUpdate {
-		maxUnavailable, err := utils.GetMaxUnavailable(ms)
-		if err != nil {
-			return fmt.Errorf("failed to calculate maxUnavailable: %v", err)
-		}
+	// Reference: https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/rolling.go#L102
+	maxUnavailable, err := utils.GetMaxUnavailable(ms)
+	if err != nil {
+		return fmt.Errorf("failed to calculate maxUnavailable: %v", err)
+	}
+	minAvailable := modelServingReplicas(ms) - maxUnavailable
+	// Only unavailable new-version groups consume the update budget. An unavailable
+	// old-version group can be replaced without further reducing availability.
+	maxScaleDown := len(servingGroupList) - minAvailable - newServingGroupUnavailableCount
 
-		// TODO(hzxuzhonghu): reuse calMaxScaleDown
+	// Put not-running groups at the end so they are selected before running
+	// groups when taking the last maxScaleDown candidates.
+	var groupsToUpdate []datastore.ServingGroup
+	allOutdatedGroups := append(runningOutdatedGroups, notRunningOutdatedGroups...)
+	if maxScaleDown <= 0 {
+		groupsToUpdate = rollingGroups
+	} else {
+		groupsToUpdate = selectServingGroupsForRollingUpdate(maxScaleDown, rollingGroups, allOutdatedGroups)
+	}
 
-		// Calculate the minimum number of available ServingGroups required
-		// Refer to https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/rolling.go
-		// Check if we can scale down. We can scale down in the following 2 cases:
-		// * Some old servingGroups are unhealthy, we could safely scale down those unhealthy servingGroups
-		//   since that won't further increase unavailability.
-		// * New servingGroup has scaled up and its replicas become ready, then we can scale down old servingGroups
-		//   in a further step.
-		minAvailable := int(*ms.Spec.Replicas) - maxUnavailable
-		maxScaleDown = len(servingGroupList) - minAvailable - newServingGroupUnavailableCount
-		if maxScaleDown <= 0 {
-			klog.V(4).Infof("No ServingGroups can be updated for ModelServing %s/%s: maxScaleDown=%d",
-				ms.Namespace, ms.Name, maxScaleDown)
-			return nil
-		}
+	if len(groupsToUpdate) == 0 {
+		klog.V(4).Infof("No ServingGroups can be updated for ModelServing %s/%s: replicas=%d, minAvailable=%d, newUnavailable=%d",
+			ms.Namespace, ms.Name, len(servingGroupList), minAvailable, newServingGroupUnavailableCount)
+		return nil
 	}
 
 	// Delete outdated groups or roles according to the selected rollout strategy.
-	updateCount, err := c.deleteOutdatedResourcesForRollingUpdate(ctx, ms, maxScaleDown, notRunningOutdatedGroups, runningOutdatedGroups, revision)
+	updateCount, err := c.deleteOutdatedResourcesForRollingUpdate(ctx, ms, groupsToUpdate, revision)
 	if err != nil {
 		return err
 	}
@@ -105,26 +127,48 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 	return nil
 }
 
+// selectServingGroupsForRollingUpdate selects the groups processed in this
+// reconcile. Existing Rolling groups are always continued. The outdated groups
+// are ordered with running groups first and not-running groups last, so taking
+// the tail prioritizes not-running groups and larger ordinals.
+func selectServingGroupsForRollingUpdate(
+	maxScaleDown int,
+	rollingGroups []datastore.ServingGroup,
+	outdatedGroups []datastore.ServingGroup,
+) []datastore.ServingGroup {
+	selected := make([]datastore.ServingGroup, 0, max(maxScaleDown, len(rollingGroups)))
+	// Rolling groups represent updates already in progress and must not be
+	// stranded when the current budget is exhausted or reduced.
+	for i := len(rollingGroups) - 1; i >= 0; i-- {
+		selected = append(selected, rollingGroups[i])
+	}
+	remaining := maxScaleDown - len(rollingGroups)
+	if remaining <= 0 {
+		return selected
+	}
+	start := max(0, len(outdatedGroups)-remaining)
+	// outdatedGroups contains running groups first and not-running groups last.
+	// Iterate backwards to process Rolling -> notRunning -> Running groups, with
+	// larger ordinals first in each category.
+	for i := len(outdatedGroups) - 1; i >= start; i-- {
+		selected = append(selected, outdatedGroups[i])
+	}
+	return selected
+}
+
 // deleteOutdatedResourcesForRollingUpdate deletes outdated resources during rolling update
-// respecting maxScaleDown constraints.
+// for the groups selected by manageRollingUpdate.
 func (c *ModelServingController) deleteOutdatedResourcesForRollingUpdate(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
-	maxScaleDown int,
-	notRunningOutdatedGroups []datastore.ServingGroup,
-	runningOutdatedGroups []datastore.ServingGroup,
+	groups []datastore.ServingGroup,
 	revision string,
 ) (int, error) {
-	// Combine all outdated groups.
-	// Delete in descending order by sequence number. Prioritise deletion of servingGroups in notRunning status.
-	// Therefore, servingGroups in notRunning status should be placed at the end.
-	allOutdatedGroups := append(runningOutdatedGroups, notRunningOutdatedGroups...)
-
 	if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.Type == workloadv1alpha1.ServingGroupRollingUpdate {
-		return c.deleteOutdatedServingGroups(ctx, ms, maxScaleDown, allOutdatedGroups)
+		return c.deleteOutdatedServingGroups(ctx, ms, groups)
 	}
 
-	return c.deleteOutdatedRoles(ctx, ms, allOutdatedGroups, revision)
+	return c.deleteOutdatedRoles(ctx, ms, groups, revision)
 }
 
 // deleteOutdatedServingGroups deletes outdated ServingGroups
@@ -132,14 +176,14 @@ func (c *ModelServingController) deleteOutdatedResourcesForRollingUpdate(
 func (c *ModelServingController) deleteOutdatedServingGroups(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
-	maxScaleDown int,
 	groups []datastore.ServingGroup,
 ) (int, error) {
 	updateCount := 0
 
-	// Iterate from end to start to delete largest ordinals first.
-	for i := len(groups) - 1; i >= 0 && updateCount < maxScaleDown; i-- {
-		sg := groups[i]
+	for _, sg := range groups {
+		if err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), sg.Name, datastore.ServingGroupRolling); err != nil {
+			return updateCount, fmt.Errorf("failed to set ServingGroup %s status to Rolling: %v", sg.Name, err)
+		}
 		klog.V(2).Infof("ServingGroup %s will be terminated for update (status=%s)", sg.Name, sg.Status)
 		if err := c.deleteServingGroup(ctx, ms, sg.Name); err != nil {
 			return updateCount, err
@@ -159,19 +203,20 @@ func (c *ModelServingController) deleteOutdatedRoles(
 ) (int, error) {
 	updateCount := 0
 
-	// Iterate from end to start to delete largest ordinals first.
-	for i := len(groups) - 1; i >= 0; i-- {
-		sg := groups[i]
-		rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ms, sg)
+	for _, sg := range groups {
+		finished, rolesToDelete, err := c.tryFinishRoleRollingUpdate(ms, sg.Name, revision)
 		if err != nil {
 			return updateCount, err
 		}
-		if !hasOutdatedRoles {
-			c.updateServingGroupRevisionIfNoOutdatedRoles(ms, sg.Name, revision)
+		if finished {
+			c.enqueueModelServing(ms)
 			continue
 		}
 		if len(rolesToDelete) == 0 {
 			continue
+		}
+		if err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), sg.Name, datastore.ServingGroupRolling); err != nil {
+			return updateCount, fmt.Errorf("failed to set ServingGroup %s status to Rolling: %v", sg.Name, err)
 		}
 		for _, role := range rolesToDelete {
 			klog.V(2).Infof("Role %s/%s in ServingGroup %s will be terminated for update", role.roleName, role.roleID, sg.Name)
@@ -183,12 +228,59 @@ func (c *ModelServingController) deleteOutdatedRoles(
 	return updateCount, nil
 }
 
-func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ms *workloadv1alpha1.ModelServing, groupName, revision string) {
-	if err := c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), groupName, revision); err != nil {
-		klog.Errorf("failed to update ServingGroup %s revision: %v", groupName, err)
-		return
+// tryFinishRoleRollingUpdate returns the Roles that can be updated in this
+// reconcile. If no actionable outdated Role remains, it changes a Rolling
+// ServingGroup to Running after every Role is ready.
+func (c *ModelServingController) tryFinishRoleRollingUpdate(ms *workloadv1alpha1.ModelServing, groupName, revision string) (bool, []roleToDelete, error) {
+	groupRevision, _ := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName)
+	rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ms, datastore.ServingGroup{Name: groupName, Revision: groupRevision})
+	if err != nil {
+		return false, nil, err
 	}
-	klog.V(2).Infof("Updated ServingGroup %s revision to latest: %s", groupName, revision)
+	if hasOutdatedRoles {
+		return false, rolesToDelete, nil
+	}
+
+	if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), groupName) != datastore.ServingGroupRolling {
+		return false, nil, nil
+	}
+
+	// The role has been successfully upgraded. However, it is not yet running.
+	ready, err := c.checkServingGroupReady(ms, groupName)
+	if err != nil {
+		return false, nil, err
+	}
+	if !ready {
+		return false, nil, nil
+	}
+
+	var revisionErr, statusErr error
+	defer func() {
+		if revisionErr == nil && statusErr == nil {
+			return
+		}
+
+		// Keep the ServingGroup in its pre-completion state so the next
+		// reconcile can retry both updates as one logical operation.
+		if err := c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), groupName, groupRevision); err != nil {
+			klog.Errorf("failed to roll back ServingGroup %s revision: %v", groupName, err)
+		}
+		if err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), groupName, datastore.ServingGroupRolling); err != nil {
+			klog.Errorf("failed to roll back ServingGroup %s status to Rolling: %v", groupName, err)
+		}
+		c.enqueueModelServing(ms)
+	}()
+
+	revisionErr = c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), groupName, revision)
+	if revisionErr != nil {
+		return false, nil, fmt.Errorf("failed to update ServingGroup %s revision: %v", groupName, revisionErr)
+	}
+	statusErr = c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), groupName, datastore.ServingGroupRunning)
+	if statusErr != nil {
+		return false, nil, fmt.Errorf("failed to set ServingGroup %s status to Running: %v", groupName, statusErr)
+	}
+	klog.V(2).Infof("Role rolling update completed for ServingGroup %s", groupName)
+	return true, nil, nil
 }
 
 type roleToDelete struct {
@@ -215,46 +307,15 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			return nil, false, fmt.Errorf("failed to get roles for ServingGroup %s, role %s: %v", sg.Name, roleSpec.Name, err)
 		}
 
-		outdatedRoles, newUnavailable := c.outdatedRoles(ms, sg, roleSpec, roleList)
-		partition, partitionConfigured, partitionErr := c.getPartition(&roleSpec.RollingUpdateConfiguration, roleReplicas(roleSpec))
+		partition, _, partitionErr := c.getPartition(&roleSpec.RollingUpdateConfiguration, roleReplicas(roleSpec))
 		if partitionErr != nil {
 			return nil, false, fmt.Errorf("failed to parse partition for role %s: %v", roleSpec.Name, partitionErr)
 		}
-		if partitionConfigured && partition > 0 && len(outdatedRoles) > 0 {
-			protected := make(map[string]struct{}, partition)
-			for _, role := range roleList {
-				_, ordinal := utils.GetParentNameAndOrdinal(role.Name)
-				if ordinal < partition {
-					protected[role.Name] = struct{}{}
-				}
-			}
-			filtered := outdatedRoles[:0]
-			for _, r := range outdatedRoles {
-				if _, ok := protected[r.Name]; ok {
-					continue
-				}
-				filtered = append(filtered, r)
-			}
-			outdatedRoles = filtered
-		}
+		// roleList is sorted by ordinal. Partition protects the first N Role
+		// instances, regardless of gaps in their ordinal values.
+		rolesAfterPartition := roleList[min(partition, len(roleList)):]
+		outdatedRoles, newUnavailable := c.outdatedRoles(ms, sg, roleSpec, rolesAfterPartition)
 		if len(outdatedRoles) == 0 {
-			if partitionConfigured && partition > 0 {
-				expectedHash := utils.CalRoleTemplateHash(roleSpec)
-				for _, role := range roleList {
-					_, ordinal := utils.GetParentNameAndOrdinal(role.Name)
-					if ordinal >= partition {
-						continue
-					}
-					if role.Status == datastore.RoleDeleting {
-						continue
-					}
-					observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, roleSpec.Name, role)
-					if ok && observedHash != expectedHash {
-						hasOutdatedRoles = true
-						break
-					}
-				}
-			}
 			continue
 		}
 		hasOutdatedRoles = true
@@ -304,33 +365,21 @@ func (c *ModelServingController) outdatedRoles(ms *workloadv1alpha1.ModelServing
 		}
 		if observedHash != expectedHash {
 			outdatedRoles = append(outdatedRoles, role)
-		} else if role.Status != datastore.RoleRunning {
+			continue
+		}
+		if role.Status != datastore.RoleRunning {
 			newUnavailable++
 		}
 	}
-
-	slices.SortFunc(outdatedRoles, func(a, b datastore.Role) int {
-		if a.Status != b.Status {
-			if a.Status != datastore.RoleRunning {
-				return -1
-			}
-			return 1
-		}
-		_, aOrdinal := utils.GetParentNameAndOrdinal(a.Name)
-		_, bOrdinal := utils.GetParentNameAndOrdinal(b.Name)
-		return cmp.Compare(bOrdinal, aOrdinal)
-	})
 	return outdatedRoles, newUnavailable
 }
 
 func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role, maxScaleDown int) ([]roleToDelete, error) {
-	rolesToDelete := make([]roleToDelete, 0, len(outdatedRoles))
-	for _, role := range outdatedRoles {
-		if maxScaleDown == 0 {
-			break
-		}
-		maxScaleDown--
+	rolesToDelete := make([]roleToDelete, 0, min(len(outdatedRoles), maxScaleDown))
+	for i := len(outdatedRoles) - 1; i >= 0 && maxScaleDown > 0; i-- {
+		role := outdatedRoles[i]
 		rolesToDelete = append(rolesToDelete, roleToDelete{roleName: roleName, roleID: role.Name})
+		maxScaleDown--
 	}
 	return rolesToDelete, nil
 }

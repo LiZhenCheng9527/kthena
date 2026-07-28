@@ -97,13 +97,11 @@ func TestSGLangConnectorRetryIsolation(t *testing.T) {
 	prefillAddr := prefillServer.Listener.Addr().String()
 	decodeAddr := decodeServer.Listener.Addr().String()
 
-	// First call — simulates retry iteration 0.
+	// First call simulates the initial PD attempt.
 	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, nil); err != nil {
 		t.Fatalf("first Proxy call failed: %v", err)
 	}
-	// Second call with the SAME prefill addr — simulates the scheduler reselecting
-	// the same prefill pod for a different decode pod on retry. This is the path
-	// where the previous (cached) request would have a drained body.
+	// The second call simulates another attempt on the same connector.
 	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, nil); err != nil {
 		t.Fatalf("second Proxy call failed: %v", err)
 	}

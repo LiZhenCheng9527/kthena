@@ -48,6 +48,8 @@ const ConnectorTypeSGLang v1alpha1.KVConnectorType = "sglang"
 //
 //	https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler.py
 type SGLangConnector struct {
+	// newBootstrapRoom is injectable for deterministic tests; production
+	// connectors always use rand.Int63.
 	newBootstrapRoom func() int64
 }
 

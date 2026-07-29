@@ -344,6 +344,7 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	return blockToPods, nil
 }
 
+// podCacheOwnerIdentifier matches the pod.namespace Redis owner format written by the Runtime.
 func podCacheOwnerIdentifier(pod *datastore.PodInfo) string {
 	podName := pod.GetPodNamespacedName()
 	return fmt.Sprintf("%s.%s", podName.Name, podName.Namespace)

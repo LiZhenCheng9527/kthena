@@ -734,7 +734,7 @@ func TestKVCacheAware_Score_Core(t *testing.T) {
 	}
 }
 
-func TestKVCacheAware_ScoreMatchesNamespacedRedisOwner(t *testing.T) {
+func TestKVCacheAware_ScoreMatchesOnlyNamespacedRedisOwner(t *testing.T) {
 	tokenizerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/tokenize" {
 			http.NotFound(w, r)
@@ -793,6 +793,22 @@ func TestKVCacheAware_ScoreMatchesNamespacedRedisOwner(t *testing.T) {
 
 	if score := scores[pod]; score != 100 {
 		t.Fatalf("namespaced Redis owner score = %d, want 100; all scores: %v", score, scores)
+	}
+
+	if err := redisClient.HDel(context.Background(), key, podName+"."+namespace).Err(); err != nil {
+		t.Fatalf("failed to remove namespaced Redis owner: %v", err)
+	}
+	if err := redisClient.HSet(context.Background(), key, podName, time.Now().Unix()).Err(); err != nil {
+		t.Fatalf("failed to seed bare Redis owner: %v", err)
+	}
+
+	scores = plugin.Score(&framework.Context{
+		Model:  model,
+		Prompt: &common.ChatMessage{Text: "hello"},
+	}, []*datastore.PodInfo{pod})
+
+	if score, exists := scores[pod]; exists {
+		t.Fatalf("bare Redis owner matched namespaced pod with score %d; all scores: %v", score, scores)
 	}
 }
 

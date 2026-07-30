@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -1138,6 +1139,116 @@ func TestModelServingRoleRollingUpdateServingGroupMaxUnavailable(t *testing.T) {
 			"RoleRollingUpdate must not exceed the ServingGroup maxUnavailable budget")
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// TestModelServingRoleRollingUpdateServingGroupMaxUnavailableProgressively verifies
+// that RoleRollingUpdate starts only one ServingGroup at a time when the top-level
+// maxUnavailable is one, and continues with the next group after the current group
+// becomes ready.
+func TestModelServingRoleRollingUpdateServingGroupMaxUnavailableProgressively(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	const servingGroupReplicas = int32(3)
+	gateType := corev1.PodConditionType("kthena.e2e/role-rolling-ready")
+	maxUnavailable := intstr.FromInt(1)
+	modelServing := createBasicModelServing("test-role-rolling-sg-progressive", servingGroupReplicas, 1)
+	modelServing.Spec.RecoveryPolicy = workload.RoleRecreate
+	modelServing.Spec.RolloutStrategy = &workload.RolloutStrategy{
+		Type: workload.RoleRollingUpdate,
+		RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+			MaxUnavailable: &maxUnavailable,
+		},
+	}
+	modelServing.Spec.Template.Roles[0].EntryTemplate.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: gateType}}
+
+	t.Log("Creating RoleRollingUpdate ModelServing with 3 ServingGroups and maxUnavailable=1")
+	_, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Create(ctx, modelServing, metav1.CreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		if err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Delete(cleanupCtx, modelServing.Name, metav1.DeleteOptions{}); err != nil {
+			t.Logf("Failed to delete ModelServing %s during cleanup: %v", modelServing.Name, err)
+		}
+	})
+
+	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, int(servingGroupReplicas), 3*time.Minute)
+	initialPods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: modelServingLabelSelector(modelServing.Name),
+	})
+	require.NoError(t, err)
+	for _, pod := range initialPods.Items {
+		patchRoleRollingReadinessGate(t, ctx, kubeClient, pod.Name, gateType)
+	}
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+
+	current, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	updated := current.DeepCopy()
+	updated.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	t.Logf("Updating Role image to %s", nginxAlpineImage)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updated, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	// Each newly updated ServingGroup remains unavailable until this test
+	// satisfies its readiness gate. The controller must not start another group
+	// while that group consumes the single unavailable slot.
+	for expectedUpdatedGroups := 1; expectedUpdatedGroups <= int(servingGroupReplicas); expectedUpdatedGroups++ {
+		var updatedPods []corev1.Pod
+		require.Eventually(t, func() bool {
+			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+				LabelSelector: modelServingLabelSelector(modelServing.Name),
+			})
+			if err != nil {
+				return false
+			}
+
+			updatedGroups := map[string]struct{}{}
+			unavailableUpdatedGroups := map[string]struct{}{}
+			updatedPods = updatedPods[:0]
+			for _, pod := range pods.Items {
+				if pod.DeletionTimestamp != nil || len(pod.Spec.Containers) == 0 || pod.Spec.Containers[0].Image != nginxAlpineImage {
+					continue
+				}
+				groupName := pod.Labels[workload.GroupNameLabelKey]
+				updatedGroups[groupName] = struct{}{}
+				updatedPods = append(updatedPods, pod)
+				if !utils.IsPodReady(pod) {
+					unavailableUpdatedGroups[groupName] = struct{}{}
+				}
+			}
+
+			t.Logf("updated ServingGroups=%d/%d, unavailable updated ServingGroups=%d",
+				len(updatedGroups), servingGroupReplicas, len(unavailableUpdatedGroups))
+			if len(updatedGroups) > expectedUpdatedGroups || len(unavailableUpdatedGroups) > 1 {
+				t.Errorf("ServingGroup maxUnavailable exceeded: updated=%d, expected at most=%d, unavailable=%d",
+					len(updatedGroups), expectedUpdatedGroups, len(unavailableUpdatedGroups))
+				return false
+			}
+			return len(updatedGroups) == expectedUpdatedGroups && len(unavailableUpdatedGroups) == 1
+		}, 3*time.Minute, 2*time.Second, "expected exactly %d updated ServingGroups with only one unavailable", expectedUpdatedGroups)
+
+		for _, pod := range updatedPods {
+			if !utils.IsPodReady(pod) {
+				patchRoleRollingReadinessGate(t, ctx, kubeClient, pod.Name, gateType)
+			}
+		}
+	}
+
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+	verifyAllPodsHaveImage(t, ctx, kubeClient, modelServingLabelSelector(modelServing.Name), nginxAlpineImage, "after RoleRollingUpdate")
+}
+
+func patchRoleRollingReadinessGate(t *testing.T, ctx context.Context, kubeClient *kubernetes.Clientset, podName string, gateType corev1.PodConditionType) {
+	t.Helper()
+	patch := []byte(fmt.Sprintf(`{"status":{"conditions":[{"type":"%s","status":"True"}]}}`, gateType))
+	require.Eventually(t, func() bool {
+		patchCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
+		defer cancel()
+		_, err := kubeClient.CoreV1().Pods(testNamespace).Patch(
+			patchCtx, podName, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "status",
+		)
+		return err == nil
+	}, 30*time.Second, time.Second, "failed to satisfy readiness gate for pod %s", podName)
 }
 
 // TestModelServingRoleRollingUpdatePartition verifies RoleRollingUpdate respects role-level partition.

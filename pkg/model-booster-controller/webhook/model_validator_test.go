@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	registryv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -232,6 +233,168 @@ func TestValidatePVCURICompatibility(t *testing.T) {
 			if tt.expectValid {
 				assert.True(t, valid, "expected valid but got error: %s", errorMsg)
 				assert.Empty(t, errorMsg)
+			} else {
+				assert.False(t, valid)
+				assert.Contains(t, errorMsg, tt.expectMsg)
+			}
+		})
+	}
+}
+
+func nixlWorker(workerType registryv1alpha1.ModelWorkerType, role string) registryv1alpha1.ModelWorker {
+	return registryv1alpha1.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
+func mooncakeWorker(workerType registryv1alpha1.ModelWorkerType, role string) registryv1alpha1.ModelWorker {
+	return registryv1alpha1.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
+func TestValidateKvConnectorConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		workers     []registryv1alpha1.ModelWorker
+		expectValid bool
+		expectMsg   string
+	}{
+		{
+			name: "prefill NIXL + decode Mooncake is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "kv_connector mismatch between prefill",
+		},
+		{
+			name: "prefill Mooncake + decode NIXL is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				mooncakeWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "kv_connector mismatch between prefill",
+		},
+		{
+			name: "prefill NIXL + decode NIXL succeeds",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: true,
+		},
+		{
+			name: "worker order does not change the result",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+			},
+			expectValid: true,
+		},
+		{
+			name: "prefill missing kv-transfer-config is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				{Type: registryv1alpha1.ModelWorkerTypePrefill},
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "prefill worker has no kv-transfer-config",
+		},
+		{
+			name: "decode missing kv-transfer-config is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				{Type: registryv1alpha1.ModelWorkerTypeDecode},
+			},
+			expectValid: false,
+			expectMsg:   "decode worker has no kv-transfer-config",
+		},
+		{
+			name: "missing kv_connector is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				{
+					Type: registryv1alpha1.ModelWorkerTypePrefill,
+					Config: apiextensionsv1.JSON{
+						Raw: []byte(`{"kv-transfer-config":"{\"kv_role\":\"kv_producer\"}"}`),
+					},
+				},
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "kv_connector is missing",
+		},
+		{
+			name: "unknown kv_connector is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				{
+					Type: registryv1alpha1.ModelWorkerTypePrefill,
+					Config: apiextensionsv1.JSON{
+						Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"UnknownConnector\",\"kv_role\":\"kv_producer\"}"}`),
+					},
+				},
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "unsupported kv_connector",
+		},
+		{
+			name: "prefill with kv_consumer role is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_consumer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "invalid kv_role",
+		},
+		{
+			name: "decode with kv_producer role is rejected",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_producer"),
+			},
+			expectValid: false,
+			expectMsg:   "invalid kv_role",
+		},
+		{
+			name: "PD backend with no kv-transfer-config on either worker remains valid",
+			workers: []registryv1alpha1.ModelWorker{
+				{Type: registryv1alpha1.ModelWorkerTypePrefill},
+				{Type: registryv1alpha1.ModelWorkerTypeDecode},
+			},
+			expectValid: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := &registryv1alpha1.ModelBooster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-model",
+					Namespace: "default",
+				},
+				Spec: registryv1alpha1.ModelBoosterSpec{
+					Backend: registryv1alpha1.ModelBackend{
+						Name:     "backend1",
+						Type:     registryv1alpha1.ModelBackendTypeVLLMDisaggregated,
+						Replicas: 1,
+						Workers:  tt.workers,
+					},
+				},
+			}
+
+			valid, errorMsg := (&ModelValidator{}).validateModel(model)
+
+			if tt.expectValid {
+				assert.True(t, valid, "expected valid but got error: %s", errorMsg)
 			} else {
 				assert.False(t, valid)
 				assert.Contains(t, errorMsg, tt.expectMsg)

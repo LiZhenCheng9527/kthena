@@ -75,6 +75,24 @@ func TestBuildModelServer(t *testing.T) {
 	}
 }
 
+func mooncakeWorker(workerType registry.ModelWorkerType, role string) registry.ModelWorker {
+	return registry.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
+func nixlWorker(workerType registry.ModelWorkerType, role string) registry.ModelWorker {
+	return registry.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
 func TestGetKvConnectorSpec(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -83,28 +101,11 @@ func TestGetKvConnectorSpec(t *testing.T) {
 		expectErrMsg string
 	}{
 		{
-			name: "prefill worker with Mooncake connector",
+			name: "no workers is valid",
 			workers: []registry.ModelWorker{
-				{
-					Type: registry.ModelWorkerTypePrefill,
-					Config: apiextensionsv1.JSON{
-						Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}"}`),
-					},
-				},
+				{Type: registry.ModelWorkerTypeServer},
 			},
-			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeMoonCake},
-		},
-		{
-			name: "decode worker with NIXL connector",
-			workers: []registry.ModelWorker{
-				{
-					Type: registry.ModelWorkerTypeDecode,
-					Config: apiextensionsv1.JSON{
-						Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_consumer\"}"}`),
-					},
-				},
-			},
-			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeNIXL},
+			expected: nil,
 		},
 		{
 			name: "server worker is ignored",
@@ -119,19 +120,93 @@ func TestGetKvConnectorSpec(t *testing.T) {
 			expected: nil,
 		},
 		{
-			name: "unknown connector type is ignored",
+			name: "PD backend with no kv-transfer-config on either worker is valid",
 			workers: []registry.ModelWorker{
-				{
-					Type: registry.ModelWorkerTypePrefill,
-					Config: apiextensionsv1.JSON{
-						Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"UnknownConnector\"}"}`),
-					},
-				},
+				{Type: registry.ModelWorkerTypePrefill},
+				{Type: registry.ModelWorkerTypeDecode},
 			},
 			expected: nil,
 		},
 		{
-			name: "missing connector field is ignored",
+			name: "prefill producer + decode consumer with matching NIXL connector succeeds",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeNIXL},
+		},
+		{
+			name: "matching Mooncake connector succeeds",
+			workers: []registry.ModelWorker{
+				mooncakeWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeMoonCake},
+		},
+		{
+			name: "kv_both role is valid for both prefill and decode",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_both"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_both"),
+			},
+			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeNIXL},
+		},
+		{
+			name: "worker order does not change the result",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+			},
+			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeNIXL},
+		},
+		{
+			name: "prefill NIXL + decode Mooncake mismatch is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: `kv_connector mismatch between prefill ("NixlConnector") and decode ("MooncakeConnector")`,
+		},
+		{
+			name: "prefill Mooncake + decode NIXL mismatch is rejected regardless of order",
+			workers: []registry.ModelWorker{
+				mooncakeWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: `kv_connector mismatch between prefill ("MooncakeConnector") and decode ("NixlConnector")`,
+		},
+		{
+			name: "prefill with connector but decode missing entirely is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+			},
+			expectErrMsg: "decode worker has no kv-transfer-config",
+		},
+		{
+			name: "decode with connector but prefill missing entirely is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "prefill worker has no kv-transfer-config",
+		},
+		{
+			name: "prefill missing kv-transfer-config while decode has one is rejected",
+			workers: []registry.ModelWorker{
+				{Type: registry.ModelWorkerTypePrefill},
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "prefill worker has no kv-transfer-config",
+		},
+		{
+			name: "decode missing kv-transfer-config while prefill has one is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				{Type: registry.ModelWorkerTypeDecode},
+			},
+			expectErrMsg: "decode worker has no kv-transfer-config",
+		},
+		{
+			name: "missing kv_connector field is rejected",
 			workers: []registry.ModelWorker{
 				{
 					Type: registry.ModelWorkerTypePrefill,
@@ -139,8 +214,46 @@ func TestGetKvConnectorSpec(t *testing.T) {
 						Raw: []byte(`{"kv-transfer-config":"{\"kv_role\":\"kv_producer\"}"}`),
 					},
 				},
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
 			},
-			expected: nil,
+			expectErrMsg: "worker prefill: kv-transfer-config is set but kv_connector is missing",
+		},
+		{
+			name: "unknown kv_connector is rejected",
+			workers: []registry.ModelWorker{
+				{
+					Type: registry.ModelWorkerTypePrefill,
+					Config: apiextensionsv1.JSON{
+						Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"UnknownConnector\",\"kv_role\":\"kv_producer\"}"}`),
+					},
+				},
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: `worker prefill: unsupported kv_connector "UnknownConnector"`,
+		},
+		{
+			name: "prefill with kv_consumer role is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_consumer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: `worker prefill: invalid kv_role "kv_consumer", expected one of [kv_producer, kv_both]`,
+		},
+		{
+			name: "decode with kv_producer role is rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_producer"),
+			},
+			expectErrMsg: `worker decode: invalid kv_role "kv_producer", expected one of [kv_consumer, kv_both]`,
+		},
+		{
+			name: "reversed roles across prefill and decode are rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_consumer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_producer"),
+			},
+			expectErrMsg: `worker prefill: invalid kv_role "kv_consumer"`,
 		},
 		{
 			name: "malformed nested kv-transfer-config returns error",
@@ -152,7 +265,7 @@ func TestGetKvConnectorSpec(t *testing.T) {
 					},
 				},
 			},
-			expectErrMsg: "failed to get kv_connector for worker prefill",
+			expectErrMsg: "worker prefill: invalid kv-transfer-config",
 		},
 		{
 			name: "malformed worker config returns error",
@@ -164,13 +277,13 @@ func TestGetKvConnectorSpec(t *testing.T) {
 					},
 				},
 			},
-			expectErrMsg: "failed to get kv-transfer-config for worker prefill",
+			expectErrMsg: "worker prefill: invalid config",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := getKvConnectorSpec(registry.ModelBackend{
+			got, err := GetKvConnectorSpec(registry.ModelBackend{
 				Name:    "test-backend",
 				Workers: tt.workers,
 			})

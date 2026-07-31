@@ -235,7 +235,7 @@ func (collector *MetricCollector) collectPodMetricsGroup(
 	specs []podMetricSpec,
 	pastHistograms map[string]HistogramInfo,
 	currentHistograms map[string]HistogramInfo,
-) (values map[string]float64, unreadyPods map[string]struct{}, failed bool, err error) {
+) (values map[string]float64, unreadyPods sets.Set[string], failed bool, err error) {
 	values = make(map[string]float64, len(specs))
 	pods, err := util.GetMetricPods(podLister, collector.Scope.Namespace, collector.Target, podSource)
 	if err != nil {
@@ -266,11 +266,11 @@ func (collector *MetricCollector) collectPodMetricsGroup(
 
 // evaluatePodsReadiness counts pods that are not ready and reports whether any
 // pod has failed or restarted.
-func evaluatePodsReadiness(pods []*corev1.Pod) (unreadyPods map[string]struct{}, failed bool) {
-	unreadyPods = make(map[string]struct{})
+func evaluatePodsReadiness(pods []*corev1.Pod) (unreadyPods sets.Set[string], failed bool) {
+	unreadyPods = sets.New[string]()
 	for _, pod := range pods {
 		if !inferControllerUtils.IsPodRunningAndReady(pod) {
-			unreadyPods[metricPodKey(pod)] = struct{}{}
+			unreadyPods.Insert(metricPodKey(pod))
 		}
 		if util.IsPodFailed(pod) || inferControllerUtils.ContainerRestarted(pod) {
 			failed = true

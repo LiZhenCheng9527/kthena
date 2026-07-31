@@ -259,6 +259,15 @@ func mooncakeWorker(workerType registryv1alpha1.ModelWorkerType, role string) re
 	}
 }
 
+func mooncakeV1Worker(workerType registryv1alpha1.ModelWorkerType, role string) registryv1alpha1.ModelWorker {
+	return registryv1alpha1.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
 func TestValidateKvConnectorConfig(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -371,6 +380,36 @@ func TestValidateKvConnectorConfig(t *testing.T) {
 				{Type: registryv1alpha1.ModelWorkerTypeDecode},
 			},
 			expectValid: true,
+		},
+		{
+			// Matches the vllm-ascend connector name used by the existing
+			// examples/model-booster/prefill-decode-disaggregation.yaml ModelBooster example.
+			name: "matching MooncakeConnectorV1 succeeds",
+			workers: []registryv1alpha1.ModelWorker{
+				mooncakeV1Worker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeV1Worker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: true,
+		},
+		{
+			name: "duplicate prefill workers are rejected regardless of order",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "found 2 prefill workers, expected at most 1",
+		},
+		{
+			name: "duplicate decode workers are rejected regardless of order",
+			workers: []registryv1alpha1.ModelWorker{
+				nixlWorker(registryv1alpha1.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+				nixlWorker(registryv1alpha1.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectValid: false,
+			expectMsg:   "found 2 decode workers, expected at most 1",
 		},
 	}
 

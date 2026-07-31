@@ -93,6 +93,15 @@ func nixlWorker(workerType registry.ModelWorkerType, role string) registry.Model
 	}
 }
 
+func mooncakeV1Worker(workerType registry.ModelWorkerType, role string) registry.ModelWorker {
+	return registry.ModelWorker{
+		Type: workerType,
+		Config: apiextensionsv1.JSON{
+			Raw: []byte(`{"kv-transfer-config":"{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"` + role + `\"}"}`),
+		},
+	}
+}
+
 func TestGetKvConnectorSpec(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -144,6 +153,16 @@ func TestGetKvConnectorSpec(t *testing.T) {
 			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeMoonCake},
 		},
 		{
+			// Matches the vllm-ascend connector name used by the existing
+			// examples/model-booster/prefill-decode-disaggregation.yaml ModelBooster example.
+			name: "matching MooncakeConnectorV1 connector succeeds",
+			workers: []registry.ModelWorker{
+				mooncakeV1Worker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeV1Worker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeMoonCake},
+		},
+		{
 			name: "kv_both role is valid for both prefill and decode",
 			workers: []registry.ModelWorker{
 				nixlWorker(registry.ModelWorkerTypePrefill, "kv_both"),
@@ -158,6 +177,51 @@ func TestGetKvConnectorSpec(t *testing.T) {
 				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
 			},
 			expected: &networking.KVConnectorSpec{Type: networking.ConnectorTypeNIXL},
+		},
+		{
+			name: "duplicate prefill workers with different connectors are rejected regardless of order",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "backend test-backend: found 2 prefill workers, expected at most 1",
+		},
+		{
+			name: "duplicate prefill workers (reversed order) are rejected the same way",
+			workers: []registry.ModelWorker{
+				mooncakeWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "backend test-backend: found 2 prefill workers, expected at most 1",
+		},
+		{
+			name: "duplicate decode workers with different connectors are rejected regardless of order",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+				mooncakeWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "backend test-backend: found 2 decode workers, expected at most 1",
+		},
+		{
+			name: "duplicate decode workers (reversed order) are rejected the same way",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				mooncakeWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "backend test-backend: found 2 decode workers, expected at most 1",
+		},
+		{
+			name: "duplicate prefill workers with identical connectors are still rejected",
+			workers: []registry.ModelWorker{
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypePrefill, "kv_producer"),
+				nixlWorker(registry.ModelWorkerTypeDecode, "kv_consumer"),
+			},
+			expectErrMsg: "backend test-backend: found 2 prefill workers, expected at most 1",
 		},
 		{
 			name: "prefill NIXL + decode Mooncake mismatch is rejected",

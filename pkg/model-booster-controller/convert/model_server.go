@@ -30,9 +30,10 @@ import (
 )
 
 var VLLMKvConnectorType = map[string]networking.KVConnectorType{
-	"MooncakeConnector":  networking.ConnectorTypeMoonCake,
-	"NixlConnector":      networking.ConnectorTypeNIXL,
-	"LMCacheConnectorV1": networking.ConnectorTypeLMCache,
+	"MooncakeConnector":   networking.ConnectorTypeMoonCake,
+	"MooncakeConnectorV1": networking.ConnectorTypeMoonCake,
+	"NixlConnector":       networking.ConnectorTypeNIXL,
+	"LMCacheConnectorV1":  networking.ConnectorTypeLMCache,
 }
 
 // vLLM kv_role values. "kv_both" is accepted for either prefill or decode since some
@@ -123,24 +124,49 @@ func BuildModelServer(model *workload.ModelBooster) ([]*networking.ModelServer, 
 // both workers must declare the same connector with a role compatible with their worker
 // type, otherwise this returns a descriptive error. The result never depends on the
 // order of backend.Workers.
+//
+// A backend must have at most one prefill worker and at most one decode worker: the
+// ModelWorker API scales a role via Replicas/Pods on a single entry, not by repeating
+// the worker type, so a second entry of the same type is rejected rather than silently
+// picked (which would make the result depend on worker order).
 func GetKvConnectorSpec(backend workload.ModelBackend) (*networking.KVConnectorSpec, error) {
-	var prefillConn, decodeConn *kvWorkerConnector
+	var prefillWorker, decodeWorker *workload.ModelWorker
+	prefillCount, decodeCount := 0, 0
 
-	for _, worker := range backend.Workers {
+	for i := range backend.Workers {
+		worker := &backend.Workers[i]
 		switch worker.Type {
 		case workload.ModelWorkerTypePrefill:
-			conn, err := parseKvWorkerConnector(worker)
-			if err != nil {
-				return nil, err
-			}
-			prefillConn = conn
+			prefillCount++
+			prefillWorker = worker
 		case workload.ModelWorkerTypeDecode:
-			conn, err := parseKvWorkerConnector(worker)
-			if err != nil {
-				return nil, err
-			}
-			decodeConn = conn
+			decodeCount++
+			decodeWorker = worker
 		}
+	}
+	if prefillCount > 1 {
+		return nil, fmt.Errorf("backend %s: found %d prefill workers, expected at most 1; duplicate prefill workers are not supported",
+			backend.Name, prefillCount)
+	}
+	if decodeCount > 1 {
+		return nil, fmt.Errorf("backend %s: found %d decode workers, expected at most 1; duplicate decode workers are not supported",
+			backend.Name, decodeCount)
+	}
+
+	var prefillConn, decodeConn *kvWorkerConnector
+	if prefillWorker != nil {
+		conn, err := parseKvWorkerConnector(*prefillWorker)
+		if err != nil {
+			return nil, err
+		}
+		prefillConn = conn
+	}
+	if decodeWorker != nil {
+		conn, err := parseKvWorkerConnector(*decodeWorker)
+		if err != nil {
+			return nil, err
+		}
+		decodeConn = conn
 	}
 
 	if prefillConn == nil && decodeConn == nil {

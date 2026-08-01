@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	registryv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/convert"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -82,6 +83,7 @@ func (v *ModelValidator) validateModel(model *registryv1alpha1.ModelBooster) (bo
 	allErrs = append(allErrs, validateWorkerImages(model)...)
 	allErrs = append(allErrs, validateBackendWorkerTypes(model)...)
 	allErrs = append(allErrs, validatePVCURICompatibility(model)...)
+	allErrs = append(allErrs, validateKvConnectorConfig(model)...)
 
 	if len(allErrs) > 0 {
 		// Convert field errors to a formatted multi-line error message
@@ -147,6 +149,23 @@ func validateBackendWorkerTypes(model *registryv1alpha1.ModelBooster) field.Erro
 				))
 			}
 		}
+	}
+	return allErrs
+}
+
+// validateKvConnectorConfig rejects PD backends whose prefill/decode workers specify
+// inconsistent kv-transfer-config (e.g. different kv_connector values, or a kv_role that
+// doesn't match the worker's role), reusing convert.GetKvConnectorSpec so admission uses
+// the exact same rules as the ModelServer converter.
+func validateKvConnectorConfig(model *registryv1alpha1.ModelBooster) field.ErrorList {
+	var allErrs field.ErrorList
+	backend := model.Spec.Backend
+	if _, err := convert.GetKvConnectorSpec(backend); err != nil {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec").Child("backend").Child("workers"),
+			backend.Name,
+			fmt.Sprintf("invalid kv connector configuration: %v", err),
+		))
 	}
 	return allErrs
 }

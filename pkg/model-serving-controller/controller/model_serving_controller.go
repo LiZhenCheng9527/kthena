@@ -1071,7 +1071,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 			}
 			hashToUse := utils.CalRoleTemplateHash(roleToApply)
 			if err := createRole(ordinal, revisionToUse, roleToApply, hashToUse); err != nil {
-				klog.Errorf("%v", err)
+				klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
 				continue
 			}
 			// Update existingOrdinals and maxOrdinal
@@ -1093,7 +1093,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		for i := 0; i < toCreate; i++ {
 			newIndex := startingIndex + i
 			if err := createRole(newIndex, newRevision, targetRole, roleTemplateHash); err != nil {
-				klog.Errorf("%v", err)
+				klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, newIndex, groupName, ms.Namespace, ms.Name, err)
 			}
 		}
 	}

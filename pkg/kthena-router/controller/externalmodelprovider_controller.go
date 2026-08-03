@@ -63,11 +63,11 @@ const externalModelProviderSecretRefIndex = "externalModelProviderSecretRef"
 func NewExternalModelProviderController(
 	kthenaClient clientset.Interface,
 	kthenaInformerFactory informersv1alpha1.SharedInformerFactory,
-	kubeInformerFactory informers.SharedInformerFactory,
+	secretInformerFactory informers.SharedInformerFactory,
 	store datastore.Store,
 ) (*ExternalModelProviderController, error) {
 	externalModelProviderInformer := kthenaInformerFactory.Networking().V1alpha1().ExternalModelProviders()
-	secretInformer := kubeInformerFactory.Core().V1().Secrets()
+	secretInformer := secretInformerFactory.Core().V1().Secrets()
 	if err := externalModelProviderInformer.Informer().AddIndexers(cache.Indexers{
 		externalModelProviderSecretRefIndex: externalModelProviderSecretRefIndexFunc,
 	}); err != nil {
@@ -356,7 +356,11 @@ func (c *ExternalModelProviderController) reconcileProviderStatus(provider *netw
 		if errors.IsNotFound(err) {
 			credentialCondition.Status = metav1.ConditionFalse
 			credentialCondition.Reason = networkingv1alpha1.ExternalModelProviderReasonCredentialNotFound
-			credentialCondition.Message = "Credential Secret is not found"
+			credentialCondition.Message = fmt.Sprintf(
+				"Credential Secret is not found or does not have label %s=%s",
+				networkingv1alpha1.ExternalModelProviderSecretLabelKey,
+				networkingv1alpha1.ExternalModelProviderSecretLabelValue,
+			)
 		} else if err != nil {
 			return err
 		} else if value := secret.Data[provider.Spec.Auth.SecretRef.Key]; len(value) == 0 {

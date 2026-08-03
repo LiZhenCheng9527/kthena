@@ -24,11 +24,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -37,6 +39,59 @@ import (
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
+
+func TestExternalModelProviderSecretInformerFactoryFiltersSecrets(t *testing.T) {
+	labeledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "provider-secret",
+			Labels: map[string]string{
+				aiv1alpha1.ExternalModelProviderSecretLabelKey: aiv1alpha1.ExternalModelProviderSecretLabelValue,
+			},
+		},
+		Data: map[string][]byte{"api-key": []byte("provider-key")},
+	}
+	unlabeledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "unrelated-secret"},
+		Data:       map[string][]byte{"private-key": []byte("must-not-be-cached")},
+	}
+	kubeClient := kubefake.NewSimpleClientset(labeledSecret, unlabeledSecret)
+	secretInformerFactory := NewExternalModelProviderSecretInformerFactory(kubeClient)
+	secretInformer := secretInformerFactory.Core().V1().Secrets()
+	secretInformerSynced := secretInformer.Informer().HasSynced
+
+	stop := make(chan struct{})
+	defer close(stop)
+	secretInformerFactory.Start(stop)
+	assert.True(t, waitForCacheSync(t, 5*time.Second, secretInformerSynced))
+
+	got, err := secretInformer.Lister().Secrets("default").Get(labeledSecret.Name)
+	assert.NoError(t, err)
+	assert.Equal(t, labeledSecret.Data, got.Data)
+
+	_, err = secretInformer.Lister().Secrets("default").Get(unlabeledSecret.Name)
+	assert.True(t, apierrors.IsNotFound(err), "Unlabeled Secret must not enter the informer cache")
+
+	var listSelector, watchSelector string
+	for _, action := range kubeClient.Actions() {
+		if action.GetResource().Resource != "secrets" {
+			continue
+		}
+		switch typedAction := action.(type) {
+		case k8stesting.ListAction:
+			if typedAction.GetListRestrictions().Labels != nil {
+				listSelector = typedAction.GetListRestrictions().Labels.String()
+			}
+		case k8stesting.WatchAction:
+			if typedAction.GetWatchRestrictions().Labels != nil {
+				watchSelector = typedAction.GetWatchRestrictions().Labels.String()
+			}
+		}
+	}
+	expectedSelector := aiv1alpha1.ExternalModelProviderSecretLabelKey + "=" + aiv1alpha1.ExternalModelProviderSecretLabelValue
+	assert.Equal(t, expectedSelector, listSelector)
+	assert.Equal(t, expectedSelector, watchSelector)
+}
 
 func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 	kthenaClient := kthenafake.NewSimpleClientset()
@@ -52,6 +107,9 @@ func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 	defer close(stop)
 	kthenaInformerFactory.Start(stop)
 	kubeInformerFactory.Start(stop)
+	if !waitForCacheSync(t, 5*time.Second, controller.externalModelProviderSynced, controller.secretSynced) {
+		t.Fatal("Failed to sync caches within timeout")
+	}
 
 	t.Run("ExternalModelProviderCreate", func(t *testing.T) {
 		provider := &aiv1alpha1.ExternalModelProvider{
@@ -68,10 +126,6 @@ func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 		_, err := kthenaClient.NetworkingV1alpha1().ExternalModelProviders("default").Create(
 			context.Background(), provider, metav1.CreateOptions{})
 		assert.NoError(t, err)
-
-		if !waitForCacheSync(t, 5*time.Second, controller.externalModelProviderSynced) {
-			t.Fatal("Failed to sync caches within timeout")
-		}
 
 		found := waitForObjectInCache(t, 2*time.Second, func() bool {
 			_, err := controller.externalModelProviderLister.ExternalModelProviders("default").Get("openai-provider")
@@ -154,10 +208,6 @@ func TestExternalModelProviderController_Lifecycle(t *testing.T) {
 			context.Background(), secret, metav1.CreateOptions{})
 		assert.NoError(t, err)
 
-		if !waitForCacheSync(t, 5*time.Second, controller.secretSynced) {
-			t.Fatal("Failed to sync secret cache within timeout")
-		}
-
 		found := waitForObjectInCache(t, 2*time.Second, func() bool {
 			_, err := controller.secretLister.Secrets("default").Get("provider-secret")
 			return err == nil
@@ -188,16 +238,19 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 	kthenaClient := kthenafake.NewSimpleClientset()
 	kubeClient := kubefake.NewSimpleClientset()
 	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
-	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	secretInformerFactory := NewExternalModelProviderSecretInformerFactory(kubeClient)
 	store := datastore.New()
 
-	controller, err := NewExternalModelProviderController(kthenaClient, kthenaInformerFactory, kubeInformerFactory, store)
+	controller, err := NewExternalModelProviderController(kthenaClient, kthenaInformerFactory, secretInformerFactory, store)
 	assert.NoError(t, err)
 
 	stop := make(chan struct{})
 	defer close(stop)
 	kthenaInformerFactory.Start(stop)
-	kubeInformerFactory.Start(stop)
+	secretInformerFactory.Start(stop)
+	if !waitForCacheSync(t, 5*time.Second, controller.externalModelProviderSynced, controller.secretSynced) {
+		t.Fatal("Failed to sync caches within timeout")
+	}
 
 	provider := &aiv1alpha1.ExternalModelProvider{
 		ObjectMeta: metav1.ObjectMeta{
@@ -221,9 +274,6 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 		context.Background(), provider, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	if !waitForCacheSync(t, 5*time.Second, controller.externalModelProviderSynced, controller.secretSynced) {
-		t.Fatal("Failed to sync caches within timeout")
-	}
 	found := waitForObjectInCache(t, 2*time.Second, func() bool {
 		_, err := controller.externalModelProviderLister.ExternalModelProviders("default").Get("openai-provider")
 		return err == nil
@@ -234,11 +284,21 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 	assert.NoError(t, err)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialNotFound)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialNotFound)
+	providerWithStatus, err := kthenaClient.NetworkingV1alpha1().ExternalModelProviders("default").Get(
+		context.Background(), "openai-provider", metav1.GetOptions{})
+	assert.NoError(t, err)
+	credentialCondition := apimeta.FindStatusCondition(providerWithStatus.Status.Conditions, aiv1alpha1.ExternalModelProviderConditionCredentialsResolved)
+	if assert.NotNil(t, credentialCondition) {
+		assert.Contains(t, credentialCondition.Message, aiv1alpha1.ExternalModelProviderSecretLabelKey)
+	}
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",
 			Name:      "provider-secret",
+			Labels: map[string]string{
+				aiv1alpha1.ExternalModelProviderSecretLabelKey: aiv1alpha1.ExternalModelProviderSecretLabelValue,
+			},
 		},
 		Data: map[string][]byte{
 			"api-key": []byte("test-key"),

@@ -76,12 +76,13 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	}
 
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	externalProviderSecretInformerFactory := controller.NewExternalModelProviderSecretInformerFactory(kubeClient)
 	kthenaInformerFactory := kthenaInformers.NewSharedInformerFactory(kthenaClient, 0)
 	modelRouteController, err := controller.NewModelRouteController(kthenaInformerFactory, store)
 	if err != nil {
 		klog.Fatalf("Error creating model route controller: %s", err.Error())
 	}
-	externalModelProviderController, err := controller.NewExternalModelProviderController(kthenaClient, kthenaInformerFactory, kubeInformerFactory, store)
+	externalModelProviderController, err := controller.NewExternalModelProviderController(kthenaClient, kthenaInformerFactory, externalProviderSecretInformerFactory, store)
 	if err != nil {
 		klog.Fatalf("Error creating external model provider controller: %s", err.Error())
 	}
@@ -152,6 +153,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	}
 
 	kubeInformerFactory.Start(stop)
+	externalProviderSecretInformerFactory.Start(stop)
 	kthenaInformerFactory.Start(stop)
 
 	if !cache.WaitForCacheSync(stop, cacheSyncs...) {

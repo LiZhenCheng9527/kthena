@@ -1,4 +1,4 @@
-# Default Scheduler Pod Affinity Examples
+# Kube Scheduler Pod Affinity Examples
 
 These examples show how to use native Kubernetes `podAffinity` with `ModelServing`
 when `schedulerName` is `default-scheduler`.

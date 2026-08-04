@@ -462,11 +462,20 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 	t.Run("chat completions", func(t *testing.T) {
 		parser := adapter.ResponseParser("/v1/chat/completions")
 
-		usage, ok := parser.ParseStreamLine(`data: {"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
-		assert.True(t, ok)
-		assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, usage)
+		result := parser.ParseStreamLine(`data: {"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+		assert.True(t, result.HasUsage)
+		assert.True(t, result.UsageOnly)
+		assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, result.Usage)
 
-		usage, ok = parser.ParseBody([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`))
+		result = parser.ParseStreamLine(`data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+		assert.True(t, result.HasUsage)
+		assert.True(t, result.UsageOnly)
+
+		result = parser.ParseStreamLine(`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+		assert.True(t, result.HasUsage)
+		assert.False(t, result.UsageOnly)
+
+		usage, ok := parser.ParseBody([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`))
 		assert.True(t, ok)
 		assert.Equal(t, TokenUsage{PromptTokens: 7, CompletionTokens: 5, TotalTokens: 12}, usage)
 
@@ -481,9 +490,9 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 	t.Run("responses", func(t *testing.T) {
 		parser := adapter.ResponseParser("/v1/responses")
 
-		_, ok := parser.ParseStreamLine(`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}`)
-		assert.False(t, ok)
-		_, ok = parser.FinalStreamUsage()
+		result := parser.ParseStreamLine(`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}`)
+		assert.False(t, result.HasUsage)
+		_, ok := parser.FinalStreamUsage()
 		assert.False(t, ok, "usage from an incomplete stream must not be recorded")
 		parser.RecordStreamLineWritten(`data: {"type":"response.completed"}`)
 		assert.True(t, parser.StreamCompleted())
@@ -503,11 +512,11 @@ func TestAnthropicAdapterResponseParser(t *testing.T) {
 	assert.NoError(t, err)
 	parser := adapter.ResponseParser("/v1/messages")
 
-	_, ok := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1}}}`)
-	assert.False(t, ok)
-	_, ok = parser.ParseStreamLine(`data: {"type":"message_delta","usage":{"output_tokens":22}}`)
-	assert.False(t, ok)
-	_, ok = parser.FinalStreamUsage()
+	result := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1}}}`)
+	assert.False(t, result.HasUsage)
+	result = parser.ParseStreamLine(`data: {"type":"message_delta","usage":{"output_tokens":22}}`)
+	assert.False(t, result.HasUsage)
+	_, ok := parser.FinalStreamUsage()
 	assert.False(t, ok, "usage from an incomplete stream must not be recorded")
 	parser.RecordStreamLineWritten(`data: {"type":"message_stop"}`)
 	assert.True(t, parser.StreamCompleted())

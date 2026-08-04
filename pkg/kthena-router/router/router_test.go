@@ -1369,6 +1369,81 @@ func TestProxyExternalRequest_OpenAIResponsesStreamAggregatesUsage(t *testing.T)
 	}
 }
 
+func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T) {
+	usageOnlyEvent := `data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
+	usageWithChoiceEvent := `data: {"choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
+	tests := []struct {
+		name             string
+		injectedUsage    bool
+		usageEvent       string
+		wantUsageEvent   bool
+		wantFinishReason bool
+	}{
+		{
+			name:           "router injected usage-only event is omitted",
+			injectedUsage:  true,
+			usageEvent:     usageOnlyEvent,
+			wantUsageEvent: false,
+		},
+		{
+			name:             "router injected usage with choices is forwarded",
+			injectedUsage:    true,
+			usageEvent:       usageWithChoiceEvent,
+			wantUsageEvent:   true,
+			wantFinishReason: true,
+		},
+		{
+			name:           "client requested usage-only event is forwarded",
+			usageEvent:     usageOnlyEvent,
+			wantUsageEvent: true,
+		},
+	}
+
+	adapter, err := providers.NewAdapter(aiv1alpha1.OpenAI)
+	assert.NoError(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &closeNotifyRecorder{
+				ResponseRecorder: httptest.NewRecorder(),
+				closeCh:          make(chan bool),
+			}
+			c, _ := gin.CreateTestContext(w)
+			if tt.injectedUsage {
+				c.Set(common.TokenUsageKey, true)
+			}
+			body := strings.Join([]string{
+				`data: {"choices":[{"delta":{"content":"hello"}}]}`,
+				"",
+				tt.usageEvent,
+				"",
+				"data: [DONE]",
+				"",
+			}, "\n")
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+
+			var got providers.TokenUsage
+			callbackCount := 0
+			err := forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser("/v1/chat/completions"), func(usage providers.TokenUsage) {
+				got = usage
+				callbackCount++
+			})
+
+			assert.NoError(t, err)
+			assert.Contains(t, w.Body.String(), `"content":"hello"`)
+			assert.Contains(t, w.Body.String(), "data: [DONE]")
+			assert.Equal(t, tt.wantUsageEvent, strings.Contains(w.Body.String(), `"total_tokens":12`))
+			assert.Equal(t, tt.wantFinishReason, strings.Contains(w.Body.String(), `"finish_reason":"stop"`))
+			assert.Equal(t, tt.wantFinishReason, strings.Contains(w.Body.String(), `"content":"tail"`))
+			assert.Equal(t, 1, callbackCount)
+			assert.Equal(t, providers.TokenUsage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}, got)
+		})
+	}
+}
+
 func TestCopyResponseHeadersPreservesMultipleValues(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

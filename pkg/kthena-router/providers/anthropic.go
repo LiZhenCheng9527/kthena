@@ -90,14 +90,14 @@ type anthropicUsageParser struct {
 	completed bool
 }
 
-func (p *anthropicUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
+func (p *anthropicUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
 	payload, ok := streamDataPayload(line)
 	if !ok {
-		return TokenUsage{}, false
+		return StreamUsageParseResult{}
 	}
 	var response anthropicStreamResponse
 	if err := json.Unmarshal(payload, &response); err != nil {
-		return TokenUsage{}, false
+		return StreamUsageParseResult{}
 	}
 
 	usage := response.Usage
@@ -112,7 +112,7 @@ func (p *anthropicUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
 		p.latest.CompletionTokens = usage.OutputTokens
 	}
 	p.latest.TotalTokens = p.latest.PromptTokens + p.latest.CompletionTokens
-	return TokenUsage{}, false
+	return StreamUsageParseResult{}
 }
 
 func (p *anthropicUsageParser) ParseBody(body []byte) (TokenUsage, bool) {

@@ -47,10 +47,19 @@ type TokenUsage struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
+// StreamUsageParseResult describes token usage found in a provider stream
+// event. UsageOnly is true when the event has no provider response content and
+// can be omitted if the router requested the event solely for accounting.
+type StreamUsageParseResult struct {
+	Usage     TokenUsage
+	HasUsage  bool
+	UsageOnly bool
+}
+
 // ResponseUsageParser normalizes provider-specific response bodies and stream
 // events into TokenUsage while tracking whether a streaming response completed.
 type ResponseUsageParser interface {
-	ParseStreamLine(line string) (TokenUsage, bool)
+	ParseStreamLine(line string) StreamUsageParseResult
 	ParseBody(body []byte) (TokenUsage, bool)
 	FinalStreamUsage() (TokenUsage, bool)
 	RecordStreamLineWritten(line string)

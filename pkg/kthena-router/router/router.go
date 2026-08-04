@@ -1091,12 +1091,14 @@ func forwardResponseWithUsageParser(
 		clientDisconnected := c.Stream(func(w io.Writer) bool {
 			line, err := reader.ReadBytes('\n')
 			if len(line) > 0 {
-				if usage, ok := parser.ParseStreamLine(string(line)); ok {
-					klog.V(4).Infof("Parsed usage: %+v", usage)
+				parseResult := parser.ParseStreamLine(string(line))
+				if parseResult.HasUsage {
+					klog.V(4).Infof("Parsed usage: %+v", parseResult.Usage)
 					if onUsage != nil {
-						onUsage(usage)
+						onUsage(parseResult.Usage)
 					}
-					if v, ok := c.Get(common.TokenUsageKey); ok && v.(bool) {
+					injectedUsage, _ := c.Get(common.TokenUsageKey)
+					if injected, ok := injectedUsage.(bool); ok && injected && parseResult.UsageOnly {
 						return true
 					}
 				}

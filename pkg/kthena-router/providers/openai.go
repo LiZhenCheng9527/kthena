@@ -113,24 +113,32 @@ type openAIUsage struct {
 }
 
 type openAIResponse struct {
-	Usage openAIUsage `json:"usage"`
+	Choices []json.RawMessage `json:"choices"`
+	Usage   openAIUsage       `json:"usage"`
 }
 
 type openAIUsageParser struct {
 	completed bool
 }
 
-func (openAIUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
+func (openAIUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
 	payload, ok := streamDataPayload(line)
 	if !ok {
-		return TokenUsage{}, false
+		return StreamUsageParseResult{}
 	}
 	var response openAIResponse
 	if err := json.Unmarshal(payload, &response); err != nil {
-		return TokenUsage{}, false
+		return StreamUsageParseResult{}
 	}
 	usage := tokenUsageFromOpenAIResponse(response)
-	return usage, usage.TotalTokens > 0
+	if usage.TotalTokens <= 0 {
+		return StreamUsageParseResult{}
+	}
+	return StreamUsageParseResult{
+		Usage:     usage,
+		HasUsage:  true,
+		UsageOnly: len(response.Choices) == 0,
+	}
 }
 
 func (openAIUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
@@ -169,16 +177,16 @@ type openAIResponsesUsageParser struct {
 	completed bool
 }
 
-func (p *openAIResponsesUsageParser) ParseStreamLine(line string) (TokenUsage, bool) {
+func (p *openAIResponsesUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
 	response, ok := parseOpenAIResponsesStreamLine(line)
 	if !ok {
-		return TokenUsage{}, false
+		return StreamUsageParseResult{}
 	}
 	usage := tokenUsageFromOpenAIResponses(response)
 	if usage.TotalTokens > 0 {
 		p.latest = usage
 	}
-	return TokenUsage{}, false
+	return StreamUsageParseResult{}
 }
 
 func (p *openAIResponsesUsageParser) ParseBody(body []byte) (TokenUsage, bool) {

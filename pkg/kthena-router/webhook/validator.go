@@ -361,7 +361,17 @@ func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networki
 	}
 
 	if provider.Spec.Auth != nil {
-		secretRefField := specField.Child("auth").Child("secretRef")
+		authField := specField.Child("auth")
+		switch provider.Spec.Auth.Scheme {
+		case "", networkingv1alpha1.ProviderAuthSchemeBearer, networkingv1alpha1.ProviderAuthSchemeAPIKey:
+		default:
+			allErrs = append(allErrs, field.NotSupported(
+				authField.Child("scheme"),
+				provider.Spec.Auth.Scheme,
+				[]string{string(networkingv1alpha1.ProviderAuthSchemeBearer), string(networkingv1alpha1.ProviderAuthSchemeAPIKey)},
+			))
+		}
+		secretRefField := authField.Child("secretRef")
 		if provider.Spec.Auth.SecretRef.Name == "" {
 			allErrs = append(allErrs, field.Required(secretRefField.Child("name"), "secret name is required"))
 		}

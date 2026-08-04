@@ -877,6 +877,7 @@ func TestValidateExternalModelProvider(t *testing.T) {
 					Model:        ptrString("claude-sonnet"),
 					BaseURL:      "https://api.anthropic.com",
 					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: networkingv1alpha1.ProviderAuthSchemeBearer,
 						SecretRef: corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
 							Key:                  "apiKey",
@@ -888,6 +889,25 @@ func TestValidateExternalModelProvider(t *testing.T) {
 				},
 			},
 			expectValid: true,
+		},
+		{
+			name: "invalid provider - unsupported auth scheme",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.Anthropic,
+					BaseURL:      "https://api.example.com",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: "Basic",
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+							Key:                  "apiKey",
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.auth.scheme: Unsupported value: \"Basic\": supported values: \"Bearer\", \"APIKey\"",
 		},
 		{
 			name: "invalid provider - http baseURL",

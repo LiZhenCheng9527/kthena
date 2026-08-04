@@ -376,7 +376,7 @@ _Appears in:_
 
 
 
-ProviderAuth defines how a provider credential is loaded.
+ProviderAuth defines how a provider credential is loaded and sent upstream.
 
 
 
@@ -385,7 +385,26 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
+| `scheme` _[ProviderAuthScheme](#providerauthscheme)_ | Scheme overrides the protocol adapter's default authentication scheme.<br />OpenAI defaults to Bearer and Anthropic defaults to APIKey. |  | Enum: [Bearer APIKey] <br /> |
 | `secretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ | SecretRef references a credential Secret in the same namespace. |  | Required: \{\} <br /> |
+
+
+#### ProviderAuthScheme
+
+_Underlying type:_ _string_
+
+ProviderAuthScheme defines how a provider credential is sent upstream.
+
+_Validation:_
+- Enum: [Bearer APIKey]
+
+_Appears in:_
+- [ProviderAuth](#providerauth)
+
+| Field | Description |
+| --- | --- |
+| `Bearer` | ProviderAuthSchemeBearer sends the credential in the Authorization header.<br /> |
+| `APIKey` | ProviderAuthSchemeAPIKey sends the credential in the x-api-key header.<br /> |
 
 
 #### RateLimit

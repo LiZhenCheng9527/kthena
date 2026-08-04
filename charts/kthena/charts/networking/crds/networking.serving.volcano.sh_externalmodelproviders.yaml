@@ -43,6 +43,14 @@ spec:
               auth:
                 description: Auth references a credential Secret in the same namespace.
                 properties:
+                  scheme:
+                    description: |-
+                      Scheme overrides the protocol adapter's default authentication scheme.
+                      OpenAI defaults to Bearer and Anthropic defaults to APIKey.
+                    enum:
+                    - Bearer
+                    - APIKey
+                    type: string
                   secretRef:
                     description: SecretRef references a credential Secret in the same
                       namespace.

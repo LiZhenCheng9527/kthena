@@ -30,6 +30,11 @@ import (
 
 type anthropicAdapter struct{}
 
+var anthropicForwardHeaders = []string{
+	"Anthropic-Version",
+	"Anthropic-Beta",
+}
+
 func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, modelRequest map[string]interface{}) (*http.Request, error) {
 	if req.URL.Path != "/v1/messages" {
 		return nil, &UnsupportedPathError{ProviderType: networkingv1alpha1.Anthropic, Path: req.URL.Path}
@@ -39,19 +44,12 @@ func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider
 	if err != nil {
 		return nil, err
 	}
-	upstream, err := buildProviderRequest(c, req, provider, modelRequest, upstreamURL, rewriteBody)
+	upstream, err := buildProviderRequest(c, req, provider, modelRequest, upstreamURL, rewriteBody, anthropicForwardHeaders...)
 	if err != nil {
 		return nil, err
 	}
-	token, err := providerToken(provider, secret)
-	if err != nil {
+	if err := applyProviderAuth(upstream.Header, provider, secret, networkingv1alpha1.ProviderAuthSchemeAPIKey); err != nil {
 		return nil, err
-	}
-	if token != "" {
-		upstream.Header.Set("x-api-key", token)
-	}
-	if version := req.Header.Get("Anthropic-Version"); upstream.Header.Get("Anthropic-Version") == "" && version != "" {
-		upstream.Header.Set("Anthropic-Version", version)
 	}
 	return upstream, nil
 }
@@ -72,8 +70,10 @@ func anthropicProviderURL(baseURL, requestPath, rawQuery string) (*url.URL, erro
 }
 
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
 }
 
 type anthropicResponse struct {
@@ -103,10 +103,13 @@ func (p *anthropicUsageParser) ParseStreamLine(line string) StreamUsageParseResu
 	usage := response.Usage
 	if response.Message != nil {
 		usage.InputTokens += response.Message.Usage.InputTokens
+		usage.CacheCreationInputTokens += response.Message.Usage.CacheCreationInputTokens
+		usage.CacheReadInputTokens += response.Message.Usage.CacheReadInputTokens
 		usage.OutputTokens += response.Message.Usage.OutputTokens
 	}
-	if usage.InputTokens > 0 {
-		p.latest.PromptTokens = usage.InputTokens
+	inputTokens := anthropicInputTokens(usage)
+	if inputTokens > 0 {
+		p.latest.PromptTokens = inputTokens
 	}
 	if usage.OutputTokens > 0 {
 		p.latest.CompletionTokens = usage.OutputTokens
@@ -121,11 +124,15 @@ func (p *anthropicUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
 		return TokenUsage{}, false
 	}
 	usage := TokenUsage{
-		PromptTokens:     response.Usage.InputTokens,
+		PromptTokens:     anthropicInputTokens(response.Usage),
 		CompletionTokens: response.Usage.OutputTokens,
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	return usage, usage.TotalTokens > 0
+}
+
+func anthropicInputTokens(usage anthropicUsage) int {
+	return usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
 }
 
 func (p *anthropicUsageParser) FinalStreamUsage() (TokenUsage, bool) {

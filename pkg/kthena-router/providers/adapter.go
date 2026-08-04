@@ -157,10 +157,17 @@ func ValidateConfiguration(provider *networkingv1alpha1.ExternalModelProvider) e
 	if err := validateStaticHeaders(provider.Spec.Headers); err != nil {
 		return err
 	}
+	if provider.Spec.Auth != nil {
+		switch provider.Spec.Auth.Scheme {
+		case "", networkingv1alpha1.ProviderAuthSchemeBearer, networkingv1alpha1.ProviderAuthSchemeAPIKey:
+		default:
+			return newConfigurationError("unsupported provider auth scheme %q", provider.Spec.Auth.Scheme)
+		}
+	}
 	return nil
 }
 
-func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, modelRequest map[string]interface{}, upstreamURL *url.URL, rewriteBody bool) (*http.Request, error) {
+func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, modelRequest map[string]interface{}, upstreamURL *url.URL, rewriteBody bool, protocolHeaders ...string) (*http.Request, error) {
 	if model, ok := modelOverride(provider); ok {
 		modelRequest["model"] = model
 		rewriteBody = true
@@ -186,7 +193,7 @@ func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkin
 	reqCopy.URL = upstreamURL
 	reqCopy.Host = upstreamURL.Host
 	reqCopy.RequestURI = ""
-	reqCopy.Header = sanitizeRequestHeaders(req.Header)
+	reqCopy.Header = sanitizeRequestHeaders(req.Header, protocolHeaders)
 	if err := applyStaticHeaders(reqCopy.Header, provider.Spec.Headers); err != nil {
 		return nil, err
 	}
@@ -252,10 +259,36 @@ func providerToken(provider *networkingv1alpha1.ExternalModelProvider, secret *c
 	return string(value), nil
 }
 
-func sanitizeRequestHeaders(headers http.Header) http.Header {
+func applyProviderAuth(headers http.Header, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, defaultScheme networkingv1alpha1.ProviderAuthScheme) error {
+	token, err := providerToken(provider, secret)
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		return nil
+	}
+
+	scheme := defaultScheme
+	if provider.Spec.Auth.Scheme != "" {
+		scheme = provider.Spec.Auth.Scheme
+	}
+	headers.Del("Authorization")
+	headers.Del("x-api-key")
+	switch scheme {
+	case networkingv1alpha1.ProviderAuthSchemeBearer:
+		headers.Set("Authorization", "Bearer "+token)
+	case networkingv1alpha1.ProviderAuthSchemeAPIKey:
+		headers.Set("x-api-key", token)
+	default:
+		return newConfigurationError("unsupported provider auth scheme %q", scheme)
+	}
+	return nil
+}
+
+func sanitizeRequestHeaders(headers http.Header, protocolHeaders []string) http.Header {
 	clean := http.Header{}
 	for key, values := range headers {
-		if !isAllowedForwardHeader(key) {
+		if !isAllowedForwardHeader(key, protocolHeaders) {
 			continue
 		}
 		for _, value := range values {
@@ -290,8 +323,13 @@ func validateStaticHeaders(staticHeaders map[string]string) error {
 	return nil
 }
 
-func isAllowedForwardHeader(header string) bool {
+func isAllowedForwardHeader(header string, protocolHeaders []string) bool {
 	for _, allowed := range allowedForwardHeaders {
+		if strings.EqualFold(header, allowed) {
+			return true
+		}
+	}
+	for _, allowed := range protocolHeaders {
 		if strings.EqualFold(header, allowed) {
 			return true
 		}

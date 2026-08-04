@@ -32,6 +32,17 @@ const (
 	Anthropic ExternalProviderType = "Anthropic"
 )
 
+// ProviderAuthScheme defines how a provider credential is sent upstream.
+// +kubebuilder:validation:Enum=Bearer;APIKey
+type ProviderAuthScheme string
+
+const (
+	// ProviderAuthSchemeBearer sends the credential in the Authorization header.
+	ProviderAuthSchemeBearer ProviderAuthScheme = "Bearer"
+	// ProviderAuthSchemeAPIKey sends the credential in the x-api-key header.
+	ProviderAuthSchemeAPIKey ProviderAuthScheme = "APIKey"
+)
+
 const (
 	// ExternalModelProviderConditionReady reports whether the provider can be used by the router.
 	ExternalModelProviderConditionReady = "Ready"
@@ -81,9 +92,14 @@ type ExternalModelProviderSpec struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
-// ProviderAuth defines how a provider credential is loaded.
+// ProviderAuth defines how a provider credential is loaded and sent upstream.
 // +kubebuilder:validation:XValidation:rule="!has(self.secretRef.optional) || !self.secretRef.optional",message="secretRef.optional must be false or unset"
 type ProviderAuth struct {
+	// Scheme overrides the protocol adapter's default authentication scheme.
+	// OpenAI defaults to Bearer and Anthropic defaults to APIKey.
+	// +optional
+	Scheme ProviderAuthScheme `json:"scheme,omitempty"`
+
 	// SecretRef references a credential Secret in the same namespace.
 	// +kubebuilder:validation:Required
 	SecretRef corev1.SecretKeySelector `json:"secretRef"`

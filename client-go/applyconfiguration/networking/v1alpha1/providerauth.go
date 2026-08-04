@@ -19,19 +19,29 @@ limitations under the License.
 package v1alpha1
 
 import (
+	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	v1 "k8s.io/api/core/v1"
 )
 
 // ProviderAuthApplyConfiguration represents a declarative configuration of the ProviderAuth type for use
 // with apply.
 type ProviderAuthApplyConfiguration struct {
-	SecretRef *v1.SecretKeySelector `json:"secretRef,omitempty"`
+	Scheme    *networkingv1alpha1.ProviderAuthScheme `json:"scheme,omitempty"`
+	SecretRef *v1.SecretKeySelector                  `json:"secretRef,omitempty"`
 }
 
 // ProviderAuthApplyConfiguration constructs a declarative configuration of the ProviderAuth type for use with
 // apply.
 func ProviderAuth() *ProviderAuthApplyConfiguration {
 	return &ProviderAuthApplyConfiguration{}
+}
+
+// WithScheme sets the Scheme field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Scheme field is set to the value of the last call.
+func (b *ProviderAuthApplyConfiguration) WithScheme(value networkingv1alpha1.ProviderAuthScheme) *ProviderAuthApplyConfiguration {
+	b.Scheme = &value
+	return b
 }
 
 // WithSecretRef sets the SecretRef field in the declarative configuration to the given value

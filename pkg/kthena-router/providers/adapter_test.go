@@ -441,6 +441,7 @@ func TestAnthropicAdapterForwardsProtocolVersionHeader(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", "context-1m-2025-08-07")
 	provider := &networkingv1alpha1.ExternalModelProvider{
 		Spec: networkingv1alpha1.ExternalModelProviderSpec{
 			ProviderType: networkingv1alpha1.Anthropic,
@@ -453,6 +454,64 @@ func TestAnthropicAdapterForwardsProtocolVersionHeader(t *testing.T) {
 	upstream, err := adapter.BuildRequest(c, req, provider, nil, map[string]interface{}{"model": "m"})
 	assert.NoError(t, err)
 	assert.Equal(t, "2023-06-01", upstream.Header.Get("Anthropic-Version"))
+	assert.Equal(t, "context-1m-2025-08-07", upstream.Header.Get("Anthropic-Beta"))
+}
+
+func TestProviderAuthSchemeOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	secret := &corev1.Secret{Data: map[string][]byte{"api-key": []byte("provider-key")}}
+
+	tests := []struct {
+		name           string
+		providerType   networkingv1alpha1.ExternalProviderType
+		path           string
+		scheme         networkingv1alpha1.ProviderAuthScheme
+		wantAuthHeader string
+		wantAPIKey     string
+	}{
+		{
+			name:           "anthropic gateway uses bearer",
+			providerType:   networkingv1alpha1.Anthropic,
+			path:           "/v1/messages",
+			scheme:         networkingv1alpha1.ProviderAuthSchemeBearer,
+			wantAuthHeader: "Bearer provider-key",
+		},
+		{
+			name:         "openai compatible gateway uses api key header",
+			providerType: networkingv1alpha1.OpenAI,
+			path:         "/v1/responses",
+			scheme:       networkingv1alpha1.ProviderAuthSchemeAPIKey,
+			wantAPIKey:   "provider-key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			req.Header.Set("Authorization", "Bearer downstream")
+			req.Header.Set("x-api-key", "downstream-key")
+			provider := &networkingv1alpha1.ExternalModelProvider{
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: tt.providerType,
+					BaseURL:      "https://api.example.com",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: tt.scheme,
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+							Key:                  "api-key",
+						},
+					},
+				},
+			}
+			adapter, err := NewAdapter(tt.providerType)
+			assert.NoError(t, err)
+			upstream, err := adapter.BuildRequest(c, req, provider, secret, map[string]interface{}{"model": "m"})
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantAuthHeader, upstream.Header.Get("Authorization"))
+			assert.Equal(t, tt.wantAPIKey, upstream.Header.Get("x-api-key"))
+		})
+	}
 }
 
 func TestOpenAIAdapterResponseParser(t *testing.T) {
@@ -521,7 +580,7 @@ func TestAnthropicAdapterResponseParser(t *testing.T) {
 	assert.NoError(t, err)
 	parser := adapter.ResponseParser(nil, "/v1/messages")
 
-	result := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1}}}`)
+	result := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_creation_input_tokens":7,"cache_read_input_tokens":5,"output_tokens":1}}}`)
 	assert.False(t, result.HasUsage)
 	result = parser.ParseStreamLine(`data: {"type":"message_delta","usage":{"output_tokens":22}}`)
 	assert.False(t, result.HasUsage)
@@ -532,11 +591,11 @@ func TestAnthropicAdapterResponseParser(t *testing.T) {
 
 	usage, ok := parser.FinalStreamUsage()
 	assert.True(t, ok)
-	assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, usage)
+	assert.Equal(t, TokenUsage{PromptTokens: 23, CompletionTokens: 22, TotalTokens: 45}, usage)
 
-	usage, ok = adapter.ResponseParser(nil, "/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":4}}`))
+	usage, ok = adapter.ResponseParser(nil, "/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"cache_creation_input_tokens":6,"cache_read_input_tokens":3,"output_tokens":4}}`))
 	assert.True(t, ok)
-	assert.Equal(t, TokenUsage{PromptTokens: 9, CompletionTokens: 4, TotalTokens: 13}, usage)
+	assert.Equal(t, TokenUsage{PromptTokens: 18, CompletionTokens: 4, TotalTokens: 22}, usage)
 
 	usage, ok = adapter.ResponseParser(nil, "/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":0}}`))
 	assert.True(t, ok)
@@ -681,6 +740,27 @@ func TestBuildRequestRejectsInvalidRuntimeConfiguration(t *testing.T) {
 			assert.ErrorAs(t, err, &configurationError)
 		})
 	}
+}
+
+func TestValidateConfigurationRejectsUnsupportedAuthScheme(t *testing.T) {
+	provider := &networkingv1alpha1.ExternalModelProvider{
+		Spec: networkingv1alpha1.ExternalModelProviderSpec{
+			ProviderType: networkingv1alpha1.Anthropic,
+			BaseURL:      "https://api.example.com",
+			Auth: &networkingv1alpha1.ProviderAuth{
+				Scheme: "Basic",
+				SecretRef: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+					Key:                  "api-key",
+				},
+			},
+		},
+	}
+
+	err := ValidateConfiguration(provider)
+	var configurationError *ConfigurationError
+	assert.ErrorAs(t, err, &configurationError)
+	assert.Contains(t, err.Error(), "unsupported provider auth scheme")
 }
 
 func TestDoTLSVerificationPolicy(t *testing.T) {

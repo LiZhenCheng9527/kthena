@@ -50,12 +50,8 @@ func (openAIAdapter) BuildRequest(c *gin.Context, req *http.Request, provider *n
 	if err != nil {
 		return nil, err
 	}
-	token, err := providerToken(provider, secret)
-	if err != nil {
+	if err := applyProviderAuth(upstream.Header, provider, secret, networkingv1alpha1.ProviderAuthSchemeBearer); err != nil {
 		return nil, err
-	}
-	if token != "" {
-		upstream.Header.Set("Authorization", "Bearer "+token)
 	}
 	return upstream, nil
 }

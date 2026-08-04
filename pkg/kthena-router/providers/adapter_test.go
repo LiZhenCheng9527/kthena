@@ -716,8 +716,18 @@ func TestProviderTransportHandlesCustomDefaultTransport(t *testing.T) {
 
 	_, preservesCustomTransport := providerTransport(custom, false).(roundTripperFunc)
 	assert.True(t, preservesCustomTransport)
-	_, isolatesInsecureTransport := providerTransport(custom, true).(*http.Transport)
-	assert.True(t, isolatesInsecureTransport)
+	isolatedTransport, isolatesInsecureTransport := providerTransport(custom, true).(*http.Transport)
+	if assert.True(t, isolatesInsecureTransport) {
+		assert.NotNil(t, isolatedTransport.DialContext)
+		assert.Equal(t, providerTransportBaseline.TLSHandshakeTimeout, isolatedTransport.TLSHandshakeTimeout)
+		assert.Equal(t, providerTransportBaseline.IdleConnTimeout, isolatedTransport.IdleConnTimeout)
+		assert.Equal(t, providerTransportBaseline.ExpectContinueTimeout, isolatedTransport.ExpectContinueTimeout)
+		assert.Equal(t, providerTransportBaseline.MaxIdleConns, isolatedTransport.MaxIdleConns)
+		assert.Zero(t, isolatedTransport.ResponseHeaderTimeout)
+		if assert.NotNil(t, isolatedTransport.TLSClientConfig) {
+			assert.True(t, isolatedTransport.TLSClientConfig.InsecureSkipVerify)
+		}
+	}
 	assert.NotPanics(t, func() {
 		_ = providerTransport(custom, true)
 	})

@@ -22,9 +22,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http/httpguts"
@@ -277,8 +279,30 @@ var allowedForwardHeaders = []string{
 	"X-B3-Flags",
 }
 
+// providerTransportBaseline preserves the connection-stage defaults from Go's
+// standard transport for the isolated fallback used with custom RoundTrippers.
+var providerTransportBaseline = newProviderTransportBaseline()
+
 var secureClient = newProviderClient(false)
 var insecureClient = newProviderClient(true)
+
+func newProviderTransportBaseline() *http.Transport {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		return transport.Clone()
+	}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+}
 
 func newProviderClient(insecureSkipVerify bool) *http.Client {
 	return &http.Client{
@@ -296,7 +320,7 @@ func providerTransport(base http.RoundTripper, insecureSkipVerify bool) http.Rou
 	if transport, ok := base.(*http.Transport); ok {
 		cloned := transport.Clone()
 		if insecureSkipVerify {
-			cloned.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+			enableInsecureSkipVerify(cloned)
 		}
 		return cloned
 	}
@@ -305,12 +329,20 @@ func providerTransport(base http.RoundTripper, insecureSkipVerify bool) http.Rou
 	}
 	// A custom RoundTripper cannot be cloned or have its TLS policy adjusted.
 	// Use an isolated transport for the opt-in insecure policy instead of
-	// panicking or mutating a replaceable package-level variable.
-	return &http.Transport{
-		Proxy:             http.ProxyFromEnvironment,
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	// panicking or mutating a replaceable package-level variable. Start from
+	// the standard transport defaults so dial and TLS handshake bounds remain.
+	fallback := providerTransportBaseline.Clone()
+	enableInsecureSkipVerify(fallback)
+	return fallback
+}
+
+func enableInsecureSkipVerify(transport *http.Transport) {
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
+	transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec
 }
 
 func Do(req *http.Request, insecureSkipVerify bool) (*http.Response, error) {

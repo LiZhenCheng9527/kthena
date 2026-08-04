@@ -908,11 +908,13 @@ func (r *Router) proxyExternalProvider(
 
 	secret, err := r.getProviderSecret(provider)
 	if err != nil {
+		klog.Errorf("failed to get credentials for external provider %s: %v", providerName, err)
 		return newExternalProxyError(http.StatusServiceUnavailable, "provider_config", fmt.Sprintf("external provider %s is not ready", providerName))
 	}
 
 	adapter, err := providers.NewAdapter(provider.Spec.ProviderType)
 	if err != nil {
+		klog.Errorf("failed to create adapter for external provider %s: %v", providerName, err)
 		var configurationError *providers.ConfigurationError
 		if errors.As(err, &configurationError) {
 			return newExternalProxyError(http.StatusServiceUnavailable, "provider_config", fmt.Sprintf("external provider %s is not ready", providerName))
@@ -921,6 +923,7 @@ func (r *Router) proxyExternalProvider(
 	}
 	upstreamRequest, err := adapter.BuildRequest(c, req, provider, secret, modelRequest)
 	if err != nil {
+		klog.Errorf("failed to build request for external provider %s: %v", providerName, err)
 		var unsupportedPath *providers.UnsupportedPathError
 		if errors.As(err, &unsupportedPath) {
 			return newExternalProxyError(http.StatusBadRequest, "request_protocol", unsupportedPath.Error())
@@ -1056,6 +1059,7 @@ func proxyExternalRequest(
 ) error {
 	resp, err := providers.Do(req, insecureSkipVerify)
 	if err != nil {
+		klog.Errorf("external provider %s transport request failed: %v", providerName, err)
 		statusCode := http.StatusBadGateway
 		if isTimeoutError(err) {
 			statusCode = http.StatusGatewayTimeout

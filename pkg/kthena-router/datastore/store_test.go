@@ -38,7 +38,9 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/convert"
 )
 
 // ptr is a helper function to get pointer to a value
@@ -1642,6 +1644,33 @@ func TestStoreMatchModelTargetExternalProvider(t *testing.T) {
 	assert.Equal(t, mr, route)
 	assert.Equal(t, ModelTargetKindExternalModelProvider, target.Kind)
 	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "openai-provider"}, target.Name)
+}
+
+func TestStoreMatchesModelBoosterSpecName(t *testing.T) {
+	model := &workloadv1alpha1.ModelBooster{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen25", Namespace: "default"},
+		Spec: workloadv1alpha1.ModelBoosterSpec{
+			Name: "qwen25-coder-32b",
+			Backend: workloadv1alpha1.ModelBackend{
+				Name: "backend",
+			},
+		},
+	}
+
+	route := convert.BuildModelRoute(model)
+	store := New()
+	assert.NoError(t, store.AddOrUpdateModelRoute(route))
+
+	target, isLora, matchedRoute, err := store.MatchModelTarget(
+		model.Spec.Name,
+		&http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+		"",
+	)
+	assert.NoError(t, err)
+	assert.False(t, isLora)
+	assert.Equal(t, ModelTargetKindModelServer, target.Kind)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "qwen25-backend"}, target.Name)
+	assert.Equal(t, route, matchedRoute)
 }
 
 type fakePodRuntimeInspector struct {

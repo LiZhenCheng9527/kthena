@@ -1374,33 +1374,34 @@ func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T)
 	usageWithChoiceEvent := `data: {"choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
 	tests := []struct {
 		name             string
-		injectedUsage    bool
+		clientUsage      bool
 		usageEvent       string
 		wantUsageEvent   bool
 		wantFinishReason bool
 	}{
 		{
 			name:           "router injected usage-only event is omitted",
-			injectedUsage:  true,
 			usageEvent:     usageOnlyEvent,
 			wantUsageEvent: false,
 		},
 		{
 			name:             "router injected usage with choices is forwarded",
-			injectedUsage:    true,
 			usageEvent:       usageWithChoiceEvent,
 			wantUsageEvent:   true,
 			wantFinishReason: true,
 		},
 		{
 			name:           "client requested usage-only event is forwarded",
+			clientUsage:    true,
 			usageEvent:     usageOnlyEvent,
 			wantUsageEvent: true,
 		},
 	}
 
-	adapter, err := providers.NewAdapter(aiv1alpha1.OpenAI)
-	assert.NoError(t, err)
+	adapter := providers.DefaultAdapter()
+	provider := &aiv1alpha1.ExternalModelProvider{
+		Spec: aiv1alpha1.ExternalModelProviderSpec{BaseURL: "https://api.example.com"},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := &closeNotifyRecorder{
@@ -1408,8 +1409,14 @@ func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T)
 				closeCh:          make(chan bool),
 			}
 			c, _ := gin.CreateTestContext(w)
-			if tt.injectedUsage {
-				c.Set(common.TokenUsageKey, true)
+			modelRequest := map[string]interface{}{"model": "test-model", "stream": true}
+			if tt.clientUsage {
+				modelRequest["stream_options"] = map[string]interface{}{"include_usage": true}
+			}
+			upstreamRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			_, err := adapter.BuildRequest(c, upstreamRequest, provider, nil, modelRequest)
+			if !assert.NoError(t, err) {
+				return
 			}
 			body := strings.Join([]string{
 				`data: {"choices":[{"delta":{"content":"hello"}}]}`,
@@ -1427,7 +1434,7 @@ func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T)
 
 			var got providers.TokenUsage
 			callbackCount := 0
-			err := forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser(c, "/v1/chat/completions"), func(usage providers.TokenUsage) {
+			err = forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser(c, "/v1/chat/completions"), func(usage providers.TokenUsage) {
 				got = usage
 				callbackCount++
 			})

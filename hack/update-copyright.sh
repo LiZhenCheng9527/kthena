@@ -48,13 +48,14 @@ add_headers() {
   local template=$2
   local file
 
+  find "$ROOT_DIR" \
+    -type d \( -name vendor -o -name venv \) -prune -o \
+    -type f -name "*.${extension}" -print0 |
   while IFS= read -r -d '' file; do
     if ! grep -q "Copyright The Volcano Authors" "$file"; then
       add_header "$file" "$template"
     fi
-  done < <(find "$ROOT_DIR" \
-    -type d \( -name vendor -o -name venv \) -prune -o \
-    -type f -name "*.${extension}" -print0)
+  done
 }
 
 add_headers go "$GO_TPL"

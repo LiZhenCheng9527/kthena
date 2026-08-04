@@ -445,28 +445,23 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 	t.Logf("Initial CurrentRevision: %s", initialRevision)
 	require.NotEmpty(t, initialRevision, "Initial CurrentRevision should be set")
 
-	updatedMS := initialMS.DeepCopy()
-	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
 	t.Logf("Updating image to %s to establish partition state", nginxAlpineImage)
 
 	// rolling update
-	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
-	require.NoError(t, err)
+	updateModelServingWithRetry(t, ctx, kthenaClient, modelServing.Name, func(ms *workload.ModelServing) {
+		ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	})
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 
 	updateRevision := waitForPartitionState(t, ctx, kthenaClient, kubeClient, modelServing.Name, partition, initialReplicas, initialRevision)
 
 	// Scale down from 5 to 3 replicas (equal to partition, so all updated groups should be removed)
-	currentMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
-	require.NoError(t, err)
-
-	scaleDownMS := currentMS.DeepCopy()
-	scaleDownMS.Spec.Replicas = ptr.To(scaledReplicas)
 	t.Logf("Scaling down from %d to %d replicas while partition=%d", initialReplicas, scaledReplicas, partition)
 
 	// Update the ModelServing to scale down
-	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
-	require.NoError(t, err)
+	updateModelServingWithRetry(t, ctx, kthenaClient, modelServing.Name, func(ms *workload.ModelServing) {
+		ms.Spec.Replicas = ptr.To(scaledReplicas)
+	})
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 
 	// Verify: only protected ordinals 0-2 remain with old revision, no updated groups
@@ -1652,13 +1647,24 @@ func TestModelServingRolePartitionScaleDown(t *testing.T) {
 		}
 		for ord := int32(0); ord < partition; ord++ {
 			if imageByOrdinal[ord] != nginxImage {
+				t.Logf("Protected prefill-%d image=%s, expecting old image=%s", ord, imageByOrdinal[ord], nginxImage)
 				return false
 			}
 		}
-		for ord := partition; ord < initialRoleReplicas; ord++ {
-			if imageByOrdinal[ord] != nginxAlpineImage {
+		updatedCount := 0
+		for ord, image := range imageByOrdinal {
+			if ord < partition {
+				continue
+			}
+			if image != nginxAlpineImage {
+				t.Logf("Non-protected prefill-%d image=%s, expecting new image=%s", ord, image, nginxAlpineImage)
 				return false
 			}
+			updatedCount++
+		}
+		if updatedCount != int(initialRoleReplicas-partition) {
+			t.Logf("Updated replicas=%d, expecting %d; images=%v", updatedCount, initialRoleReplicas-partition, imageByOrdinal)
+			return false
 		}
 		return true
 	}, 3*time.Minute, 2*time.Second, "Role partition state did not converge before scale down")

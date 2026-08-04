@@ -1079,6 +1079,8 @@ func TestLWSAPIBasic(t *testing.T) {
 // immediately after would fail with "connection refused" errors.
 func TestModelServingControllerManagerRestart(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	// Create a complicated ModelServing with multiple roles
 	// 5 serving groups × (3 pods for prefill + 2 pods for decode) = 25 pods total
@@ -1173,6 +1175,8 @@ func TestModelServingControllerManagerRestart(t *testing.T) {
 // TestModelServingBinPackScaleDownServingGroup tests bin pack scale down at ServingGroup level
 func TestModelServingBinPackScaleDownServingGroup(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	modelServing := createBasicModelServing("test-binpack-sg-scaledown", 4, 0)
 	t.Log("Creating ModelServing with 4 servingGroup replicas for bin pack scale down test")
@@ -1237,6 +1241,8 @@ func TestModelServingBinPackScaleDownServingGroup(t *testing.T) {
 
 func TestModelServingBinPackScaleDownRole(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	const (
 		initialRoleReplicas = int32(4)
@@ -1302,6 +1308,8 @@ func TestModelServingBinPackScaleDownRole(t *testing.T) {
 
 func TestModelServingBinPackScaleDownCombined(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	prefillRole := createRole("prefill", 2, 0)
 	decodeRole := createRole("decode", 1, 0)
@@ -1375,6 +1383,8 @@ func TestModelServingBinPackScaleDownCombined(t *testing.T) {
 // not ready, scale-down prefers removing that group before healthy groups.
 func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	modelServing := createBasicModelServing("test-status-sg-priority", 4, 0)
 	// Inject a readiness gate to control pod readiness deterministically via K8s API
@@ -1452,6 +1462,8 @@ func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 // role scale-down prefers removing that replica before healthy ones.
 func TestModelServingStatusAwarePriorityScaleDownRole(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+	// waiting for webhook to be ready before running tests
+	waitForWebhookReady(t, ctx, kthenaClient, testNamespace)
 
 	const initialRoleReplicas = int32(4)
 

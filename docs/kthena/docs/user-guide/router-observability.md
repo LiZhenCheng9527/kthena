@@ -8,25 +8,27 @@ The Kthena router exposes three complementary observability surfaces:
 
 ## Endpoint map
 
-The current Helm chart serves health and metrics routes on the inference
-listener. The debug listener is a separate loopback-only server inside the
-router pod.
+The current Helm chart serves metrics on a dedicated internal listener. Health
+routes remain on the inference listener, while the debug listener is a separate
+loopback-only server inside the router pod.
 
 | Listener | Default | Endpoints | Exposure |
 | --- | --- | --- | --- |
-| Router | Container port `8080`; Service port `80` | `/healthz`, `/readyz`, `/metrics`, inference APIs | The `kthena-router` LoadBalancer Service |
+| Router | Container port `8080`; Service port `80` | `/healthz`, `/readyz`, inference APIs | The `kthena-router` LoadBalancer Service |
+| Metrics | Container and Service port `9090` | `/metrics` | The internal `kthena-router-metrics` ClusterIP Service |
 | Debug | `localhost:15000` | `/debug/config_dump/*`, `/debug/pprof/*` | Pod loopback only; no Service port |
 
-The chart does not currently provide an `observability.metrics` values block.
-The metrics path is fixed at `/metrics`, and its port follows
-`networking.kthenaRouter.port`. Do not set the previously documented
-`observability.metrics` keys; Helm ignores them.
+The metrics path is fixed at `/metrics`. Set
+`networking.kthenaRouter.metrics.port` to change its port. Metrics are not served
+on the public inference listener unless
+`networking.kthenaRouter.metrics.exposeOnRouterPort` is explicitly enabled for
+legacy compatibility.
 
 To inspect these endpoints without relying on their external exposure:
 
 ```bash
-# The Service listens on 80 and forwards to the router's default port, 8080.
-kubectl port-forward -n kthena-system service/kthena-router 8080:80
+# The internal Service forwards to the dedicated metrics listener.
+kubectl port-forward -n kthena-system service/kthena-router-metrics 9090:9090
 
 # Run separately when debug access is needed. This selects a router pod and
 # reaches the process's loopback-only listener from inside its network namespace.
@@ -65,17 +67,17 @@ been exercised.
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
 | `kthena_router_scheduler_plugin_duration_seconds` | Histogram | `model`, `plugin`, `type` | Scheduler plugin execution time; `type` is `filter` or `score` |
-| `kthena_router_fairness_queue_size` | Gauge | `model`, `user_id` | Pending requests in the fairness queue |
-| `kthena_router_fairness_queue_duration_seconds` | Histogram | `model`, `user_id` | Time spent waiting in the fairness queue |
-| `kthena_router_fairness_queue_cancelled_total` | Counter | `model`, `user_id` | Requests cancelled or timed out while queued |
-| `kthena_router_fairness_queue_dequeue_total` | Counter | `model`, `user_id` | Requests successfully dequeued |
+| `kthena_router_fairness_queue_size` | Gauge | `model`, `user_id="_all"` | Pending requests in the fairness queue, aggregated across users |
+| `kthena_router_fairness_queue_duration_seconds` | Histogram | `model`, `user_id="_all"` | Time spent waiting in the fairness queue, aggregated across users |
+| `kthena_router_fairness_queue_cancelled_total` | Counter | `model`, `user_id="_all"` | Requests cancelled or timed out while queued, aggregated across users |
+| `kthena_router_fairness_queue_dequeue_total` | Counter | `model`, `user_id="_all"` | Requests successfully dequeued, aggregated across users |
 | `kthena_router_fairness_queue_inflight` | Gauge | `model` | Requests admitted through the fairness semaphore |
 | `kthena_router_fairness_queue_priority_refresh_total` | Counter | `model` | Dequeue-time priority refresh and reinsert operations |
 | `kthena_router_fairness_queue_heap_rebuild_total` | Counter | `model` | Full heap rebuilds caused by priority drift |
 
-`user_id` values originate from authenticated request identity. Treat them as
-sensitive, and account for their cardinality when retaining or federating these
-series.
+Raw user identifiers are deliberately not exported. The `user_id` label is
+fixed to `_all`, keeping cardinality bounded and avoiding exposure of user
+identity through the metrics endpoint.
 
 ### Tokenizer and cache-aware scheduling
 
@@ -230,7 +232,7 @@ After starting both port-forwards from the [endpoint map](#endpoint-map):
 
 ```bash
 # Request counters by model and result.
-curl -s http://localhost:8080/metrics \
+curl -s http://localhost:9090/metrics \
   | grep '^kthena_router_requests_total'
 
 # Router configuration and currently known pods.

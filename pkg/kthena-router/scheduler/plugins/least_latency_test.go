@@ -117,6 +117,13 @@ func TestNewLeastLatencyNilRawUsesDefaultWeight(t *testing.T) {
 	}
 }
 
+func TestNewLeastLatencyRawWithoutWeightUsesDefault(t *testing.T) {
+	plugin := NewLeastLatency(runtime.RawExtension{Raw: []byte(`{}`)})
+	if plugin.TTFTTPOTWeightFactor != defaultTTFTTPOTWeightFactor {
+		t.Fatalf("expected default weight factor %v, got %v", defaultTTFTTPOTWeightFactor, plugin.TTFTTPOTWeightFactor)
+	}
+}
+
 func TestNewLeastLatencyInvalidArgsUsesDefaultWeight(t *testing.T) {
 	plugin := NewLeastLatency(runtime.RawExtension{Raw: []byte(`TTFTTPOTWeightFactor: [`)})
 	if plugin.TTFTTPOTWeightFactor != defaultTTFTTPOTWeightFactor {

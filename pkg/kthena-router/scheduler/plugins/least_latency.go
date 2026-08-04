@@ -57,7 +57,6 @@ func NewLeastLatency(pluginArg runtime.RawExtension) *LeastLatency {
 	if len(pluginArg.Raw) > 0 {
 		if err := yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs); err != nil {
 			klog.Errorf("Unmarshal LeastLatencyArgs error, setting default value: %v", err)
-			leastLatencyArgs.TTFTTPOTWeightFactor = defaultTTFTTPOTWeightFactor
 		}
 	}
 

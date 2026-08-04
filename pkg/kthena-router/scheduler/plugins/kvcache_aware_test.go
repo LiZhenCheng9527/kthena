@@ -2535,10 +2535,12 @@ func TestFreshOwners(t *testing.T) {
 			want:           []string{"pod-1.default"},
 		},
 		{
-			name:           "ownership written exactly at the restart is kept",
+			// Both timestamps are second-truncated, so a write in the restart's own second may
+			// have preceded it. Dropping costs a cache miss; keeping can route to a lost cache.
+			name:           "ownership written in the restart's second is dropped",
 			entries:        map[string]string{"pod-1.default": "1000"},
 			ownerStartedAt: map[string]int64{"pod-1.default": startedAt},
-			want:           []string{"pod-1.default"},
+			want:           []string{},
 		},
 		{
 			name:           "untracked owner is kept",

@@ -459,7 +459,9 @@ func freshOwners(entries map[string]string, ownerStartedAt map[string]int64) []s
 		if tracked {
 			written, err := strconv.ParseInt(writtenAt, 10, 64)
 			// An unparsable timestamp proves nothing, so keep it and leave it to gcStaleFields.
-			if err == nil && written < startedAt {
+			// Both sides are second-truncated, so a same-second write is dropped: it may have
+			// preceded the restart, and keeping it would route to a cache that is gone.
+			if err == nil && written <= startedAt {
 				klog.V(4).Infof("KVCacheAware.queryRedis: dropping ownership by %s written at %d, containers started at %d",
 					owner, written, startedAt)
 				continue

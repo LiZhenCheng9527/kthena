@@ -936,7 +936,7 @@ func (r *Router) proxyExternalProvider(
 	}
 
 	userID := c.GetString(common.UserIdKey)
-	responseParser := adapter.ResponseParser(req.URL.Path)
+	responseParser := adapter.ResponseParser(c, req.URL.Path)
 
 	return proxyExternalRequest(c, upstreamRequest, responseParser, provider.Spec.InsecureSkipVerify, isStreaming(modelRequest), providerName, func(usage providers.TokenUsage) {
 		if usage.TotalTokens <= 0 {
@@ -1041,11 +1041,8 @@ func proxyRequest(
 	if err != nil {
 		return fmt.Errorf("decode request error: %w", err)
 	}
-	adapter, err := providers.NewAdapter(v1alpha1.OpenAI)
-	if err != nil {
-		return err
-	}
-	return forwardResponseWithUsageParser(c, resp, stream, adapter.ResponseParser(req.URL.Path), onUsage)
+	parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+	return forwardResponseWithUsageParser(c, resp, stream, parser, onUsage)
 }
 
 func proxyExternalRequest(
@@ -1101,8 +1098,7 @@ func forwardResponseWithUsageParser(
 					if onUsage != nil {
 						onUsage(parseResult.Usage)
 					}
-					injectedUsage, _ := c.Get(common.TokenUsageKey)
-					if injected, ok := injectedUsage.(bool); ok && injected && parseResult.UsageOnly {
+					if parseResult.SuppressLine {
 						return true
 					}
 				}

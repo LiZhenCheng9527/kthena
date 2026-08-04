@@ -34,7 +34,7 @@ func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider
 	if req.URL.Path != "/v1/messages" {
 		return nil, &UnsupportedPathError{ProviderType: networkingv1alpha1.Anthropic, Path: req.URL.Path}
 	}
-	rewriteBody := provider.Spec.Model != nil && *provider.Spec.Model != ""
+	_, rewriteBody := modelOverride(provider)
 	upstreamURL, err := anthropicProviderURL(provider.Spec.BaseURL, req.URL.Path, req.URL.RawQuery)
 	if err != nil {
 		return nil, err
@@ -56,7 +56,7 @@ func (anthropicAdapter) BuildRequest(c *gin.Context, req *http.Request, provider
 	return upstream, nil
 }
 
-func (anthropicAdapter) ResponseParser(string) ResponseUsageParser {
+func (anthropicAdapter) ResponseParser(*gin.Context, string) ResponseUsageParser {
 	return &anthropicUsageParser{}
 }
 

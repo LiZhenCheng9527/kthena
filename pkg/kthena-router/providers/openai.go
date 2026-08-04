@@ -35,7 +35,10 @@ func (openAIAdapter) BuildRequest(c *gin.Context, req *http.Request, provider *n
 	if !isOpenAIPath(req.URL.Path) {
 		return nil, &UnsupportedPathError{ProviderType: networkingv1alpha1.OpenAI, Path: req.URL.Path}
 	}
-	rewriteBody := provider.Spec.Model != nil && *provider.Spec.Model != ""
+	rewriteBody := false
+	if _, ok := modelOverride(provider); ok {
+		rewriteBody = true
+	}
 	if req.URL.Path != "/v1/responses" && addOpenAIStreamingTokenUsage(c, modelRequest) {
 		rewriteBody = true
 	}
@@ -57,11 +60,11 @@ func (openAIAdapter) BuildRequest(c *gin.Context, req *http.Request, provider *n
 	return upstream, nil
 }
 
-func (openAIAdapter) ResponseParser(path string) ResponseUsageParser {
+func (openAIAdapter) ResponseParser(c *gin.Context, path string) ResponseUsageParser {
 	if path == "/v1/responses" {
 		return &openAIResponsesUsageParser{}
 	}
-	return &openAIUsageParser{}
+	return &openAIUsageParser{suppressUsageOnly: routerInjectedUsage(c)}
 }
 
 func addOpenAIStreamingTokenUsage(c *gin.Context, modelRequest map[string]interface{}) bool {
@@ -118,10 +121,13 @@ type openAIResponse struct {
 }
 
 type openAIUsageParser struct {
-	completed bool
+	// suppressUsageOnly is set when the router injected include_usage into the
+	// request; the resulting usage-only chunk is then withheld from the client.
+	suppressUsageOnly bool
+	completed         bool
 }
 
-func (openAIUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
+func (p *openAIUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
 	payload, ok := streamDataPayload(line)
 	if !ok {
 		return StreamUsageParseResult{}
@@ -135,13 +141,13 @@ func (openAIUsageParser) ParseStreamLine(line string) StreamUsageParseResult {
 		return StreamUsageParseResult{}
 	}
 	return StreamUsageParseResult{
-		Usage:     usage,
-		HasUsage:  true,
-		UsageOnly: len(response.Choices) == 0,
+		Usage:        usage,
+		HasUsage:     true,
+		SuppressLine: p.suppressUsageOnly && len(response.Choices) == 0,
 	}
 }
 
-func (openAIUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
+func (*openAIUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
 	var response openAIResponse
 	if err := json.Unmarshal(body, &response); err != nil {
 		return TokenUsage{}, false
@@ -150,7 +156,7 @@ func (openAIUsageParser) ParseBody(body []byte) (TokenUsage, bool) {
 	return usage, usage.TotalTokens > 0
 }
 
-func (openAIUsageParser) FinalStreamUsage() (TokenUsage, bool) {
+func (*openAIUsageParser) FinalStreamUsage() (TokenUsage, bool) {
 	return TokenUsage{}, false
 }
 

@@ -460,20 +460,29 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 	assert.NoError(t, err)
 
 	t.Run("chat completions", func(t *testing.T) {
-		parser := adapter.ResponseParser("/v1/chat/completions")
+		gin.SetMode(gin.TestMode)
+		injected, _ := gin.CreateTestContext(httptest.NewRecorder())
+		injected.Set(common.TokenUsageKey, true)
+		parser := adapter.ResponseParser(injected, "/v1/chat/completions")
 
 		result := parser.ParseStreamLine(`data: {"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
 		assert.True(t, result.HasUsage)
-		assert.True(t, result.UsageOnly)
+		assert.True(t, result.SuppressLine, "router-injected usage-only chunk must be withheld")
 		assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, result.Usage)
 
 		result = parser.ParseStreamLine(`data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
 		assert.True(t, result.HasUsage)
-		assert.True(t, result.UsageOnly)
+		assert.True(t, result.SuppressLine)
 
 		result = parser.ParseStreamLine(`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
 		assert.True(t, result.HasUsage)
-		assert.False(t, result.UsageOnly)
+		assert.False(t, result.SuppressLine, "content-bearing chunk must always be forwarded")
+
+		clientOpted, _ := gin.CreateTestContext(httptest.NewRecorder())
+		clientParser := adapter.ResponseParser(clientOpted, "/v1/chat/completions")
+		result = clientParser.ParseStreamLine(`data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`)
+		assert.True(t, result.HasUsage)
+		assert.False(t, result.SuppressLine, "client-requested usage chunk must be forwarded")
 
 		usage, ok := parser.ParseBody([]byte(`{"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}}`))
 		assert.True(t, ok)
@@ -488,7 +497,7 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 	})
 
 	t.Run("responses", func(t *testing.T) {
-		parser := adapter.ResponseParser("/v1/responses")
+		parser := adapter.ResponseParser(nil, "/v1/responses")
 
 		result := parser.ParseStreamLine(`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}`)
 		assert.False(t, result.HasUsage)
@@ -501,7 +510,7 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, TokenUsage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15}, usage)
 
-		usage, ok = adapter.ResponseParser("/v1/responses").ParseBody([]byte(`{"usage":{"input_tokens":8,"output_tokens":2}}`))
+		usage, ok = adapter.ResponseParser(nil, "/v1/responses").ParseBody([]byte(`{"usage":{"input_tokens":8,"output_tokens":2}}`))
 		assert.True(t, ok)
 		assert.Equal(t, TokenUsage{PromptTokens: 8, CompletionTokens: 2, TotalTokens: 10}, usage)
 	})
@@ -510,7 +519,7 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 func TestAnthropicAdapterResponseParser(t *testing.T) {
 	adapter, err := NewAdapter(networkingv1alpha1.Anthropic)
 	assert.NoError(t, err)
-	parser := adapter.ResponseParser("/v1/messages")
+	parser := adapter.ResponseParser(nil, "/v1/messages")
 
 	result := parser.ParseStreamLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1}}}`)
 	assert.False(t, result.HasUsage)
@@ -525,11 +534,11 @@ func TestAnthropicAdapterResponseParser(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, TokenUsage{PromptTokens: 11, CompletionTokens: 22, TotalTokens: 33}, usage)
 
-	usage, ok = adapter.ResponseParser("/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":4}}`))
+	usage, ok = adapter.ResponseParser(nil, "/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":4}}`))
 	assert.True(t, ok)
 	assert.Equal(t, TokenUsage{PromptTokens: 9, CompletionTokens: 4, TotalTokens: 13}, usage)
 
-	usage, ok = adapter.ResponseParser("/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":0}}`))
+	usage, ok = adapter.ResponseParser(nil, "/v1/messages").ParseBody([]byte(`{"usage":{"input_tokens":9,"output_tokens":0}}`))
 	assert.True(t, ok)
 	assert.Equal(t, TokenUsage{PromptTokens: 9, TotalTokens: 9}, usage)
 }

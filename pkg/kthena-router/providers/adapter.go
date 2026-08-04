@@ -38,7 +38,11 @@ import (
 
 type Adapter interface {
 	BuildRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, modelRequest map[string]interface{}) (*http.Request, error)
-	ResponseParser(path string) ResponseUsageParser
+	// ResponseParser returns the usage parser for a request path. The gin
+	// context carries request-scoped adapter state (for example whether the
+	// adapter injected usage reporting in BuildRequest), so callers must pass
+	// the same context that BuildRequest received.
+	ResponseParser(c *gin.Context, path string) ResponseUsageParser
 }
 
 // TokenUsage is the provider-neutral token accounting view returned by a
@@ -50,12 +54,13 @@ type TokenUsage struct {
 }
 
 // StreamUsageParseResult describes token usage found in a provider stream
-// event. UsageOnly is true when the event has no provider response content and
-// can be omitted if the router requested the event solely for accounting.
+// event. SuppressLine is true when the event exists only to satisfy usage
+// reporting that the router itself injected into the request, so the line
+// must not be forwarded to the client.
 type StreamUsageParseResult struct {
-	Usage     TokenUsage
-	HasUsage  bool
-	UsageOnly bool
+	Usage        TokenUsage
+	HasUsage     bool
+	SuppressLine bool
 }
 
 // ResponseUsageParser normalizes provider-specific response bodies and stream
@@ -107,6 +112,35 @@ func NewAdapter(providerType networkingv1alpha1.ExternalProviderType) (Adapter, 
 	}
 }
 
+// DefaultAdapter returns the adapter for in-cluster model servers, which
+// expose OpenAI-compatible APIs.
+func DefaultAdapter() Adapter {
+	return openAIAdapter{}
+}
+
+// routerInjectedUsage reports whether the router injected usage reporting
+// into the upstream request on behalf of the client, in which case the
+// resulting usage-only stream event must not reach the client.
+func routerInjectedUsage(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, ok := c.Get(common.TokenUsageKey)
+	if !ok {
+		return false
+	}
+	injected, ok := value.(bool)
+	return ok && injected
+}
+
+// modelOverride returns the configured upstream model override, if any.
+func modelOverride(provider *networkingv1alpha1.ExternalModelProvider) (string, bool) {
+	if provider == nil || provider.Spec.Model == nil || *provider.Spec.Model == "" {
+		return "", false
+	}
+	return *provider.Spec.Model, true
+}
+
 // ValidateConfiguration validates provider settings that are required by every
 // request. It is used both by reconciliation and as defense in depth in the
 // request-building path.
@@ -127,8 +161,8 @@ func ValidateConfiguration(provider *networkingv1alpha1.ExternalModelProvider) e
 }
 
 func buildProviderRequest(c *gin.Context, req *http.Request, provider *networkingv1alpha1.ExternalModelProvider, modelRequest map[string]interface{}, upstreamURL *url.URL, rewriteBody bool) (*http.Request, error) {
-	if provider.Spec.Model != nil && *provider.Spec.Model != "" {
-		modelRequest["model"] = *provider.Spec.Model
+	if model, ok := modelOverride(provider); ok {
+		modelRequest["model"] = model
 		rewriteBody = true
 	}
 

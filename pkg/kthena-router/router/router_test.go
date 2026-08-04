@@ -1310,7 +1310,7 @@ func TestProxyExternalRequest_AnthropicStreamAggregatesUsage(t *testing.T) {
 	assert.NoError(t, err)
 
 	var got providers.TokenUsage
-	err = proxyExternalRequest(c, req, adapter.ResponseParser("/v1/messages"), false, true, "default/anthropic-provider", func(usage providers.TokenUsage) {
+	err = proxyExternalRequest(c, req, adapter.ResponseParser(c, "/v1/messages"), false, true, "default/anthropic-provider", func(usage providers.TokenUsage) {
 		got = usage
 	})
 	assert.NoError(t, err)
@@ -1351,7 +1351,7 @@ func TestProxyExternalRequest_OpenAIResponsesStreamAggregatesUsage(t *testing.T)
 
 			var got providers.TokenUsage
 			callbackCount := 0
-			err = proxyExternalRequest(c, upstreamRequest, adapter.ResponseParser("/v1/responses"), false, true, "default/openai-provider", func(usage providers.TokenUsage) {
+			err = proxyExternalRequest(c, upstreamRequest, adapter.ResponseParser(c, "/v1/responses"), false, true, "default/openai-provider", func(usage providers.TokenUsage) {
 				got = usage
 				callbackCount++
 			})
@@ -1427,7 +1427,7 @@ func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T)
 
 			var got providers.TokenUsage
 			callbackCount := 0
-			err := forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser("/v1/chat/completions"), func(usage providers.TokenUsage) {
+			err := forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser(c, "/v1/chat/completions"), func(usage providers.TokenUsage) {
 				got = usage
 				callbackCount++
 			})

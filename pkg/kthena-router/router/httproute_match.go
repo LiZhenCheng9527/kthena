@@ -75,9 +75,13 @@ func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRout
 	if len(httpRoutes) == 0 {
 		return httpRouteMatchResult{}, false
 	}
+	listenerName := c.GetString(GatewayListenerNameKey)
 
 	for _, route := range httpRoutes {
 		if route == nil {
+			continue
+		}
+		if !httpRouteMatchesGatewayListenerName(route, gatewayKey, listenerName) {
 			continue
 		}
 		if !matchHTTPRouteHostnames(route.Spec.Hostnames, c.Request.Host) {
@@ -89,6 +93,28 @@ func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRout
 		}
 	}
 	return httpRouteMatchResult{}, false
+}
+
+func httpRouteMatchesGatewayListenerName(route *gatewayv1.HTTPRoute, gatewayKey, listenerName string) bool {
+	for _, parentRef := range route.Spec.ParentRefs {
+		if parentRef.Group != nil && string(*parentRef.Group) != gatewayv1.GroupName {
+			continue
+		}
+		if parentRef.Kind != nil && *parentRef.Kind != "Gateway" {
+			continue
+		}
+		gatewayNamespace := route.Namespace
+		if parentRef.Namespace != nil {
+			gatewayNamespace = string(*parentRef.Namespace)
+		}
+		if gatewayNamespace+"/"+string(parentRef.Name) != gatewayKey {
+			continue
+		}
+		if parentRef.SectionName == nil || string(*parentRef.SectionName) == listenerName {
+			return true
+		}
+	}
+	return false
 }
 
 func findBestHTTPRouteRuleMatch(route *gatewayv1.HTTPRoute, requestPath string) (httpRouteMatchResult, bool) {

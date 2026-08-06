@@ -256,6 +256,7 @@ func startListener(ctx context.Context, cfg listenerConfig) *http.Server {
 			}
 
 			c.Set(router.GatewayKey, matched.GatewayKey)
+			c.Set(router.GatewayListenerNameKey, matched.ListenerName)
 			c.Next()
 		})
 		engine.Use(AccessLogMiddleware(lm.router))

@@ -83,16 +83,72 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 		}
 	}
 	method := gatewayv1.HTTPMethodGet
+	routeForListener := func(name, listenerName string, rules []gatewayv1.HTTPRouteRule) *gatewayv1.HTTPRoute {
+		httpRoute := route(name, nil, rules)
+		sectionName := gatewayv1.SectionName(listenerName)
+		httpRoute.Spec.ParentRefs[0].SectionName = &sectionName
+		return httpRoute
+	}
 
 	tests := []struct {
 		name           string
 		routes         []*gatewayv1.HTTPRoute
 		host           string
 		path           string
+		listenerName   string
 		expectedRoute  string
 		expectedPool   string
 		expectedPrefix string
 	}{
+		{
+			name: "matches route without section name",
+			routes: []*gatewayv1.HTTPRoute{
+				route("route", nil, []gatewayv1.HTTPRouteRule{
+					pathRule("/chat", "pool"),
+				}),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "public",
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
+		},
+		{
+			name: "matches route attached to selected listener",
+			routes: []*gatewayv1.HTTPRoute{
+				routeForListener("route", "private", []gatewayv1.HTTPRouteRule{
+					pathRule("/chat", "pool"),
+				}),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "private",
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
+		},
+		{
+			name: "skips route attached to another listener",
+			routes: []*gatewayv1.HTTPRoute{
+				routeForListener("route", "private", []gatewayv1.HTTPRouteRule{
+					pathRule("/chat", "pool"),
+				}),
+			},
+			host:         "api.example.com",
+			path:         "/chat",
+			listenerName: "public",
+		},
+		{
+			name: "skips listener-scoped route without listener context",
+			routes: []*gatewayv1.HTTPRoute{
+				routeForListener("route", "private", []gatewayv1.HTTPRouteRule{
+					pathRule("/chat", "pool"),
+				}),
+			},
+			host: "api.example.com",
+			path: "/chat",
+		},
 		{
 			name: "prefers longest prefix in a single route",
 			routes: []*gatewayv1.HTTPRoute{
@@ -199,6 +255,9 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 			c.Request, _ = http.NewRequest(http.MethodPost, tt.path, nil)
 			c.Request.Host = tt.host
+			if tt.listenerName != "" {
+				c.Set(GatewayListenerNameKey, tt.listenerName)
+			}
 
 			result, matched := router.findHTTPRouteMatch(c, "default/gw")
 			if tt.expectedRoute == "" {

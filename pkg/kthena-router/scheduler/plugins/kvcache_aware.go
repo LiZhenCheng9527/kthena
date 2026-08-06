@@ -293,7 +293,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 }
 
 // queryRedisForBlocks queries Redis to find which pods have cached the given token block hashes
-// Returns a map from block hash to list of pod names that have cached that block.
+// Returns a map from block hash to the pod.namespace owner identifiers that have cached it.
 // ownerStartedAt carries each candidate's container start time, used to drop stale ownership.
 func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string, ownerStartedAt map[string]int64) (map[uint64][]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -309,8 +309,8 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	klog.V(2).Infof("KVCacheAware.queryRedis: querying %d block hashes for model=%q", len(blockHashes), modelName)
 
 	pipe := t.redisClient.Pipeline()
-	keys := make([]string, len(blockHashes))
 	cmds := make([]*redis.MapStringStringCmd, len(blockHashes))
+	keys := make([]string, len(blockHashes))
 
 	// Build pipeline commands for batch Redis query. Values are read alongside the owners so
 	// ownership predating a restart can be dropped.
@@ -458,7 +458,8 @@ func freshOwners(entries map[string]string, ownerStartedAt map[string]int64) []s
 		startedAt, tracked := ownerStartedAt[owner]
 		if tracked {
 			written, err := strconv.ParseInt(writtenAt, 10, 64)
-			// An unparsable timestamp proves nothing, so keep it and leave it to gcStaleFields.
+			// An unparsable timestamp is kept: gcStaleFields skips it too, and a future
+			// higher-precision format would otherwise drop every owner at once.
 			// Both sides are second-truncated, so a same-second write is dropped: it may have
 			// preceded the restart, and keeping it would route to a cache that is gone.
 			if err == nil && written <= startedAt {

@@ -58,6 +58,7 @@ const (
 	// Context keys for gin context
 	GatewayKey             = "gatewayKey"
 	GatewayListenerNameKey = "gatewayListenerName"
+	GatewayListenerPortKey = "gatewayListenerPort"
 	PromptKey              = "promptKey" // store parsed ChatMessage, which will be reused
 
 	successfulRequestFinishReason = "successful_request"

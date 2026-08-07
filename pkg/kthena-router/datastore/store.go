@@ -377,6 +377,7 @@ type store struct {
 	routes             map[string][]*aiv1alpha1.ModelRoute // key: model name, value: list of ModelRoutes
 	loraRoutes         map[string][]*aiv1alpha1.ModelRoute // key: lora name, value: list of ModelRoutes
 	gatewayModelRoutes map[string]sets.Set[string]         // key: gateway key (namespace/name), value: set of ModelRoute keys
+	regexCache         sync.Map                            // key: regex pattern, value: *compiledPattern
 
 	// Gateway fields (using standard Gateway API)
 	gatewayMutex sync.RWMutex
@@ -1245,6 +1246,7 @@ func (s *store) AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error {
 	s.routeMutex.Unlock()
 
 	s.cleanRequestWaitingQueues(queuesToClean)
+	s.gcRegexCache()
 
 	s.triggerCallbacks("ModelRoute", EventData{
 		EventType:  EventUpdate,
@@ -1359,6 +1361,7 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 
 	// Clean up associated waiting queues for both base model and all lora adapters
 	s.cleanRequestWaitingQueues(queueCleanupCandidates)
+	s.gcRegexCache()
 
 	// Trigger callbacks outside the lock to avoid potential deadlocks
 	s.triggerCallbacks("ModelRoute", EventData{
@@ -1516,7 +1519,7 @@ func (s *store) selectRule(modelName string, req *http.Request, rules []*aiv1alp
 		headersMatched := true
 		for key, sm := range rule.ModelMatch.Headers {
 			reqValue := req.Header.Get(key)
-			if !matchString(sm, reqValue) {
+			if !s.matchString(sm, reqValue) {
 				headersMatched = false
 				break
 			}
@@ -1527,7 +1530,7 @@ func (s *store) selectRule(modelName string, req *http.Request, rules []*aiv1alp
 
 		uriMatched := true
 		if uriMatch := rule.ModelMatch.Uri; uriMatch != nil {
-			if !matchString(uriMatch, req.URL.Path) {
+			if !s.matchString(uriMatch, req.URL.Path) {
 				uriMatched = false
 			}
 		}
@@ -1542,15 +1545,80 @@ func (s *store) selectRule(modelName string, req *http.Request, rules []*aiv1alp
 	return nil, fmt.Errorf("failed to find a matching rule")
 }
 
-func matchString(sm *aiv1alpha1.StringMatch, value string) bool {
+// compiledPattern caches a compile result, including failures
+type compiledPattern struct {
+	re  *regexp.Regexp
+	err error
+}
+
+// compileRegex returns the compiled pattern, compiling it on first use
+func (s *store) compileRegex(pattern string) (*regexp.Regexp, error) {
+	if v, ok := s.regexCache.Load(pattern); ok {
+		cp := v.(*compiledPattern)
+		return cp.re, cp.err
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		klog.Warningf("invalid regex %q in ModelRoute match, treating as no match: %v", pattern, err)
+	}
+	v, _ := s.regexCache.LoadOrStore(pattern, &compiledPattern{re: re, err: err})
+	cp := v.(*compiledPattern)
+	return cp.re, cp.err
+}
+
+// collectRouteRegexes adds every regex pattern referenced by mr to out
+func collectRouteRegexes(mr *aiv1alpha1.ModelRoute, out map[string]struct{}) {
+	for _, rule := range mr.Spec.Rules {
+		if rule == nil || rule.ModelMatch == nil {
+			continue
+		}
+		for _, sm := range rule.ModelMatch.Headers {
+			if sm != nil && sm.Regex != nil {
+				out[*sm.Regex] = struct{}{}
+			}
+		}
+		if uri := rule.ModelMatch.Uri; uri != nil && uri.Regex != nil {
+			out[*uri.Regex] = struct{}{}
+		}
+	}
+}
+
+// gcRegexCache drops compiled patterns that no ModelRoute references any more
+func (s *store) gcRegexCache() {
+	live := make(map[string]struct{})
+	s.routeMutex.RLock()
+	for _, routes := range s.routes {
+		for _, mr := range routes {
+			collectRouteRegexes(mr, live)
+		}
+	}
+	for _, routes := range s.loraRoutes {
+		for _, mr := range routes {
+			collectRouteRegexes(mr, live)
+		}
+	}
+	s.routeMutex.RUnlock()
+
+	s.regexCache.Range(func(key, _ any) bool {
+		if _, ok := live[key.(string)]; !ok {
+			s.regexCache.Delete(key)
+		}
+		return true
+	})
+}
+
+func (s *store) matchString(sm *aiv1alpha1.StringMatch, value string) bool {
 	switch {
 	case sm.Exact != nil:
 		return value == *sm.Exact
 	case sm.Prefix != nil:
 		return strings.HasPrefix(value, *sm.Prefix)
 	case sm.Regex != nil:
-		matched, _ := regexp.MatchString(*sm.Regex, value)
-		return matched
+		re, err := s.compileRegex(*sm.Regex)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(value)
 	default:
 		return true
 	}

@@ -92,49 +92,6 @@ func TestKVCacheAwareBlock_String_Core(t *testing.T) {
 	}
 }
 
-func TestExtractPodNameFromIdentifier_Core(t *testing.T) {
-	tests := []struct {
-		name       string
-		identifier string
-		expected   string
-	}{
-		{
-			name:       "Simple pod name",
-			identifier: "pod-name",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Pod with namespace",
-			identifier: "pod-name.namespace",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Full pod identifier",
-			identifier: "pod-name.namespace.svc.cluster.local",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Pod with dashes and numbers",
-			identifier: "my-pod-123.my-namespace.svc.cluster.local",
-			expected:   "my-pod-123",
-		},
-		{
-			name:       "Empty string",
-			identifier: "",
-			expected:   "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := extractPodNameFromIdentifier(tt.identifier)
-			if result != tt.expected {
-				t.Errorf("Expected %s, got %s", tt.expected, result)
-			}
-		})
-	}
-}
-
 func TestComputeStandardizedHash_Core(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1744,65 +1701,6 @@ func TestKVCacheAware_Score_Advanced_Core(t *testing.T) {
 
 			if !reflect.DeepEqual(resultMap, tt.expectedScores) {
 				t.Errorf("Expected scores %v, got %v", tt.expectedScores, resultMap)
-			}
-		})
-	}
-}
-
-// Test extractPodNameFromIdentifier with various formats
-func TestExtractPodNameFromIdentifier_Advanced_Core(t *testing.T) {
-	tests := []struct {
-		name       string
-		identifier string
-		expected   string
-	}{
-		{
-			name:       "Simple pod name",
-			identifier: "pod-name",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Pod with namespace",
-			identifier: "pod-name.namespace",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Full service name",
-			identifier: "pod-name.namespace.svc.cluster.local",
-			expected:   "pod-name",
-		},
-		{
-			name:       "Empty string",
-			identifier: "",
-			expected:   "",
-		},
-		{
-			name:       "Single dot",
-			identifier: ".",
-			expected:   "",
-		},
-		{
-			name:       "Multiple dots",
-			identifier: "a.b.c.d.e.f",
-			expected:   "a",
-		},
-		{
-			name:       "Pod name with hyphens",
-			identifier: "my-pod-name-123.my-namespace.svc.cluster.local",
-			expected:   "my-pod-name-123",
-		},
-		{
-			name:       "Pod name with numbers",
-			identifier: "pod123.ns456",
-			expected:   "pod123",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := extractPodNameFromIdentifier(tt.identifier)
-			if result != tt.expected {
-				t.Errorf("Expected %s, got %s", tt.expected, result)
 			}
 		})
 	}

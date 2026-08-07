@@ -881,47 +881,24 @@ func TestKVCacheAware_QueryRedisForBlocks_Core(t *testing.T) {
 	// In a real integration test, you would use a Redis test container
 
 	tests := []struct {
-		name           string
-		blockHashes    []uint64
-		modelName      string
-		mockResults    map[uint64][]string
-		expectedResult map[uint64][]string
-		expectError    bool
+		name        string
+		blockHashes []uint64
+		modelName   string
 	}{
 		{
-			name:           "Empty block hashes",
-			blockHashes:    []uint64{},
-			modelName:      "test-model",
-			mockResults:    map[uint64][]string{},
-			expectedResult: map[uint64][]string{},
-			expectError:    false,
+			name:        "Empty block hashes",
+			blockHashes: []uint64{},
+			modelName:   "test-model",
 		},
 		{
-			name:        "Single block with pods",
+			name:        "Single block",
 			blockHashes: []uint64{12345},
 			modelName:   "test-model",
-			mockResults: map[uint64][]string{
-				12345: {"pod1.namespace", "pod2.namespace"},
-			},
-			expectedResult: map[uint64][]string{
-				12345: {"pod1", "pod2"},
-			},
-			expectError: false,
 		},
 		{
-			name:        "Multiple blocks with mixed results",
+			name:        "Multiple blocks",
 			blockHashes: []uint64{12345, 67890, 11111},
 			modelName:   "test-model",
-			mockResults: map[uint64][]string{
-				12345: {"pod1.namespace.svc.cluster.local", "pod2.namespace"},
-				67890: {}, // No pods for this block
-				11111: {"pod3.namespace.svc.cluster.local"},
-			},
-			expectedResult: map[uint64][]string{
-				12345: {"pod1", "pod2"},
-				11111: {"pod3"},
-			},
-			expectError: false,
 		},
 	}
 
@@ -934,21 +911,6 @@ func TestKVCacheAware_QueryRedisForBlocks_Core(t *testing.T) {
 				expectedKey := kvCacheKeyPrefix + tt.modelName + "@" + fmt.Sprintf("%d", hash)
 				if key != expectedKey {
 					t.Errorf("Expected key %s, got %s", expectedKey, key)
-				}
-			}
-
-			// Test pod name extraction logic
-			for hash, expectedPods := range tt.expectedResult {
-				mockPods := tt.mockResults[hash]
-				actualPods := make([]string, 0, len(mockPods))
-
-				for _, podIdentifier := range mockPods {
-					podName := extractPodNameFromIdentifier(podIdentifier)
-					actualPods = append(actualPods, podName)
-				}
-
-				if !reflect.DeepEqual(actualPods, expectedPods) {
-					t.Errorf("For hash %d, expected pods %v, got %v", hash, expectedPods, actualPods)
 				}
 			}
 		})

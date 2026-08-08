@@ -92,6 +92,10 @@ func InstallKthena(cfg *KthenaConfig) error {
 		return fmt.Errorf("failed to install kthena: %v", err)
 	}
 
+	if err := waitForKthenaDeployments(cfg); err != nil {
+		return err
+	}
+
 	// Wait for auto-generated Gateway if Gateway API is enabled
 	if cfg.GatewayAPIEnabled {
 		fmt.Printf("Waiting for auto-generated Gateway 'default' in '%s' namespace...\n", cfg.Namespace)
@@ -124,6 +128,35 @@ func InstallKthena(cfg *KthenaConfig) error {
 	}
 
 	return nil
+}
+
+func waitForKthenaDeployments(cfg *KthenaConfig) error {
+	for _, deployment := range kthenaDeployments(cfg) {
+		fmt.Printf("Waiting for deployment %s to be ready...\n", deployment)
+		cmd := exec.Command(
+			"kubectl", "rollout", "status", "deployment/"+deployment,
+			"--namespace", cfg.Namespace,
+			"--timeout=300s",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to wait for deployment %s: %w", deployment, err)
+		}
+	}
+
+	return nil
+}
+
+func kthenaDeployments(cfg *KthenaConfig) []string {
+	deployments := make([]string, 0, 2)
+	if cfg.WorkloadEnabled {
+		deployments = append(deployments, "kthena-controller-manager")
+	}
+	if cfg.NetworkingEnabled {
+		deployments = append(deployments, "kthena-router")
+	}
+	return deployments
 }
 
 // UninstallKthena uninstalls kthena via helm

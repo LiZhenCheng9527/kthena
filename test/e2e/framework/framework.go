@@ -69,20 +69,7 @@ func InstallKthena(cfg *KthenaConfig) error {
 		cfg.ImageTag = "latest"
 	}
 
-	args := []string{
-		"install", "kthena", cfg.ChartPath,
-		"--namespace", cfg.Namespace,
-		"--create-namespace",
-		"--set", fmt.Sprintf("workload.enabled=%v", cfg.WorkloadEnabled),
-		"--set", fmt.Sprintf("networking.enabled=%v", cfg.NetworkingEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.enabled=%v", cfg.GatewayAPIEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.inferenceExtension=%v", cfg.InferenceExtensionEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("networking.webhook.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.downloaderImage.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.runtimeImage.tag=%s", cfg.ImageTag),
-	}
+	args := helmInstallArgs(cfg)
 
 	cmd := exec.Command("helm", args...)
 	cmd.Stdout = os.Stdout
@@ -90,15 +77,6 @@ func InstallKthena(cfg *KthenaConfig) error {
 	fmt.Printf("Installing kthena: %s\n", strings.Join(cmd.Args, " "))
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to install kthena: %v", err)
-	}
-
-	// Wait for pods to be ready
-	fmt.Println("Waiting for kthena pods to be ready...")
-	waitCmd := exec.Command("kubectl", "wait", "--for=condition=Ready", "pod", "--all", "-n", cfg.Namespace, "--timeout=300s")
-	waitCmd.Stdout = os.Stdout
-	waitCmd.Stderr = os.Stderr
-	if err := waitCmd.Run(); err != nil {
-		return fmt.Errorf("failed to wait for kthena pods: %v", err)
 	}
 
 	// Wait for auto-generated Gateway if Gateway API is enabled
@@ -133,6 +111,25 @@ func InstallKthena(cfg *KthenaConfig) error {
 	}
 
 	return nil
+}
+
+func helmInstallArgs(cfg *KthenaConfig) []string {
+	return []string{
+		"install", "kthena", cfg.ChartPath,
+		"--namespace", cfg.Namespace,
+		"--create-namespace",
+		"--wait",
+		"--timeout", "5m",
+		"--set", fmt.Sprintf("workload.enabled=%v", cfg.WorkloadEnabled),
+		"--set", fmt.Sprintf("networking.enabled=%v", cfg.NetworkingEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.enabled=%v", cfg.GatewayAPIEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.inferenceExtension=%v", cfg.InferenceExtensionEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("networking.webhook.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.downloaderImage.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.runtimeImage.tag=%s", cfg.ImageTag),
+	}
 }
 
 // UninstallKthena uninstalls kthena via helm

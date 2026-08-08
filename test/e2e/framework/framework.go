@@ -69,7 +69,20 @@ func InstallKthena(cfg *KthenaConfig) error {
 		cfg.ImageTag = "latest"
 	}
 
-	args := helmInstallArgs(cfg)
+	args := []string{
+		"install", "kthena", cfg.ChartPath,
+		"--namespace", cfg.Namespace,
+		"--create-namespace",
+		"--set", fmt.Sprintf("workload.enabled=%v", cfg.WorkloadEnabled),
+		"--set", fmt.Sprintf("networking.enabled=%v", cfg.NetworkingEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.enabled=%v", cfg.GatewayAPIEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.inferenceExtension=%v", cfg.InferenceExtensionEnabled),
+		"--set", fmt.Sprintf("networking.kthenaRouter.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("networking.webhook.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.image.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.downloaderImage.tag=%s", cfg.ImageTag),
+		"--set", fmt.Sprintf("workload.controllerManager.runtimeImage.tag=%s", cfg.ImageTag),
+	}
 
 	cmd := exec.Command("helm", args...)
 	cmd.Stdout = os.Stdout
@@ -111,25 +124,6 @@ func InstallKthena(cfg *KthenaConfig) error {
 	}
 
 	return nil
-}
-
-func helmInstallArgs(cfg *KthenaConfig) []string {
-	return []string{
-		"install", "kthena", cfg.ChartPath,
-		"--namespace", cfg.Namespace,
-		"--create-namespace",
-		"--wait",
-		"--timeout", "5m",
-		"--set", fmt.Sprintf("workload.enabled=%v", cfg.WorkloadEnabled),
-		"--set", fmt.Sprintf("networking.enabled=%v", cfg.NetworkingEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.enabled=%v", cfg.GatewayAPIEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.gatewayAPI.inferenceExtension=%v", cfg.InferenceExtensionEnabled),
-		"--set", fmt.Sprintf("networking.kthenaRouter.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("networking.webhook.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.image.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.downloaderImage.tag=%s", cfg.ImageTag),
-		"--set", fmt.Sprintf("workload.controllerManager.runtimeImage.tag=%s", cfg.ImageTag),
-	}
 }
 
 // UninstallKthena uninstalls kthena via helm

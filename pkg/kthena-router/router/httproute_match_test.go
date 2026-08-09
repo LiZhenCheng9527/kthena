@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -29,6 +30,15 @@ import (
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
+
+type orderedHTTPRouteStore struct {
+	datastore.Store
+	routes []*gatewayv1.HTTPRoute
+}
+
+func (s *orderedHTTPRouteStore) GetHTTPRoutesByGateway(string) []*gatewayv1.HTTPRoute {
+	return s.routes
+}
 
 func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 	pathType := gatewayv1.PathMatchPathPrefix
@@ -300,6 +310,77 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 			pool, found := inferencePoolFromHTTPRouteRule(result.route, result.rule)
 			assert.True(t, found)
 			assert.Equal(t, types.NamespacedName{Namespace: "default", Name: tt.expectedPool}, pool)
+		})
+	}
+}
+
+func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	route := func(namespace, name, prefix string, createdAt time.Time) *gatewayv1.HTTPRoute {
+		return &gatewayv1.HTTPRoute{
+			ObjectMeta: v1.ObjectMeta{
+				Namespace:         namespace,
+				Name:              name,
+				CreationTimestamp: v1.NewTime(createdAt),
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{{
+					Matches: []gatewayv1.HTTPRouteMatch{{
+						Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &prefix},
+					}},
+				}},
+			},
+		}
+	}
+	newer := time.Date(2026, time.January, 2, 0, 0, 0, 0, time.UTC)
+	older := newer.Add(-time.Hour)
+
+	tests := []struct {
+		name          string
+		routes        []*gatewayv1.HTTPRoute
+		expectedRoute types.NamespacedName
+	}{
+		{
+			name: "longest matching prefix wins regardless of route order",
+			routes: []*gatewayv1.HTTPRoute{
+				route("default", "root-route", "/", older),
+				route("default", "chat-route", "/chat", newer),
+			},
+			expectedRoute: types.NamespacedName{Namespace: "default", Name: "chat-route"},
+		},
+		{
+			name: "oldest route wins equal path specificity regardless of route order",
+			routes: []*gatewayv1.HTTPRoute{
+				route("default", "new-route", "/chat", newer),
+				route("default", "old-route", "/chat", older),
+			},
+			expectedRoute: types.NamespacedName{Namespace: "default", Name: "old-route"},
+		},
+		{
+			name: "namespace and name resolve equal timestamp ties",
+			routes: []*gatewayv1.HTTPRoute{
+				route("team-b", "a-route", "/chat", older),
+				route("team-a", "z-route", "/chat", older),
+			},
+			expectedRoute: types.NamespacedName{Namespace: "team-a", Name: "z-route"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := &Router{store: &orderedHTTPRouteStore{routes: tt.routes}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/chat/completions", nil)
+
+			match, found := router.findHTTPRouteMatch(c, "default/gateway")
+			if !found {
+				t.Fatal("expected a matching HTTPRoute")
+			}
+			assert.Equal(t, tt.expectedRoute, types.NamespacedName{
+				Namespace: match.route.Namespace,
+				Name:      match.route.Name,
+			})
 		})
 	}
 }

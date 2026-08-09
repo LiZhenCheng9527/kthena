@@ -45,8 +45,8 @@ type httpRouteMatchResult struct {
 	// stored in gin.Context so ReplacePrefixMatch URLRewrite can replace exactly
 	// the prefix that made this rule match.
 	matchedPrefix string
-	// path stores the path specificity used only to choose the best rule within
-	// this HTTPRoute.
+	// path stores the path specificity used to choose the best rule within one
+	// HTTPRoute and then the best match across all applicable HTTPRoutes.
 	path httpRoutePathPrecedence
 }
 
@@ -66,10 +66,9 @@ type httpRoutePathPrecedence struct {
 }
 
 // findHTTPRouteMatch keeps Kthena's lightweight HTTPRoute matching model. It
-// checks hostnames at the route level, then picks the best path match within the
-// first matching HTTPRoute and preserves that rule for backend/filter lookup. It
-// intentionally does not implement full Gateway API method/header/query matching
-// or cross-route precedence.
+// checks hostnames at the route level, finds the best path match in every
+// applicable HTTPRoute, then applies cross-route precedence. It intentionally
+// does not implement full Gateway API method/header/query matching.
 func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRouteMatchResult, bool) {
 	httpRoutes := r.store.GetHTTPRoutesByGateway(gatewayKey)
 	if len(httpRoutes) == 0 {
@@ -78,6 +77,8 @@ func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRout
 	listenerName := c.GetString(GatewayListenerNameKey)
 	listenerPort := c.GetInt(GatewayListenerPortKey)
 
+	var best httpRouteMatchResult
+	found := false
 	for _, route := range httpRoutes {
 		if route == nil {
 			continue
@@ -90,10 +91,13 @@ func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRout
 		}
 		result, matched := findBestHTTPRouteRuleMatch(route, c.Request.URL.Path)
 		if matched {
-			return result, true
+			if !found || compareHTTPRouteMatchPrecedence(result, best) < 0 {
+				best = result
+				found = true
+			}
 		}
 	}
-	return httpRouteMatchResult{}, false
+	return best, found
 }
 
 func httpRouteMatchesGatewayListener(route *gatewayv1.HTTPRoute, gatewayKey, listenerName string, listenerPort int) bool {
@@ -184,17 +188,8 @@ func hasUnsupportedHTTPRouteMatchPredicates(match gatewayv1.HTTPRouteMatch) bool
 }
 
 func compareHTTPRoutePathPrecedence(a, b httpRoutePathPrecedence) int {
-	if a.matchType != b.matchType {
-		if a.matchType > b.matchType {
-			return -1
-		}
-		return 1
-	}
-	if a.characters != b.characters {
-		if a.characters > b.characters {
-			return -1
-		}
-		return 1
+	if result := compareHTTPRoutePathSpecificity(a, b); result != 0 {
+		return result
 	}
 	if a.ruleIndex != b.ruleIndex {
 		// When path specificity is equal, keep the HTTPRoute's rule order.
@@ -207,6 +202,50 @@ func compareHTTPRoutePathPrecedence(a, b httpRoutePathPrecedence) int {
 		return -1
 	}
 	if a.matchIndex > b.matchIndex {
+		return 1
+	}
+	return 0
+}
+
+func compareHTTPRoutePathSpecificity(a, b httpRoutePathPrecedence) int {
+	if a.matchType != b.matchType {
+		if a.matchType > b.matchType {
+			return -1
+		}
+		return 1
+	}
+	if a.characters != b.characters {
+		if a.characters > b.characters {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// compareHTTPRouteMatchPrecedence compares the best matches from two different
+// HTTPRoutes. Path specificity wins first. Gateway API then resolves ties using
+// the oldest route creation timestamp and lexical namespace/name order.
+func compareHTTPRouteMatchPrecedence(a, b httpRouteMatchResult) int {
+	if result := compareHTTPRoutePathSpecificity(a.path, b.path); result != 0 {
+		return result
+	}
+	if !a.route.CreationTimestamp.Equal(&b.route.CreationTimestamp) {
+		if a.route.CreationTimestamp.Before(&b.route.CreationTimestamp) {
+			return -1
+		}
+		return 1
+	}
+	if a.route.Namespace != b.route.Namespace {
+		if a.route.Namespace < b.route.Namespace {
+			return -1
+		}
+		return 1
+	}
+	if a.route.Name < b.route.Name {
+		return -1
+	}
+	if a.route.Name > b.route.Name {
 		return 1
 	}
 	return 0

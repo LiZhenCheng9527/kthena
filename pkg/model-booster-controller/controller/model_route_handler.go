@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 
+	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/convert"
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
@@ -53,8 +54,13 @@ func (mc *ModelBoosterController) createOrUpdateModelRoute(ctx context.Context, 
 			klog.Errorf("failed to get ModelRoute %s before recreation: %v", klog.KObj(modelRoute), err)
 			return err
 		}
-		if currentModelRoute.DeletionTimestamp != nil || currentModelRoute.Spec.ModelName == modelRoute.Spec.ModelName {
+		if currentModelRoute.DeletionTimestamp != nil {
 			return nil
+		}
+		if currentModelRoute.Spec.ModelName == modelRoute.Spec.ModelName {
+			// The informer can still hold the pre-recreation route. Reconcile the
+			// live route so concurrent rule changes are not lost.
+			return mc.updateModelRoute(ctx, currentModelRoute, modelRoute)
 		}
 
 		klog.Infof("Delete ModelBooster Route %s because spec.modelName is immutable", modelRoute.Name)
@@ -66,12 +72,16 @@ func (mc *ModelBoosterController) createOrUpdateModelRoute(ctx context.Context, 
 		// observes the missing route and creates it with the desired model name.
 		return nil
 	}
-	if oldModelRoute.Labels[utils.RevisionLabelKey] == modelRoute.Labels[utils.RevisionLabelKey] {
-		klog.Infof("ModelBooster Route %s of model %s does not need to update", modelRoute.Name, model.Name)
+	return mc.updateModelRoute(ctx, oldModelRoute, modelRoute)
+}
+
+func (mc *ModelBoosterController) updateModelRoute(ctx context.Context, currentModelRoute, modelRoute *networkingv1alpha1.ModelRoute) error {
+	if currentModelRoute.Labels[utils.RevisionLabelKey] == modelRoute.Labels[utils.RevisionLabelKey] {
+		klog.Infof("ModelBooster Route %s does not need to update", modelRoute.Name)
 		return nil
 	}
-	modelRoute.ResourceVersion = oldModelRoute.ResourceVersion
-	if _, err := mc.client.NetworkingV1alpha1().ModelRoutes(model.Namespace).Update(ctx, modelRoute, metav1.UpdateOptions{}); err != nil {
+	modelRoute.ResourceVersion = currentModelRoute.ResourceVersion
+	if _, err := mc.client.NetworkingV1alpha1().ModelRoutes(modelRoute.Namespace).Update(ctx, modelRoute, metav1.UpdateOptions{}); err != nil {
 		klog.Errorf("failed to update ModelRoute %s: %v", klog.KObj(modelRoute), err)
 		return err
 	}

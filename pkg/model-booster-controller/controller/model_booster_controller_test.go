@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	kthenafake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/convert"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -164,6 +166,48 @@ func TestReconcileRecreatesModelRouteWhenModelRequestNameChanges(t *testing.T) {
 	}))
 	assert.Equal(t, int32(1), deletes.Load())
 	assert.Equal(t, int32(1), creates.Load())
+}
+
+func TestCreateOrUpdateModelRouteUpdatesLiveRouteWhenListerIsStale(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := fake.NewClientset()
+	kthenaClient := kthenafake.NewSimpleClientset()
+	controller := NewModelBoosterController(kubeClient, kthenaClient)
+
+	model := loadYaml[workload.ModelBooster](t, "../convert/testdata/input/model.yaml")
+	model.Spec.Name = "deepseek-v3-request"
+	model.Spec.Backend.Name = "new-backend"
+	desiredRoute := convert.BuildModelRoute(model)
+
+	liveRoute := desiredRoute.DeepCopy()
+	liveRoute.Spec.Rules[0].TargetModels[0].ModelServerName = "test-model-old-backend"
+	liveRoute.Labels[utils.RevisionLabelKey] = "outdated"
+	_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).Create(ctx, liveRoute, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	staleRoute := liveRoute.DeepCopy()
+	staleRoute.Spec.ModelName = "test-model"
+	assert.NoError(t, controller.modelRoutesInformer.GetStore().Add(staleRoute))
+
+	var updates, deletes atomic.Int32
+	kthenaClient.PrependReactor("update", "modelroutes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		updates.Add(1)
+		return false, nil, nil
+	})
+	kthenaClient.PrependReactor("delete", "modelroutes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		deletes.Add(1)
+		return false, nil, nil
+	})
+
+	assert.NoError(t, controller.createOrUpdateModelRoute(ctx, model))
+	assert.Equal(t, int32(1), updates.Load())
+	assert.Zero(t, deletes.Load())
+
+	updatedRoute, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).Get(ctx, model.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, desiredRoute.Spec.ModelName, updatedRoute.Spec.ModelName)
+	assert.Equal(t, desiredRoute.Spec.Rules, updatedRoute.Spec.Rules)
+	assert.Equal(t, desiredRoute.Labels[utils.RevisionLabelKey], updatedRoute.Labels[utils.RevisionLabelKey])
 }
 
 func TestReconcile_ReturnsError(t *testing.T) {

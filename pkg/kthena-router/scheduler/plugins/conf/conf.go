@@ -74,7 +74,9 @@ func (p *PluginConfig) UnmarshalYAML(value *yaml.Node) error {
 		field := value.Content[i+1]
 		switch key.Value {
 		case "name":
-			p.Name = field.Value
+			if err := field.Decode(&p.Name); err != nil {
+				return fmt.Errorf("decode plugin name: %w", err)
+			}
 		case "args":
 			args, err := yaml.Marshal(field)
 			if err != nil {

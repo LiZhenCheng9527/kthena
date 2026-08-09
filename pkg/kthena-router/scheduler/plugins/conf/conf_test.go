@@ -112,6 +112,26 @@ func TestParseRouterConfigNonFiniteLeastLatencyWeightUsesDefault(t *testing.T) {
 	}
 }
 
+func TestParseRouterConfigRejectsNonScalarPluginName(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "routerConfiguration.yaml")
+	config := `scheduler:
+  pluginConfig:
+    - name:
+        nested: least-latency
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write router configuration: %v", err)
+	}
+
+	_, err := ParseRouterConfig(configPath)
+	if err == nil {
+		t.Fatal("expected a non-scalar plugin name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Fatalf("expected a plugin name type error, got %v", err)
+	}
+}
+
 func TestHandleRandomPluginConflicts(t *testing.T) {
 	tests := []struct {
 		name            string

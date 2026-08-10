@@ -1,0 +1,89 @@
+# ModelBooster example: prefill-decode disaggregation with the NIXL KV connector.
+#
+# This is the ModelBooster equivalent of examples/model-serving/gpu-pd-disaggregation.yaml.
+# The image bundles both LMCache and NIXL (`...-nixl-...-lmcache-...`), but the KV
+# connector is selected purely by the `kv_connector` name in `kv-transfer-config`.
+# Here it is `NixlConnector`, so Kthena maps it to the `nixl` KV connector type
+# (`spec.kvConnector.type: nixl` on the generated ModelServer).
+#
+# Unlike the `lmcache` (shared-store) mode, the `nixl` connector transfers KV cache
+# in-band via a `kv_transfer_params` handshake between prefill and decode. It does
+# NOT require a shared Redis/LMCache backend.
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelBooster
+metadata:
+  name: qwen-nixl-pd
+  namespace: default
+spec:
+  backend:
+    name: qwen-nixl
+    type: vLLMDisaggregated
+    modelURI: "hf://Qwen/Qwen3-0.6B"
+    cacheURI: "hostpath://tmp/cache"
+    replicas: 1
+    env:
+      # NIXL side-channel and collective-communication settings, applied to both
+      # prefill and decode workers.
+      - name: PYTHONHASHSEED
+        value: "1047"
+      - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+        value: "0.0.0.0"
+      - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+        value: "5558"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: "spawn"
+      - name: VLLM_ENABLE_V1_MULTIPROCESSING
+        value: "0"
+      - name: GLOO_SOCKET_IFNAME
+        value: "eth0"
+      - name: NCCL_SOCKET_IFNAME
+        value: "eth0"
+      - name: NCCL_IB_DISABLE
+        value: "0"
+      - name: NCCL_IB_GID_INDEX
+        value: "7"
+      - name: UCX_TLS
+        value: "^gga"
+    workers:
+      - type: prefill
+        image: ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2
+        replicas: 1
+        pods: 1
+        resources:
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+            nvidia.com/gpu: "1"
+        config:
+          served-model-name: "Qwen/Qwen3-0.6B"
+          tensor-parallel-size: 1
+          uvicorn-log-level: warning
+          kv-transfer-config: |
+            {"kv_connector": "NixlConnector",
+              "kv_role": "kv_producer"
+            }
+      - type: decode
+        image: ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2
+        replicas: 1
+        pods: 1
+        resources:
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+            nvidia.com/gpu: "1"
+        config:
+          served-model-name: "Qwen/Qwen3-0.6B"
+          tensor-parallel-size: 1
+          uvicorn-log-level: warning
+          kv-transfer-config: |
+            {"kv_connector": "NixlConnector",
+              "kv_role": "kv_consumer"
+            }

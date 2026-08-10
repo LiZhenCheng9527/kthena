@@ -24,7 +24,7 @@ package "kthena CLI" {
     
     rectangle "Kubernetes Resources" as KubernetesResources {
        usecase "Model(s)" as ModelResource
-       usecase "ModelInfer(s)" as ModelInferResource
+       usecase "ModelServing(s)" as ModelServingResource
        usecase "Policy(s)" as PolicyResource
        usecase "PolicyBinding(s)" as PolicyBindingResource
     }
@@ -60,7 +60,7 @@ end note
 
 ' layout
 GetVerb -[hidden]-> ModelResource
-GetVerb -[hidden]-> ModelInferResource
+GetVerb -[hidden]-> ModelServingResource
 GetVerb -[hidden]-> PolicyResource
 GetVerb -[hidden]-> PolicyBindingResource
 
@@ -178,7 +178,7 @@ Example template structure:
 # Variables: var1, var2, var3
 ---
 apiVersion: workload.serving.volcano.sh/v1alpha1
-kind: ModelInfer
+kind: ModelServing
 metadata:
   name: {{.name}}
   namespace: {{.namespace}}

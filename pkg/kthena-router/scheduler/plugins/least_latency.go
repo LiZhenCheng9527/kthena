@@ -17,6 +17,7 @@ limitations under the License.
 package plugins
 
 import (
+	"fmt"
 	"math"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,6 +49,29 @@ type LeastLatencyArgs struct {
 	// TTFTTPOTWeightFactor must be between 0 and 1. A value of 0 prioritizes
 	// TPOT, 1 prioritizes TTFT, and values in between blend both metrics.
 	TTFTTPOTWeightFactor float64 `yaml:"TTFTTPOTWeightFactor,omitempty"`
+}
+
+// ValidateLeastLatencyArgs validates least-latency plugin arguments supplied
+// through router configuration.
+func ValidateLeastLatencyArgs(pluginArg runtime.RawExtension) error {
+	if len(pluginArg.Raw) == 0 {
+		return nil
+	}
+
+	leastLatencyArgs := LeastLatencyArgs{
+		TTFTTPOTWeightFactor: defaultTTFTTPOTWeightFactor,
+	}
+	if err := yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs); err != nil {
+		return fmt.Errorf("unmarshal least-latency arguments: %w", err)
+	}
+
+	weight := leastLatencyArgs.TTFTTPOTWeightFactor
+	if math.IsNaN(weight) || math.IsInf(weight, 0) ||
+		weight < minTTFTTPOTWeightFactor || weight > maxTTFTTPOTWeightFactor {
+		return fmt.Errorf("TTFTTPOTWeightFactor must be a finite value between %v and %v, got %v",
+			minTTFTTPOTWeightFactor, maxTTFTTPOTWeightFactor, weight)
+	}
+	return nil
 }
 
 func NewLeastLatency(pluginArg runtime.RawExtension) *LeastLatency {

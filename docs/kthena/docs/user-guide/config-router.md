@@ -27,7 +27,7 @@ Plugin Configuration (PluginConfig):
 - `0.5` gives equal weight to TTFT and TPOT.
 - `1.0` prioritizes TTFT.
 
-Values outside the `0.0` to `1.0` range, including non-finite values, use the default value `0.5`.
+The router exits with a configuration error when this value is outside the `0.0` to `1.0` range, or is non-finite.
 
 Filter Plugins (Filter):
 

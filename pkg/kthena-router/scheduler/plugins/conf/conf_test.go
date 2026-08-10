@@ -22,8 +22,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins"
 )
 
 func TestLoadSchedulerConfig(t *testing.T) {
@@ -68,7 +66,7 @@ func TestLoadSchedulerConfig(t *testing.T) {
 	}
 }
 
-func TestParseRouterConfigNonFiniteLeastLatencyWeightUsesDefault(t *testing.T) {
+func TestLoadSchedulerConfigRejectsInvalidLeastLatencyWeight(t *testing.T) {
 	tt := []struct {
 		name  string
 		value string
@@ -76,6 +74,8 @@ func TestParseRouterConfigNonFiniteLeastLatencyWeightUsesDefault(t *testing.T) {
 		{name: "not a number", value: ".nan"},
 		{name: "positive infinity", value: ".inf"},
 		{name: "negative infinity", value: "-.inf"},
+		{name: "below minimum", value: "-0.1"},
+		{name: "above maximum", value: "1.1"},
 	}
 
 	for _, tc := range tt {
@@ -95,18 +95,9 @@ func TestParseRouterConfigNonFiniteLeastLatencyWeightUsesDefault(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse router configuration: %v", err)
 			}
-			_, _, pluginArgs, err := LoadSchedulerConfig(&routerConfig.Scheduler)
-			if err != nil {
-				t.Fatalf("load scheduler configuration: %v", err)
-			}
-			args := pluginArgs[plugins.LeastLatencyPluginName]
-			if !strings.Contains(string(args.Raw), tc.value) {
-				t.Fatalf("expected plugin arguments to preserve %q, got %q", tc.value, args.Raw)
-			}
-
-			plugin := plugins.NewLeastLatency(args)
-			if plugin.TTFTTPOTWeightFactor != 0.5 {
-				t.Fatalf("expected non-finite router configuration weight to use default 0.5, got %v", plugin.TTFTTPOTWeightFactor)
+			_, _, _, err = LoadSchedulerConfig(&routerConfig.Scheduler)
+			if err == nil {
+				t.Fatalf("expected invalid weight %q to be rejected", tc.value)
 			}
 		})
 	}

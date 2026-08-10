@@ -23,6 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	yaml "sigs.k8s.io/yaml/goyaml.v3"
+
+	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins"
 )
 
 type RouterConfiguration struct {
@@ -172,6 +174,11 @@ func unmarshalPluginsConfig(schedulerConfig *SchedulerConfiguration) (map[string
 
 	if len(schedulerConfig.PluginConfig) > 0 {
 		for _, pluginArg := range schedulerConfig.PluginConfig {
+			if pluginArg.Name == plugins.LeastLatencyPluginName {
+				if err := plugins.ValidateLeastLatencyArgs(pluginArg.Args); err != nil {
+					return nil, fmt.Errorf("invalid %s plugin configuration: %w", pluginArg.Name, err)
+				}
+			}
 			pluginsArgMap[pluginArg.Name] = pluginArg.Args
 		}
 	}

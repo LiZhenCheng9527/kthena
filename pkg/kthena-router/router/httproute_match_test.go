@@ -316,6 +316,8 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 
 func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
 	pathType := gatewayv1.PathMatchPathPrefix
+	gatewayKind := gatewayv1.Kind("Gateway")
+	gatewayNamespace := gatewayv1.Namespace("default")
 	route := func(namespace, name, prefix string, createdAt time.Time) *gatewayv1.HTTPRoute {
 		return &gatewayv1.HTTPRoute{
 			ObjectMeta: v1.ObjectMeta{
@@ -324,6 +326,13 @@ func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
 				CreationTimestamp: v1.NewTime(createdAt),
 			},
 			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{
+						Name:      "gateway",
+						Namespace: &gatewayNamespace,
+						Kind:      &gatewayKind,
+					}},
+				},
 				Rules: []gatewayv1.HTTPRouteRule{{
 					Matches: []gatewayv1.HTTPRouteMatch{{
 						Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &prefix},

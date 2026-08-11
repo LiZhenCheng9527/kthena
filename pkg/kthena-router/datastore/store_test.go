@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -2621,4 +2622,246 @@ func TestStoreRunBoundedConcurrency(t *testing.T) {
 	// Verify the bound was respected and parallelism actually occurred
 	assert.Greater(t, maxInFlight.Load(), int32(1), "expected at least some parallelism in scrapes")
 	assert.LessOrEqual(t, maxInFlight.Load(), int32(maxConcurrentPodScrapes), "in-flight requests should never exceed the semaphore cap")
+}
+
+func TestMatchString(t *testing.T) {
+	tests := []struct {
+		name  string
+		match *aiv1alpha1.StringMatch
+		value string
+		want  bool
+	}{
+		{
+			name:  "exact match",
+			match: &aiv1alpha1.StringMatch{Exact: ptr("prod")},
+			value: "prod",
+			want:  true,
+		},
+		{
+			name:  "exact mismatch",
+			match: &aiv1alpha1.StringMatch{Exact: ptr("prod")},
+			value: "staging",
+			want:  false,
+		},
+		{
+			name:  "prefix match",
+			match: &aiv1alpha1.StringMatch{Prefix: ptr("/v1/")},
+			value: "/v1/chat/completions",
+			want:  true,
+		},
+		{
+			name:  "prefix mismatch",
+			match: &aiv1alpha1.StringMatch{Prefix: ptr("/v1/")},
+			value: "/v2/chat",
+			want:  false,
+		},
+		{
+			name:  "regex match",
+			match: &aiv1alpha1.StringMatch{Regex: ptr("^(acme|globex)-prod$")},
+			value: "globex-prod",
+			want:  true,
+		},
+		{
+			name:  "regex mismatch",
+			match: &aiv1alpha1.StringMatch{Regex: ptr("^(acme|globex)-prod$")},
+			value: "initech-prod",
+			want:  false,
+		},
+		{
+			name:  "invalid regex never matches",
+			match: &aiv1alpha1.StringMatch{Regex: ptr("^(unclosed")},
+			value: "anything",
+			want:  false,
+		},
+		{
+			name:  "no matcher set matches everything",
+			match: &aiv1alpha1.StringMatch{},
+			value: "anything",
+			want:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &store{}
+			assert.Equal(t, tt.want, s.matchString(tt.match, tt.value))
+		})
+	}
+}
+
+func TestCompileRegexReusesCompiledPattern(t *testing.T) {
+	s := &store{}
+
+	first, err := s.compileRegex("^cache-me-[0-9]+$")
+	assert.NoError(t, err)
+	second, err := s.compileRegex("^cache-me-[0-9]+$")
+	assert.NoError(t, err)
+	assert.Same(t, first, second, "the same pattern should not be recompiled")
+
+	re, err := s.compileRegex("^(still-unclosed")
+	assert.Error(t, err)
+	assert.Nil(t, re)
+	// Failures are cached too, so a bad pattern is not recompiled per request.
+	_, errAgain := s.compileRegex("^(still-unclosed")
+	assert.Equal(t, err, errAgain)
+}
+
+func TestCompileRegexConcurrent(t *testing.T) {
+	s := &store{}
+
+	var wg sync.WaitGroup
+	got := make([]*regexp.Regexp, 32)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			re, err := s.compileRegex("^concurrent-[a-z]+$")
+			assert.NoError(t, err)
+			got[i] = re
+		}(i)
+	}
+	wg.Wait()
+	for i := 1; i < len(got); i++ {
+		assert.Same(t, got[0], got[i], "all goroutines should share one compiled pattern")
+	}
+}
+
+func newTestRouteStore() *store {
+	return &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+	}
+}
+
+func regexModelRoute(namespace, name, model, pattern string) *aiv1alpha1.ModelRoute {
+	return &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: model,
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "server"}},
+					ModelMatch: &aiv1alpha1.ModelMatch{
+						Uri: &aiv1alpha1.StringMatch{Regex: ptr(pattern)},
+					},
+				},
+			},
+		},
+	}
+}
+
+func cachedPatterns(s *store) []string {
+	var out []string
+	s.regexCache.Range(func(key, _ any) bool {
+		out = append(out, key.(string))
+		return true
+	})
+	return out
+}
+
+func TestGCRegexCacheDropsUnreferencedPatterns(t *testing.T) {
+	s := newTestRouteStore()
+	const pattern = "^/v1/gc-me$"
+	assert.NoError(t, s.AddOrUpdateModelRoute(regexModelRoute("default", "r1", "m1", pattern)))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/gc-me"}, Header: http.Header{}}
+	_, _, _, err := s.MatchModelTarget("m1", req, "")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{pattern}, cachedPatterns(s), "pattern should be cached after a matching request")
+
+	assert.NoError(t, s.DeleteModelRoute("default/r1"))
+	assert.Empty(t, cachedPatterns(s), "deleting the route should drop its compiled pattern")
+}
+
+func TestGCRegexCacheKeepsPatternsStillInUse(t *testing.T) {
+	s := newTestRouteStore()
+	const shared = "^/v1/shared$"
+	assert.NoError(t, s.AddOrUpdateModelRoute(regexModelRoute("default", "r1", "m1", shared)))
+	assert.NoError(t, s.AddOrUpdateModelRoute(regexModelRoute("default", "r2", "m2", shared)))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/shared"}, Header: http.Header{}}
+	_, _, _, err := s.MatchModelTarget("m1", req, "")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{shared}, cachedPatterns(s))
+
+	// r2 still references the pattern, so it must survive r1 going away.
+	assert.NoError(t, s.DeleteModelRoute("default/r1"))
+	assert.Equal(t, []string{shared}, cachedPatterns(s))
+
+	assert.NoError(t, s.DeleteModelRoute("default/r2"))
+	assert.Empty(t, cachedPatterns(s))
+}
+
+// TestRegexCacheUnderRouteChurn drives gcRegexCache and the request path at once
+func TestRegexCacheUnderRouteChurn(t *testing.T) {
+	s := newTestRouteStore()
+	assert.NoError(t, s.AddOrUpdateModelRoute(regexModelRoute("default", "stable", "stable-model", "^/v1/stable$")))
+
+	stop := make(chan struct{})
+	var readers, writers sync.WaitGroup
+
+	// Readers keep matching against the stable route until told to stop.
+	for i := 0; i < 8; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			req := &http.Request{URL: &url.URL{Path: "/v1/stable"}, Header: http.Header{}}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _, _, _ = s.MatchModelTarget("stable-model", req, "")
+				}
+			}
+		}()
+	}
+
+	// Writers churn short-lived routes, each with its own pattern.
+	for w := 0; w < 4; w++ {
+		writers.Add(1)
+		go func(w int) {
+			defer writers.Done()
+			for i := 0; i < 100; i++ {
+				name := fmt.Sprintf("churn-%d-%d", w, i)
+				pattern := fmt.Sprintf("^/v1/churn-%d-%d$", w, i)
+				_ = s.AddOrUpdateModelRoute(regexModelRoute("default", name, name, pattern))
+				_ = s.DeleteModelRoute("default/" + name)
+			}
+		}(w)
+	}
+
+	// Release the readers only once the writers are done.
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+
+	// Every churned route is gone, so only the stable route's pattern may remain.
+	remaining := cachedPatterns(s)
+	assert.LessOrEqual(t, len(remaining), 1, "cache should not retain patterns from deleted routes, got %v", remaining)
+}
+
+func BenchmarkSelectRuleRegex(b *testing.B) {
+	s := &store{}
+	rules := []*aiv1alpha1.Rule{
+		{
+			ModelMatch: &aiv1alpha1.ModelMatch{
+				Headers: map[string]*aiv1alpha1.StringMatch{
+					"x-tenant": {Regex: ptr("^(acme|globex|initech)-(prod|staging)$")},
+				},
+				Uri: &aiv1alpha1.StringMatch{Regex: ptr("^/v1/(chat/completions|completions)$")},
+			},
+		},
+	}
+	req, _ := http.NewRequest(http.MethodPost, "http://x/v1/chat/completions", nil)
+	req.Header.Set("x-tenant", "globex-prod")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := s.selectRule("m", req, rules); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

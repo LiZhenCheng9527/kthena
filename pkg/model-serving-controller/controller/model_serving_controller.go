@@ -346,7 +346,7 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		if apierrors.IsNotFound(err) {
 			klog.V(4).Infof("modelServing of pod %s has been deleted", newPod.Name)
 		} else {
-			klog.Errorf("get model Serving failed when update pod: %v", err)
+			klog.Errorf("get model Serving failed when update pod %s/%s: %v", newPod.Namespace, newPod.Name, err)
 		}
 		return
 	}
@@ -361,13 +361,13 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		// The pod is available, that is, the state is running, and the container is ready
 		err = c.handleReadyPod(ms, servingGroupName, newPod)
 		if err != nil {
-			klog.Errorf("handle running pod failed: %v", err)
+			klog.Errorf("handle running pod %s/%s failed for ModelServing %s/%s: %v", newPod.Namespace, newPod.Name, ms.Namespace, ms.Name, err)
 		}
 	case utils.IsPodFailed(newPod) || utils.ContainerRestarted(newPod):
 		klog.V(4).Infof("handleErrorPod: %s/%s", newPod.Namespace, newPod.Name)
 		err = c.handleErrorPod(ms, servingGroupName, newPod)
 		if err != nil {
-			klog.Errorf("handle error pod failed: %v", err)
+			klog.Errorf("handle error pod %s/%s failed for ModelServing %s/%s: %v", newPod.Namespace, newPod.Name, ms.Namespace, ms.Name, err)
 		}
 	default:
 		klog.V(4).Infof("handleDefault: %s/%s", newPod.Namespace, newPod.Name)
@@ -420,7 +420,7 @@ func (c *ModelServingController) deletePod(obj interface{}) {
 
 	err := c.handleDeletedPod(ms, servingGroupName, pod)
 	if err != nil {
-		klog.Errorf("handle deleted pod failed: %v", err)
+		klog.Errorf("handle deleted pod %s/%s failed in ServingGroup %s of ModelServing %s/%s: %v", pod.Namespace, pod.Name, servingGroupName, ms.Namespace, ms.Name, err)
 	}
 }
 
@@ -1885,7 +1885,7 @@ func (c *ModelServingController) isServingGroupOutdated(group datastore.ServingG
 	groupNameValue := fmt.Sprintf("%s/%s", namespace, group.Name)
 	pods, err := c.getPodsByIndex(GroupNameKey, groupNameValue)
 	if err != nil {
-		klog.Errorf("cannot list pod when check group updated,err: %v", err)
+		klog.Errorf("cannot list pod when check ServingGroup %s/%s updated: %v", namespace, group.Name, err)
 		return false
 	}
 	// Check all pods match the newHash
@@ -1987,19 +1987,19 @@ func (c *ModelServingController) isServingGroupDeleted(ms *workloadv1alpha1.Mode
 	groupNameValue := fmt.Sprintf("%s/%s", ms.Namespace, servingGroupName)
 	pods, err := c.getPodsByIndex(GroupNameKey, groupNameValue)
 	if err != nil {
-		klog.Errorf("failed to get pod, err: %v", err)
+		klog.Errorf("failed to get pods for ServingGroup %s of ModelServing %s/%s: %v", servingGroupName, ms.Namespace, ms.Name, err)
 		return false
 	}
 	services, err := c.getServicesByIndex(GroupNameKey, groupNameValue)
 	if err != nil {
-		klog.Errorf("failed to get service, err:%v", err)
+		klog.Errorf("failed to get services for ServingGroup %s of ModelServing %s/%s: %v", servingGroupName, ms.Namespace, ms.Name, err)
 		return false
 	}
 	pgs := []*schedulingv1beta1.PodGroup{}
 	if c.podGroupManager.HasPodGroupCRD() {
 		pgs, err = c.getPodGroupsByIndex(GroupNameKey, groupNameValue)
 		if err != nil {
-			klog.Errorf("failed to get podGroup, err: %v", err)
+			klog.Errorf("failed to get podGroups for ServingGroup %s of ModelServing %s/%s: %v", servingGroupName, ms.Namespace, ms.Name, err)
 			return false
 		}
 	}
@@ -2015,12 +2015,12 @@ func (c *ModelServingController) isRoleDeleted(ms *workloadv1alpha1.ModelServing
 	// check whether the role deletion has been completed
 	pods, err := c.getPodsByIndex(RoleIDKey, roleIDValue)
 	if err != nil {
-		klog.Errorf("failed to get pod, err: %v", err)
+		klog.Errorf("failed to get pods for role %s/%s in ServingGroup %s of ModelServing %s/%s: %v", roleName, roleID, servingGroupName, ms.Namespace, ms.Name, err)
 		return false
 	}
 	services, err := c.getServicesByIndex(RoleIDKey, roleIDValue)
 	if err != nil {
-		klog.Errorf("failed to get service, err:%v", err)
+		klog.Errorf("failed to get services for role %s/%s in ServingGroup %s of ModelServing %s/%s: %v", roleName, roleID, servingGroupName, ms.Namespace, ms.Name, err)
 		return false
 	}
 	return len(pods) == 0 && len(services) == 0

@@ -171,7 +171,7 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) {
 	for _, policy := range policies {
 		err := ac.schedule(ctx, policy)
 		if err != nil {
-			klog.Errorf("failed to process autoscale,err: %v", err)
+			klog.Errorf("failed to process autoscale for policy %s: %v", klog.KObj(policy), err)
 			continue
 		}
 	}

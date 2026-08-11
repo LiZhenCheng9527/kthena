@@ -17,6 +17,8 @@ limitations under the License.
 package scheduler
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -370,4 +372,29 @@ func TestPDSchedulerFiltersOverloadedDecodePod(t *testing.T) {
 	// 10 and must be filtered out before PD pairing.
 	err = NewScheduler(store, nil).Schedule(ctx, pods)
 	require.Error(t, err)
+}
+
+// BenchmarkRunScorePlugins measures the scoring loop at default verbosity
+func BenchmarkRunScorePlugins(b *testing.B) {
+	for _, podCount := range []int{8, 32} {
+		b.Run(fmt.Sprintf("pods=%d", podCount), func(b *testing.B) {
+			scheduler := NewScheduler(datastore.New(), nil).(*SchedulerImpl)
+			pods := make([]*datastore.PodInfo, podCount)
+			for i := range pods {
+				pods[i] = createTestPodInfo(fmt.Sprintf("pod-%d", i))
+				pods[i].TTFT = float64(10 + i)
+				pods[i].TPOT = float64(20 + i)
+			}
+			ctx := &framework.Context{
+				Model:  "model",
+				Prompt: &common.ChatMessage{Text: strings.Repeat("token ", 128)},
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = scheduler.RunScorePlugins(pods, ctx)
+			}
+		})
+	}
 }

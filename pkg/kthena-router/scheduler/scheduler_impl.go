@@ -224,6 +224,8 @@ func (s *SchedulerImpl) RunFilterPlugins(pods []*datastore.PodInfo, ctx *framewo
 
 func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framework.Context) map[*datastore.PodInfo]int {
 	res := make(map[*datastore.PodInfo]int)
+	// Checked once: V(4) arguments are boxed before klog can discard them
+	logScores := klog.V(4).Enabled()
 	for _, scorePlugin := range s.scorePlugins {
 		// Record score plugin execution time
 		startTime := time.Now()
@@ -235,10 +237,14 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 			ctx.MetricsRecorder.RecordSchedulerPluginDuration(scorePlugin.plugin.Name(), metrics.PluginTypeScore, duration)
 		}
 
-		klog.V(4).Infof("ScorePlugin: %s", scorePlugin.plugin.Name())
+		if logScores {
+			klog.Infof("ScorePlugin: %s", scorePlugin.plugin.Name())
+		}
 		for k, v := range scores {
-			if podName := k.GetPodNamespacedName(); podName.Name != "" {
-				klog.V(4).Infof("Pod: %s/%s, Score: %d", podName.Namespace, podName.Name, v)
+			if logScores {
+				if podName := k.GetPodNamespacedName(); podName.Name != "" {
+					klog.Infof("Pod: %s/%s, Score: %d", podName.Namespace, podName.Name, v)
+				}
 			}
 			if _, ok := res[k]; !ok {
 				res[k] = v * scorePlugin.weight
@@ -248,7 +254,7 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 		}
 	}
 
-	if klog.V(4).Enabled() {
+	if logScores {
 		klog.Info("Final Pod Scores:")
 		for k, v := range res {
 			if podName := k.GetPodNamespacedName(); podName.Name != "" {

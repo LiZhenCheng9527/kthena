@@ -341,12 +341,17 @@ func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
 			},
 		}
 	}
+	withHostname := func(httpRoute *gatewayv1.HTTPRoute, hostname gatewayv1.Hostname) *gatewayv1.HTTPRoute {
+		httpRoute.Spec.Hostnames = []gatewayv1.Hostname{hostname}
+		return httpRoute
+	}
 	newer := time.Date(2026, time.January, 2, 0, 0, 0, 0, time.UTC)
 	older := newer.Add(-time.Hour)
 
 	tests := []struct {
 		name          string
 		routes        []*gatewayv1.HTTPRoute
+		host          string
 		expectedRoute types.NamespacedName
 	}{
 		{
@@ -356,6 +361,15 @@ func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
 				route("default", "chat-route", "/chat", newer),
 			},
 			expectedRoute: types.NamespacedName{Namespace: "default", Name: "chat-route"},
+		},
+		{
+			name: "exact hostname wins before path specificity",
+			routes: []*gatewayv1.HTTPRoute{
+				withHostname(route("default", "wildcard-route", "/chat", newer), "*.example.com"),
+				withHostname(route("default", "exact-route", "/", older), "api.example.com"),
+			},
+			host:          "api.example.com",
+			expectedRoute: types.NamespacedName{Namespace: "default", Name: "exact-route"},
 		},
 		{
 			name: "oldest route wins equal path specificity regardless of route order",
@@ -381,6 +395,7 @@ func TestRouter_FindHTTPRouteMatchCrossRoutePrecedence(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			c.Request, _ = http.NewRequest(http.MethodPost, "/chat/completions", nil)
+			c.Request.Host = tt.host
 
 			match, found := router.findHTTPRouteMatch(c, "default/gateway")
 			if !found {

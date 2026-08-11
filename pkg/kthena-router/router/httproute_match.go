@@ -48,7 +48,25 @@ type httpRouteMatchResult struct {
 	// path stores the path specificity used to choose the best rule within one
 	// HTTPRoute and then the best match across all applicable HTTPRoutes.
 	path httpRoutePathPrecedence
+	// hostname stores the matching hostname specificity used to choose between
+	// HTTPRoutes before applying path precedence.
+	hostname httpRouteHostnamePrecedence
 }
+
+type httpRouteHostnamePrecedence struct {
+	// matchType ranks hostname matches. Exact hostnames are more specific than
+	// wildcard hostnames, which are more specific than routes without hostnames.
+	matchType int
+	// characters is the length of the matching hostname pattern. It resolves
+	// ties between wildcard hostnames with different suffix lengths.
+	characters int
+}
+
+const (
+	httpRouteHostnameAnyPrecedence = iota
+	httpRouteHostnameWildcardPrecedence
+	httpRouteHostnameExactPrecedence
+)
 
 type httpRoutePathPrecedence struct {
 	// matchType ranks path match kinds. Higher values are more specific:
@@ -86,11 +104,13 @@ func (r *Router) findHTTPRouteMatch(c *gin.Context, gatewayKey string) (httpRout
 		if !httpRouteMatchesGatewayListener(route, gatewayKey, listenerName, listenerPort) {
 			continue
 		}
-		if !matchHTTPRouteHostnames(route.Spec.Hostnames, c.Request.Host) {
+		hostnamePrecedence, hostnameMatched := matchHTTPRouteHostnamePrecedence(route.Spec.Hostnames, c.Request.Host)
+		if !hostnameMatched {
 			continue
 		}
 		result, matched := findBestHTTPRouteRuleMatch(route, c.Request.URL.Path)
 		if matched {
+			result.hostname = hostnamePrecedence
 			if !found || compareHTTPRouteMatchPrecedence(result, best) < 0 {
 				best = result
 				found = true
@@ -224,9 +244,13 @@ func compareHTTPRoutePathSpecificity(a, b httpRoutePathPrecedence) int {
 }
 
 // compareHTTPRouteMatchPrecedence compares the best matches from two different
-// HTTPRoutes. Path specificity wins first. Gateway API then resolves ties using
-// the oldest route creation timestamp and lexical namespace/name order.
+// HTTPRoutes. Gateway API ranks hostname specificity before path specificity,
+// then resolves ties using the oldest route creation timestamp and lexical
+// namespace/name order.
 func compareHTTPRouteMatchPrecedence(a, b httpRouteMatchResult) int {
+	if result := compareHTTPRouteHostnamePrecedence(a.hostname, b.hostname); result != 0 {
+		return result
+	}
 	if result := compareHTTPRoutePathSpecificity(a.path, b.path); result != 0 {
 		return result
 	}
@@ -246,6 +270,22 @@ func compareHTTPRouteMatchPrecedence(a, b httpRouteMatchResult) int {
 		return -1
 	}
 	if a.route.Name > b.route.Name {
+		return 1
+	}
+	return 0
+}
+
+func compareHTTPRouteHostnamePrecedence(a, b httpRouteHostnamePrecedence) int {
+	if a.matchType != b.matchType {
+		if a.matchType > b.matchType {
+			return -1
+		}
+		return 1
+	}
+	if a.characters != b.characters {
+		if a.characters > b.characters {
+			return -1
+		}
 		return 1
 	}
 	return 0
@@ -370,22 +410,27 @@ func matchHTTPPathPrefix(path, prefix string) (bool, string) {
 	return path == normalizedPrefix || strings.HasPrefix(path, normalizedPrefix+"/"), normalizedPrefix
 }
 
-// matchHTTPRouteHostnames matches the request Host header against route
-// hostnames. Empty hostnames means the route matches all hosts.
-func matchHTTPRouteHostnames(hostnames []gatewayv1.Hostname, requestHost string) bool {
+// matchHTTPRouteHostnamePrecedence returns the most specific hostname pattern
+// matched by the route. Empty hostnames match every host with the lowest
+// specificity.
+func matchHTTPRouteHostnamePrecedence(hostnames []gatewayv1.Hostname, requestHost string) (httpRouteHostnamePrecedence, bool) {
 	if len(hostnames) == 0 {
-		return true
+		return httpRouteHostnamePrecedence{matchType: httpRouteHostnameAnyPrecedence}, true
 	}
 	normalizedHost := normalizeHTTPRouteHost(requestHost)
 	if normalizedHost == "" {
-		return false
+		return httpRouteHostnamePrecedence{}, false
 	}
+	var best httpRouteHostnamePrecedence
+	found := false
 	for _, hostname := range hostnames {
-		if matchHTTPRouteHostname(string(hostname), normalizedHost) {
-			return true
+		precedence, matched := matchHTTPRouteHostnamePattern(string(hostname), normalizedHost)
+		if matched && (!found || compareHTTPRouteHostnamePrecedence(precedence, best) < 0) {
+			best = precedence
+			found = true
 		}
 	}
-	return false
+	return best, found
 }
 
 // normalizeHTTPRouteHost removes the optional Host header port and normalizes
@@ -410,17 +455,31 @@ func normalizeHTTPRouteHost(host string) string {
 // suffix hostnames. A wildcard such as "*.example.com" matches
 // "api.example.com" and "v1.api.example.com", but not "example.com".
 func matchHTTPRouteHostname(pattern, host string) bool {
+	_, matched := matchHTTPRouteHostnamePattern(pattern, host)
+	return matched
+}
+
+func matchHTTPRouteHostnamePattern(pattern, host string) (httpRouteHostnamePrecedence, bool) {
 	pattern = strings.ToLower(strings.TrimSuffix(pattern, "."))
 	if pattern == host {
-		return true
+		return httpRouteHostnamePrecedence{
+			matchType:  httpRouteHostnameExactPrecedence,
+			characters: len(pattern),
+		}, true
 	}
 	if !strings.HasPrefix(pattern, "*.") {
-		return false
+		return httpRouteHostnamePrecedence{}, false
 	}
 	suffix := strings.TrimPrefix(pattern, "*")
 	if !strings.HasSuffix(host, suffix) {
-		return false
+		return httpRouteHostnamePrecedence{}, false
 	}
 	prefix := strings.TrimSuffix(host, suffix)
-	return prefix != ""
+	if prefix == "" {
+		return httpRouteHostnamePrecedence{}, false
+	}
+	return httpRouteHostnamePrecedence{
+		matchType:  httpRouteHostnameWildcardPrecedence,
+		characters: len(suffix),
+	}, true
 }

@@ -1,8 +1,8 @@
-# vLLM Prefill-Decode Disaggregation (LMCache & NIXL)
+# Prefill-Decode Disaggregation with ModelBooster (vLLM, LMCache & NIXL)
 
 This page describes how to deploy prefill-decode disaggregated inference with a
-`ModelBooster` on a GPU cluster using either KV connector supported by
-[vLLM](https://github.com/vllm-project/vllm):
+single `ModelBooster` resource on a GPU cluster, using either KV connector
+supported by [vLLM](https://github.com/vllm-project/vllm):
 
 - **`lmcache`** — KV reuse through a shared store (e.g. Redis).
 - **`nixl`** — in-band, point-to-point KV transfer between prefill and decode.
@@ -264,5 +264,6 @@ or use the `lmcache` shared-store option, which does not need a P2P transport.
   `VLLM_NIXL_SIDE_CHANNEL_PORT` are set and the `NCCL_IB_*` / `UCX_TLS` values match
   your cluster network interfaces and transport.
 
-For a ModelServing-based NIXL example, see
-[vLLM Prefill-Decode Disaggregation (GPU)](./vllm-pd-disaggregation.md).
+For the ModelServing-based approach (manually creating `ModelServing`,
+`ModelServer`, and `ModelRoute`), see
+[Prefill-Decode Disaggregation with ModelServing (vLLM, NIXL & LMCache)](./modelserving-vllm-pd-disaggregation.md).

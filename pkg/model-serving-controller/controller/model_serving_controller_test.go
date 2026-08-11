@@ -16,6 +16,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"testing"
 	"time"
@@ -2144,19 +2145,28 @@ func TestFindMissingOrdinals(t *testing.T) {
 		name             string
 		expectedCount    int
 		existingOrdinals []int
+		limit            int
 		want             []int
 	}{
-		{name: "zero replicas", expectedCount: 0, existingOrdinals: []int{0}, want: nil},
-		{name: "empty", expectedCount: 3, want: []int{0, 1, 2}},
-		{name: "continuous", expectedCount: 3, existingOrdinals: []int{0, 1, 2}, want: []int{}},
-		{name: "gaps", expectedCount: 5, existingOrdinals: []int{0, 2, 4}, want: []int{1, 3}},
-		{name: "unsorted duplicates", expectedCount: 4, existingOrdinals: []int{2, 0, 2}, want: []int{1, 3}},
-		{name: "ignore out of range", expectedCount: 3, existingOrdinals: []int{-1, 1, 10}, want: []int{0, 2}},
+		{name: "zero replicas", expectedCount: 0, existingOrdinals: []int{0}, limit: 1, want: []int{}},
+		{name: "zero limit", expectedCount: 3, limit: 0, want: []int{}},
+		{name: "empty", expectedCount: 3, limit: 3, want: []int{0, 1, 2}},
+		{name: "continuous", expectedCount: 3, existingOrdinals: []int{0, 1, 2}, limit: 3, want: []int{}},
+		{name: "gaps", expectedCount: 5, existingOrdinals: []int{0, 2, 4}, limit: 5, want: []int{1, 3}},
+		{name: "limited gaps", expectedCount: 5, existingOrdinals: []int{0, 2, 4}, limit: 1, want: []int{1}},
+		{name: "unsorted duplicates", expectedCount: 4, existingOrdinals: []int{2, 0, 2}, limit: 4, want: []int{1, 3}},
+		{name: "ignore out of range", expectedCount: 3, existingOrdinals: []int{-1, 1, 10}, limit: 3, want: []int{0, 2}},
+		{name: "int32 max replicas is lazy", expectedCount: math.MaxInt32, existingOrdinals: []int{0, 1}, limit: 2, want: []int{2, 3}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, findMissingOrdinals(tt.expectedCount, tt.existingOrdinals))
+			got := []int{}
+			forEachMissingOrdinal(tt.expectedCount, tt.existingOrdinals, tt.limit, func(ordinal int) bool {
+				got = append(got, ordinal)
+				return true
+			})
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

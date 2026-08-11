@@ -700,11 +700,9 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 		existingOrdinals = append(existingOrdinals, ordinal)
 	}
 
-	missingOrdinals := findMissingOrdinals(expectedCount, existingOrdinals)
-	toCreate := min(max(0, expectedCount-len(servingGroupList)), len(missingOrdinals))
-	missingOrdinals = missingOrdinals[:toCreate]
-	klog.V(4).Infof("scaleUpServingGroups: modelServing=%s, existingOrdinals=%v, missingOrdinals=%v",
-		utils.GetNamespaceName(ms), existingOrdinals, missingOrdinals)
+	toCreate := max(0, expectedCount-len(servingGroupList))
+	klog.V(4).Infof("scaleUpServingGroups: modelServing=%s, existingOrdinals=%v, groupsToCreate=%d",
+		utils.GetNamespaceName(ms), existingOrdinals, toCreate)
 
 	// Helper function to create a ServingGroup
 	createServingGroup := func(ordinal int, revision string, roles []workloadv1alpha1.Role) error {
@@ -731,7 +729,8 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 	// Create it lazily because restoring only ordinals below partition uses the
 	// existing CurrentRevision and does not need a new snapshot.
 	newRevisionCreated := false
-	for _, ordinal := range missingOrdinals {
+	var scaleUpErr error
+	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
 		if partition > 0 && ordinal < partition {
 			// Use CurrentRevision for partition-protected ordinals
 			revisionToUse := newRevision
@@ -763,9 +762,10 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 			}
 
 			if err := createServingGroup(ordinal, revisionToUse, rolesToUse); err != nil {
-				return err
+				scaleUpErr = err
+				return false
 			}
-			continue
+			return true
 		}
 
 		if !newRevisionCreated {
@@ -773,14 +773,20 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 			// it only once during this reconciliation.
 			klog.V(4).Infof("scaleUpServingGroups: creating ControllerRevision for newRevision=%s, modelServing=%s", newRevision, utils.GetNamespaceName(ms))
 			if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, newRevision, ms.Spec.Template.Roles); err != nil {
-				return fmt.Errorf("failed to create ControllerRevision for new revision %s: %w", newRevision, err)
+				scaleUpErr = fmt.Errorf("failed to create ControllerRevision for new revision %s: %w", newRevision, err)
+				return false
 			}
 			newRevisionCreated = true
 		}
 		klog.V(4).Infof("scaleUpServingGroups: creating new ServingGroup at ordinal=%d with newRevision=%s for modelServing=%s", ordinal, newRevision, utils.GetNamespaceName(ms))
 		if err := createServingGroup(ordinal, newRevision, ms.Spec.Template.Roles); err != nil {
-			return err
+			scaleUpErr = err
+			return false
 		}
+		return true
+	})
+	if scaleUpErr != nil {
+		return scaleUpErr
 	}
 
 	klog.V(4).Infof("scaleUpServingGroups: done for modelServing=%s", utils.GetNamespaceName(ms))
@@ -964,9 +970,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		}
 		existingOrdinals = append(existingOrdinals, ordinal)
 	}
-	missingOrdinals := findMissingOrdinals(expectedCount, existingOrdinals)
-	toCreate := min(max(0, expectedCount-len(roleList)), len(missingOrdinals))
-	missingOrdinals = missingOrdinals[:toCreate]
+	toCreate := max(0, expectedCount-len(roleList))
 
 	// Role needs to scale up, and the ServingGroup status needs to be set to Scaling
 	err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), groupName, datastore.ServingGroupScaling)
@@ -992,7 +996,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		return nil
 	}
 
-	for _, ordinal := range missingOrdinals {
+	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
 		if partitionConfigured && partition > 0 && ordinal < partition {
 			// Use CurrentRevision for partition-protected ordinals
 			revisionToUse := newRevision
@@ -1048,13 +1052,14 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 			if err := createRole(ordinal, revisionToUse, roleToApply, hashToUse); err != nil {
 				klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
 			}
-			continue
+			return true
 		}
 		roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
 		if err := createRole(ordinal, newRevision, targetRole, roleTemplateHash); err != nil {
 			klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
 		}
-	}
+		return true
+	})
 }
 
 // manageRoleReplicasPerGroup manages the replicas of a specific role within an Serving group
@@ -2275,27 +2280,32 @@ func roleReplicas(role workloadv1alpha1.Role) int {
 	return int(*role.Replicas)
 }
 
-// findMissingOrdinals returns the missing ordinals in [0, expectedCount).
+// forEachMissingOrdinal visits at most limit missing ordinals in [0, expectedCount).
+// Memory usage depends on the observed ordinals rather than the user-provided
+// expectedCount, which may be as large as math.MaxInt32.
 // Invalid, out-of-range, duplicate, and unsorted existing ordinals are tolerated.
-func findMissingOrdinals(expectedCount int, existingOrdinals []int) []int {
-	if expectedCount <= 0 {
-		return nil
+func forEachMissingOrdinal(expectedCount int, existingOrdinals []int, limit int, handler func(int) bool) {
+	if expectedCount <= 0 || limit <= 0 {
+		return
 	}
 
-	existing := make([]bool, expectedCount)
+	existing := make(map[int]struct{}, min(len(existingOrdinals), expectedCount))
 	for _, ordinal := range existingOrdinals {
 		if ordinal >= 0 && ordinal < expectedCount {
-			existing[ordinal] = true
+			existing[ordinal] = struct{}{}
 		}
 	}
 
-	missing := make([]int, 0, expectedCount)
-	for ordinal, found := range existing {
-		if !found {
-			missing = append(missing, ordinal)
+	visited := 0
+	for ordinal := 0; ordinal < expectedCount && visited < limit; ordinal++ {
+		if _, found := existing[ordinal]; found {
+			continue
+		}
+		visited++
+		if !handler(ordinal) {
+			return
 		}
 	}
-	return missing
 }
 
 // scaleDownServingGroups scales down the ServingGroups to the expected count with two-level priority-based selection:

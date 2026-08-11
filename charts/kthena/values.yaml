@@ -52,6 +52,9 @@ networking:
       exposeOnRouterPort: false
     # -- Debug server port for Kthena Router (localhost only).
     debugPort: 15000
+    service:
+      # -- Kubernetes Service type used to expose Kthena Router.
+      type: LoadBalancer
     image:
       # -- Image repository for Kthena Router.
       repository: ghcr.io/volcano-sh/kthena-router

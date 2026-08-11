@@ -14,7 +14,7 @@ spec:
     - port: 80
       targetPort: {{ .Values.kthenaRouter.port }}
       name: http
-  type: LoadBalancer
+  type: {{ .Values.kthenaRouter.service.type }}
 ---
 apiVersion: v1
 kind: Service

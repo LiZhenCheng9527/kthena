@@ -48,7 +48,7 @@ spec:
         value: "naive"
     workers:
       - type: prefill
-        image: ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2
+        image: lmcache/vllm-openai:latest
         replicas: 1
         pods: 1
         resources:
@@ -74,7 +74,7 @@ spec:
               }
             }
       - type: decode
-        image: ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2
+        image: lmcache/vllm-openai:latest
         replicas: 1
         pods: 1
         resources:

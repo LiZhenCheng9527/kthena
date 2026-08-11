@@ -22,8 +22,17 @@ spec:
     cacheURI: "hostpath://tmp/cache"
     replicas: 1
     env:
+      # The volcano-sh image already bundles a compatible NIXL (v0.4.1). By default
+      # Kthena runs `pip install -U nixl` at startup for the NIXL connector, which
+      # would upgrade to an incompatible version and crash vLLM. Skip that install.
+      - name: KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL
+        value: "1"
       # NIXL side-channel and collective-communication settings, applied to both
       # prefill and decode workers.
+      #
+      # NOTE: Do not set GLOO_SOCKET_IFNAME / TP_SOCKET_IFNAME / HCCL_SOCKET_IFNAME
+      # here. For vLLMDisaggregated backends Kthena already injects those (=eth0)
+      # into the decode worker, and Kubernetes rejects duplicate env names.
       - name: PYTHONHASHSEED
         value: "1047"
       - name: VLLM_NIXL_SIDE_CHANNEL_HOST
@@ -34,10 +43,6 @@ spec:
         value: "spawn"
       - name: VLLM_ENABLE_V1_MULTIPROCESSING
         value: "0"
-      - name: GLOO_SOCKET_IFNAME
-        value: "eth0"
-      - name: NCCL_SOCKET_IFNAME
-        value: "eth0"
       - name: NCCL_IB_DISABLE
         value: "0"
       - name: NCCL_IB_GID_INDEX

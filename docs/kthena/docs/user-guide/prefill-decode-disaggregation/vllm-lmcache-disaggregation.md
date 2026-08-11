@@ -42,8 +42,14 @@ not currently supported. Use the `nixl` connector when you want in-band P2P tran
 
 - Kubernetes cluster with Kthena installed
 - NVIDIA GPU-enabled nodes with the appropriate device plugin configured
-- A vLLM image that bundles the connector you want (the image below includes both
-  LMCache and NIXL: `ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2`)
+- A vLLM image whose connector Python dependencies are fully installed:
+  - **LMCache:** use an image where LMCache is fully bundled, e.g. the official
+    `lmcache/vllm-openai:latest`. The `ghcr.io/volcano-sh/vllm-openai:...-lmcache-0.3.2`
+    image ships the LMCache package but not all of its runtime dependencies
+    (`nvtx`, `sortedcontainers`, `redis`, ...), so loading `LMCacheConnectorV1`
+    from it crash-loops with `ModuleNotFoundError`.
+  - **NIXL:** the `ghcr.io/volcano-sh/vllm-openai:v0.10.0-cu128-nixl-v0.4.1-lmcache-0.3.2`
+    image already bundles a compatible NIXL (v0.4.1).
 - The target model accessible from the cluster
 - **For the `lmcache` connector only:** a standalone Redis instance reachable from
   the cluster to act as the shared LMCache backend
@@ -51,7 +57,9 @@ not currently supported. Use the `nixl` connector when you want in-band P2P tran
 :::note
 When using the ModelBooster approach, the `ModelServer` and `ModelRoute` resources
 are created and managed automatically — you do not need to deploy them manually.
-ModelBooster creates a `ModelServing` named `{modelbooster-name}-{backend-name}`.
+ModelBooster creates a `ModelServing` named `{modelbooster-name}-{backend-name}`,
+and a `ModelRoute` whose `modelName` equals the ModelBooster name. Send inference
+requests with `"model": "<modelbooster-name>"`, not the vLLM `served-model-name`.
 :::
 
 ## Option A: LMCache connector (shared store)
@@ -122,13 +130,15 @@ qwen-lmcache-pd-qwen-lmcache-0-decode-0-0     2/2     Running   0          3m
 qwen-lmcache-pd-qwen-lmcache-0-prefill-0-0    2/2     Running   0          3m
 ```
 
-Send a chat completion request through the Kthena router. Use a prompt **longer**
-than `LMCACHE_CHUNK_SIZE` tokens so the KV cache actually reaches Redis:
+Send a chat completion request through the Kthena router. The `model` field must be
+the ModelBooster name (`qwen-lmcache-pd`), which is the `ModelRoute` `modelName`.
+Use a prompt **longer** than `LMCACHE_CHUNK_SIZE` tokens so the KV cache actually
+reaches Redis:
 
 ```sh
 curl -X POST http://<ROUTER_IP>:80/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"<long prompt of 300+ tokens>"}],"max_tokens":20}'
+  -d '{"model":"qwen-lmcache-pd","messages":[{"role":"user","content":"<long prompt of 300+ tokens>"}],"max_tokens":20}'
 ```
 
 #### Confirm real KV reuse
@@ -172,10 +182,17 @@ Key parts of the configuration:
   `kv_producer`, decode `kv_consumer`). This makes Kthena emit
   `kvConnector.type: nixl`, and the router's NIXL connector parses the prefill
   response and forwards `kv_transfer_params` to decode.
+- **`KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL: "1"`**: For the NIXL connector Kthena
+  otherwise runs `pip install -U nixl` at container startup, which upgrades the
+  image's bundled NIXL to a version that is incompatible with the image's vLLM and
+  crash-loops the engine. Since the recommended image already bundles a compatible
+  NIXL, skip that install.
 - **NIXL env vars** (applied to both workers via `spec.backend.env`):
   `VLLM_NIXL_SIDE_CHANNEL_HOST` / `VLLM_NIXL_SIDE_CHANNEL_PORT` for the side channel,
-  plus the `NCCL_*` / `GLOO_SOCKET_IFNAME` / `UCX_TLS` settings that match your
-  cluster network.
+  plus `NCCL_IB_*` / `UCX_TLS` settings that match your cluster network. Do **not**
+  set `GLOO_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `HCCL_SOCKET_IFNAME` here — Kthena
+  already injects those into the decode worker, and Kubernetes rejects duplicate
+  env var names (the ModelServing would fail validation).
 
 ### Verify the NIXL deployment
 
@@ -208,8 +225,32 @@ With NIXL, KV transfer is confirmed by the router log showing prefill and decode
 routed within the same PD group, and by a successful response. Unlike `lmcache`, no
 shared backend or minimum prompt length is required for KV transfer to occur.
 
+:::warning
+NIXL performs GPU-to-GPU KV transfer over its side channel (UCX). This requires a
+cluster network/transport that NIXL can use between the prefill and decode pods
+(e.g. RDMA/InfiniBand, or a correctly configured `UCX_TLS`). On environments
+without a suitable transport, the pods start and requests are routed, but the
+decode engine can fail during the KV read (`nixl_connector.py` `_read_blocks`).
+Tune `UCX_TLS`, `NCCL_IB_DISABLE`, and `NCCL_IB_GID_INDEX` to match your network,
+or use the `lmcache` shared-store option, which does not need a P2P transport.
+:::
+
 ## Troubleshooting
 
+- **`ModuleNotFoundError` (`nvtx`, `sortedcontainers`, `redis`, ...) on the vLLM
+  container with `lmcache`**: The image ships LMCache but not all of its runtime
+  dependencies. Use an image where LMCache is fully installed, e.g.
+  `lmcache/vllm-openai:latest`.
+- **NIXL vLLM container crash-loops right after a `pip install ... nixl` log line**:
+  The startup dependency install upgraded NIXL to a version incompatible with the
+  image's vLLM. Set `KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL: "1"` so the bundled
+  NIXL is used.
+- **ModelServing rejected with `Duplicate value: {"name":"GLOO_SOCKET_IFNAME"}`**:
+  Kthena auto-injects `GLOO_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` / `HCCL_SOCKET_IFNAME`
+  into the decode worker. Remove those env vars from `spec.backend.env`.
+- **Router returns `no decode pod found` / request fails**: A prefill or decode pod
+  is not Ready (often crash-looping). Check pod status and the vLLM container logs
+  for the underlying error.
 - **`LMCache hit tokens: 0` / `External prefix cache hit rate: 0.0%`**: Usually means
   no shared backend is configured, or the prompt is shorter than
   `LMCACHE_CHUNK_SIZE` (with `discard_partial_chunks: true`, partial chunks are never
@@ -220,8 +261,8 @@ shared backend or minimum prompt length is required for KV transfer to occur.
   `kv_connector` name in `kv-transfer-config`, not the image. Use
   `LMCacheConnectorV1` for `lmcache` and `NixlConnector` for `nixl`.
 - **NIXL decode errors / no transfer**: Ensure `VLLM_NIXL_SIDE_CHANNEL_HOST` and
-  `VLLM_NIXL_SIDE_CHANNEL_PORT` are set and the `NCCL_*` / `UCX_TLS` values match
-  your cluster network interfaces.
+  `VLLM_NIXL_SIDE_CHANNEL_PORT` are set and the `NCCL_IB_*` / `UCX_TLS` values match
+  your cluster network interfaces and transport.
 
 For a ModelServing-based NIXL example, see
 [vLLM Prefill-Decode Disaggregation (GPU)](./vllm-pd-disaggregation.md).

@@ -199,12 +199,14 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		return nil
 	}
 
-	podNames := make([]string, 0, len(pods))
-	for _, p := range pods {
-		podNames = append(podNames, p.GetPodNamespacedName().Name)
+	if klog.V(4).Enabled() {
+		podNames := make([]string, 0, len(pods))
+		for _, p := range pods {
+			podNames = append(podNames, p.GetPodNamespacedName().Name)
+		}
+		klog.Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
+			ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 	}
-	klog.V(4).Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
-		ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 
 	if (ctx.Prompt.Text == "" && len(ctx.Prompt.Messages) == 0) || ctx.Model == "" {
 		klog.V(4).Infof("KVCacheAware.Score: early return — empty prompt or model (model=%q, textLen=%d, messagesLen=%d)",

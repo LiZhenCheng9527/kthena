@@ -47,7 +47,7 @@ type ModelBoosterSpec struct {
 // ModelBackend defines the configuration for a model backend.
 type ModelBackend struct {
 	// Name is the name of the backend. Can't duplicate with other ModelBackend name in the same ModelBooster CR.
-	// Note: update name will cause the old modelInfer deletion and a new modelInfer creation.
+	// Note: update name will cause the old ModelServing deletion and a new ModelServing creation.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 	// Type is the type of the backend.

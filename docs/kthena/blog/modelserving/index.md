@@ -81,7 +81,8 @@ metadata:
   name: {modelserving-name}-{servinggroup-index}
   namespace: {modelserving-namespace}
   labels:
-    modelinfer.volcano.sh/name: {modelserving-name}-{servinggroup-index}
+    modelserving.volcano.sh/name: {modelserving-name}
+    modelserving.volcano.sh/group-name: {modelserving-name}-{servinggroup-index}
   annotations:
     scheduling.k8s.io/group-name: {modelserving-name}
 spec:

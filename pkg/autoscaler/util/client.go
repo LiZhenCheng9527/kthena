@@ -67,11 +67,11 @@ func UpdateModelServing(ctx context.Context, client clientset.Interface, modelIn
 	if oldModelInfer, err := client.WorkloadV1alpha1().ModelServings(modelInfer.Namespace).Get(modelInferCtx, modelInfer.Name, metav1.GetOptions{}); err == nil {
 		modelInfer.ResourceVersion = oldModelInfer.ResourceVersion
 		if _, updateErr := client.WorkloadV1alpha1().ModelServings(modelInfer.Namespace).Update(modelInferCtx, modelInfer, metav1.UpdateOptions{}); updateErr != nil {
-			klog.Errorf("failed to update modelInfer,err: %v", updateErr)
+			klog.Errorf("failed to update ModelServing %s/%s: %v", modelInfer.Namespace, modelInfer.Name, updateErr)
 			return updateErr
 		}
 	} else {
-		klog.Errorf("failed to get old modelInfer,err: %v", err)
+		klog.Errorf("failed to get old ModelServing %s/%s: %v", modelInfer.Namespace, modelInfer.Name, err)
 		return err
 	}
 	return nil

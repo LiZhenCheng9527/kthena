@@ -258,6 +258,47 @@ func TestGetPreviousHistogram(t *testing.T) {
 	}
 }
 
+func Test_updateGaugeMetricsInfo(t *testing.T) {
+	// Non-zero values are written; TPOT/TTFT zero values are skipped (guard preserved).
+	podinfo := &PodInfo{
+		GPUCacheUsage:    0.5,
+		RequestWaitingNum: 3,
+		RequestRunningNum: 2,
+		TPOT:              0.1,
+		TTFT:              0.2,
+	}
+	metrics := map[string]float64{
+		utils.KVCacheUsage:     0.9,
+		utils.RequestWaitingNum: 10,
+		utils.RequestRunningNum: 7,
+		utils.TPOT:              0.0, // zero → skipped, TPOT unchanged
+		utils.TTFT:              0.4,
+	}
+	updateGaugeMetricsInfo(podinfo, metrics)
+
+	assert.Equal(t, 0.9, podinfo.GPUCacheUsage)
+	assert.Equal(t, float64(10), podinfo.RequestWaitingNum)
+	assert.Equal(t, float64(7), podinfo.RequestRunningNum)
+	assert.Equal(t, 0.1, podinfo.TPOT) // unchanged, zero skipped
+	assert.Equal(t, 0.4, podinfo.TTFT)
+}
+
+func BenchmarkUpdateGaugeMetricsInfo(b *testing.B) {
+	podinfo := &PodInfo{}
+	metrics := map[string]float64{
+		utils.KVCacheUsage:      0.9,
+		utils.RequestWaitingNum: 10,
+		utils.RequestRunningNum: 7,
+		utils.TPOT:              0.1,
+		utils.TTFT:              0.2,
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		updateGaugeMetricsInfo(podinfo, metrics)
+	}
+}
+
 func TestStoreUpdatePodMetrics(t *testing.T) {
 	sum1 := float64(1)
 	count1 := uint64(1)

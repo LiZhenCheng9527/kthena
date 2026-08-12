@@ -62,6 +62,34 @@ var (
 	}
 )
 
+// Package-level read-only dispatch tables. Functions take podinfo as a parameter
+// instead of capturing it, so the tables are built once and reused — no per-call
+// map allocation. Concurrent reads of a never-written map are safe. Must stay unexported.
+var (
+	gaugeUpdateFuncs = map[string]func(*PodInfo, float64){
+		utils.KVCacheUsage: func(p *PodInfo, f float64) { p.GPUCacheUsage = f },
+		utils.RequestWaitingNum: func(p *PodInfo, f float64) { p.RequestWaitingNum = f },
+		utils.RequestRunningNum: func(p *PodInfo, f float64) { p.RequestRunningNum = f },
+		utils.TPOT: func(p *PodInfo, f float64) {
+			if f == 0.0 {
+				return
+			}
+			p.TPOT = f
+		},
+		utils.TTFT: func(p *PodInfo, f float64) {
+			if f == 0.0 {
+				return
+			}
+			p.TTFT = f
+		},
+	}
+
+	histogramUpdateFuncs = map[string]func(*PodInfo, *dto.Histogram){
+		utils.TPOT: func(p *PodInfo, h *dto.Histogram) { p.TimePerOutputToken = h },
+		utils.TTFT: func(p *PodInfo, h *dto.Histogram) { p.TimeToFirstToken = h },
+	}
+)
+
 const (
 	// defaultMetricsScrapeInterval is the default polling interval for pod metrics.
 	defaultMetricsScrapeInterval = 1 * time.Second
@@ -1782,33 +1810,10 @@ func getPreviousHistogram(podinfo *PodInfo) map[string]*dto.Histogram {
 func updateGaugeMetricsInfo(podinfo *PodInfo, metricsInfo map[string]float64) {
 	podinfo.mutex.Lock()
 	defer podinfo.mutex.Unlock()
-	updateFuncs := map[string]func(float64){
-		utils.KVCacheUsage: func(f float64) {
-			podinfo.GPUCacheUsage = f
-		},
-		utils.RequestWaitingNum: func(f float64) {
-			podinfo.RequestWaitingNum = f
-		},
-		utils.RequestRunningNum: func(f float64) {
-			podinfo.RequestRunningNum = f
-		},
-		utils.TPOT: func(f float64) {
-			if f == float64(0.0) {
-				return
-			}
-			podinfo.TPOT = f
-		},
-		utils.TTFT: func(f float64) {
-			if f == float64(0.0) {
-				return
-			}
-			podinfo.TTFT = f
-		},
-	}
 
 	for _, name := range metricsName {
-		if updateFunc, exist := updateFuncs[name]; exist {
-			updateFunc(metricsInfo[name])
+		if updateFunc, exist := gaugeUpdateFuncs[name]; exist {
+			updateFunc(podinfo, metricsInfo[name])
 		} else {
 			klog.V(4).Infof("Unknown metric: %s", name)
 		}
@@ -1818,18 +1823,10 @@ func updateGaugeMetricsInfo(podinfo *PodInfo, metricsInfo map[string]float64) {
 func updateHistogramMetrics(podinfo *PodInfo, histogramMetrics map[string]*dto.Histogram) {
 	podinfo.mutex.Lock()
 	defer podinfo.mutex.Unlock()
-	updateFuncs := map[string]func(*dto.Histogram){
-		utils.TPOT: func(h *dto.Histogram) {
-			podinfo.TimePerOutputToken = h
-		},
-		utils.TTFT: func(h *dto.Histogram) {
-			podinfo.TimeToFirstToken = h
-		},
-	}
 
 	for _, name := range histogramMetricsName {
-		if updateFunc, exist := updateFuncs[name]; exist {
-			updateFunc(histogramMetrics[name])
+		if updateFunc, exist := histogramUpdateFuncs[name]; exist {
+			updateFunc(podinfo, histogramMetrics[name])
 		} else {
 			klog.V(4).Infof("Unknown histogram metric: %s", name)
 		}

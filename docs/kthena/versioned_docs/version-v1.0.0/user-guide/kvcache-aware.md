@@ -334,8 +334,8 @@ kubectl logs <vllm-pod> -c runtime -n <namespace> | grep -iE "redis|zmq|kv"
 
 Expected messages:
 - `Redis client initialized successfully`
-- `vLLM ZMQ subscriber initialized successfully`
-- `Event handlers registered successfully`
+- `vLLM ZMQ subscriber initialized successfully` (or `SGLang ZMQ subscriber initialized successfully`)
+- `vLLM KV-cache event handler registered` (or `SGLang KV-cache event handler registered`)
 
 ### 3. Inspect Redis Keys
 

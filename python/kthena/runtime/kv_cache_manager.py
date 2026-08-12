@@ -39,6 +39,11 @@ def get_sglang_mapping_key_prefix() -> str:
     return "sglang:kv:block"
 
 
+# 24h, kept equal by hand to kvCacheFieldFreshDuration in
+# pkg/kthena-router/scheduler/plugins/kvcache_aware.go; change both together.
+MAPPING_KEY_TTL_SECONDS = 86400
+
+
 def compute_standardized_hash(token_ids: List[int]) -> int:
     if not token_ids:
         return 0
@@ -119,7 +124,7 @@ class VLLMKVCacheRedisManager:
             self.hash_mapping[engine_hash] = std_hash
             mapping_key = self._get_hash_mapping_key(engine_hash, pod_identifier)
             pipe.set(mapping_key, str(std_hash))
-            pipe.expire(mapping_key, 86400)
+            pipe.expire(mapping_key, MAPPING_KEY_TTL_SECONDS)
             pipe.hset(matrix_block_key, pod_identifier, timestamp)
         return True
 

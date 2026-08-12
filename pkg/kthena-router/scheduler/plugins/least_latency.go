@@ -106,7 +106,7 @@ func (l *LeastLatency) Name() string {
 // Score calculates a score for each pod based on their inference latency:
 func (l *LeastLatency) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
 	// Stores the computed score for each pod
-	scoreResults := make(map[*datastore.PodInfo]int)
+	scoreResults := make(map[*datastore.PodInfo]int, len(pods))
 	// Handle edge case: empty pod list
 	if len(pods) == 0 {
 		return scoreResults

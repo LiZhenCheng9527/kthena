@@ -57,7 +57,7 @@ func (r *Random) Name() string {
 
 // Score assigns random scores to pods within the range [0, 100]
 func (r *Random) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
-	scoreResults := make(map[*datastore.PodInfo]int)
+	scoreResults := make(map[*datastore.PodInfo]int, len(pods))
 
 	if len(pods) == 0 {
 		return scoreResults

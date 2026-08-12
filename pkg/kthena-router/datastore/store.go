@@ -65,7 +65,7 @@ var (
 	// instead of capturing it, so the tables are built once and reused — no per-call
 	// map allocation. Concurrent reads of a never-written map are safe. Must stay unexported.
 	gaugeUpdateFuncs = map[string]func(*PodInfo, float64){
-		utils.KVCacheUsage: func(p *PodInfo, f float64) { p.GPUCacheUsage = f },
+		utils.KVCacheUsage:      func(p *PodInfo, f float64) { p.GPUCacheUsage = f },
 		utils.RequestWaitingNum: func(p *PodInfo, f float64) { p.RequestWaitingNum = f },
 		utils.RequestRunningNum: func(p *PodInfo, f float64) { p.RequestRunningNum = f },
 		utils.TPOT: func(p *PodInfo, f float64) {

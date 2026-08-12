@@ -261,14 +261,14 @@ func TestGetPreviousHistogram(t *testing.T) {
 func Test_updateGaugeMetricsInfo(t *testing.T) {
 	// Non-zero values are written; TPOT/TTFT zero values are skipped (guard preserved).
 	podinfo := &PodInfo{
-		GPUCacheUsage:    0.5,
+		GPUCacheUsage:     0.5,
 		RequestWaitingNum: 3,
 		RequestRunningNum: 2,
 		TPOT:              0.1,
 		TTFT:              0.2,
 	}
 	metrics := map[string]float64{
-		utils.KVCacheUsage:     0.9,
+		utils.KVCacheUsage:      0.9,
 		utils.RequestWaitingNum: 10,
 		utils.RequestRunningNum: 7,
 		utils.TPOT:              0.0, // zero → skipped, TPOT unchanged

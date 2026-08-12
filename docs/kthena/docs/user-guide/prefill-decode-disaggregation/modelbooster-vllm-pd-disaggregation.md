@@ -218,7 +218,7 @@ Send a test request through the router:
 ```sh
 curl -X POST http://<ROUTER_IP>:80/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Hello"}],"max_tokens":20}'
+  -d '{"model":"qwen-nixl-pd","messages":[{"role":"user","content":"Hello"}],"max_tokens":20}'
 ```
 
 With NIXL, KV transfer is confirmed by the router log showing prefill and decode

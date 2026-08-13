@@ -36,31 +36,40 @@ func TestLoadSchedulerConfig(t *testing.T) {
 			expectErrs: "",
 		},
 		{
-			name:       "empty plugins config",
+			name:       "missing config file",
 			configFile: "non-existent-file.yaml",
 			expectErrs: "failed to read config file",
 		},
 		{
 			name:       "invalid YAML syntax",
+			configFile: "../../../utils/testdata/configmap-malformed.yaml",
+			expectErrs: "failed to Unmarshal routerConfiguration",
+		},
+		{
+			name:       "plugin entry is not a mapping",
 			configFile: "../../../utils/testdata/configmap-invalid.yaml",
-			expectErrs: "failed to Unmarshal schedulerConfiguration",
+			expectErrs: "plugin configuration must be a mapping",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			routerConf, err := ParseRouterConfig(tc.configFile)
-			if err != nil {
-				if !strings.Contains(err.Error(), tc.expectErrs) {
-					t.Errorf("expected error %q, got %q", tc.expectErrs, err.Error())
-				}
-			} else {
+			if err == nil {
 				_, _, _, err = LoadSchedulerConfig(&routerConf.Scheduler)
+			}
+			if tc.expectErrs == "" {
 				if err != nil {
-					if !strings.Contains(err.Error(), tc.expectErrs) {
-						t.Errorf("expected error %q, got %q", tc.expectErrs, err.Error())
-					}
+					t.Errorf("expected no error, got %q", err.Error())
 				}
+				return
+			}
+			if err == nil {
+				t.Errorf("expected error %q, got none", tc.expectErrs)
+				return
+			}
+			if !strings.Contains(err.Error(), tc.expectErrs) {
+				t.Errorf("expected error %q, got %q", tc.expectErrs, err.Error())
 			}
 		})
 	}

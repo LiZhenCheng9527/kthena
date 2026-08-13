@@ -19,7 +19,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Getting Started',
-      items: ['getting-started/installation', 'getting-started/quick-start'],
+      items: ['getting-started/installation', 'getting-started/quick-start', 'getting-started/gpu-free-quick-start'],
     },
     {
       type: 'category',

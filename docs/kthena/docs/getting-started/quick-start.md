@@ -9,6 +9,10 @@ import CodeBlock from '@theme/CodeBlock';
 Get up and running with Kthena in minutes! This guide will walk you through deploying your first AI model.
 We'll install a model from Hugging Face and perform inference using a simple curl command.
 
+:::tip
+No GPUs available? Follow the [GPU-Free Quick Start](./gpu-free-quick-start.md) to evaluate Kthena end to end with a mock inference backend on a CPU-only cluster.
+:::
+
 Kthena provides two ways to quickly deploy LLMs. We recommend starting with `ModelServing` for flexible, self-hosted deployments.
 
 ## Prerequisites

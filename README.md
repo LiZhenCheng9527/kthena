@@ -110,6 +110,7 @@ Regular Community Meeting:
 Resources:
 - [Meeting notes and agenda](https://docs.google.com/document/d/1bph_MA1UU3tKCV9T8XmJ0cIH3o85uAxExep412fDToE/edit?tab=t.0)
 - [Meeting link](https://zoom-lfx.platform.linuxfoundation.org/meeting/99772189625?password=c4530aed-d08f-4871-9477-091980f37d50)
+- [Meeting Calendar](https://calendar.google.com/calendar/u/0/newembed?src=volcano.sh.bot@gmail.com&csspa=1)
 
 ## License
 

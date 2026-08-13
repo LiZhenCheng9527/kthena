@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2833,4 +2834,165 @@ type failingEnqueueStore struct {
 
 func (s *failingEnqueueStore) Enqueue(req *datastore.Request) error {
 	return fmt.Errorf("injected enqueue failure")
+}
+
+func TestUpstreamTimeoutFor(t *testing.T) {
+	tests := []struct {
+		name   string
+		server *aiv1alpha1.ModelServer
+		want   time.Duration
+	}{
+		{
+			name:   "nil model server",
+			server: nil,
+			want:   0,
+		},
+		{
+			name:   "no traffic policy",
+			server: &aiv1alpha1.ModelServer{},
+			want:   0,
+		},
+		{
+			name: "traffic policy without timeout",
+			server: &aiv1alpha1.ModelServer{
+				Spec: aiv1alpha1.ModelServerSpec{TrafficPolicy: &aiv1alpha1.TrafficPolicy{}},
+			},
+			want: 0,
+		},
+		{
+			name: "timeout configured",
+			server: &aiv1alpha1.ModelServer{
+				Spec: aiv1alpha1.ModelServerSpec{
+					TrafficPolicy: &aiv1alpha1.TrafficPolicy{
+						Timeout: &v1.Duration{Duration: 2 * time.Second},
+					},
+				},
+			},
+			want: 2 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, upstreamTimeoutFor(tt.server))
+		})
+	}
+}
+
+// A backend that accepts the connection but never completes it must fail at the
+// configured timeout, which ResponseHeaderTimeout alone would not have bounded.
+func TestDoRequestBoundsConnectionSetup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(listener.Addr().String())
+	assert.NoError(t, err)
+	port, err := strconv.Atoi(portStr)
+	assert.NoError(t, err)
+
+	req, err := http.NewRequest(http.MethodPost, "https://placeholder/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	start := time.Now()
+	_, err = doRequest(req, host, int32(port), 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second, "TLS handshake to a silent listener must be bounded by the policy")
+}
+
+// A backend that never sends response headers must fail at the configured timeout
+func TestDoRequestHonorsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		backend.Close()
+	}()
+
+	host, port := splitHostPort(t, backend.URL)
+
+	req, err := http.NewRequest(http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	start := time.Now()
+	_, err = doRequest(req, host, port, 300*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Error(t, err, "a stalled backend should fail once the timeout elapses")
+	assert.Less(t, elapsed, 3*time.Second, "should fail near the timeout, not hang")
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "should not fail before the timeout")
+}
+
+// With no timeout configured the request is bounded only by its context
+func TestDoRequestWithoutTimeoutStillWaits(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	host, port := splitHostPort(t, backend.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	_, err = doRequest(req, host, port, 0)
+	assert.Error(t, err, "without a policy timeout only the request context bounds the call")
+	close(release)
+}
+
+func splitHostPort(t *testing.T, rawURL string) (string, int32) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	assert.NoError(t, err)
+	host, portStr, err := net.SplitHostPort(u.Host)
+	assert.NoError(t, err)
+	p, err := strconv.Atoi(portStr)
+	assert.NoError(t, err)
+	return host, int32(p)
+}
+
+// A stream slower than the timeout must not be cut off, only headers are bounded
+func TestDoRequestTimeoutDoesNotTruncateSlowStream(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		assert.True(t, ok)
+		flusher.Flush()
+		for i := 0; i < 6; i++ {
+			time.Sleep(100 * time.Millisecond)
+			fmt.Fprintf(w, "data: chunk-%d\n\n", i)
+			flusher.Flush()
+		}
+	}))
+	defer backend.Close()
+
+	host, port := splitHostPort(t, backend.URL)
+	req, err := http.NewRequest(http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	// Body takes ~600ms, well past the 200ms header timeout
+	resp, err := doRequest(req, host, port, 200*time.Millisecond)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "a slow stream must not be cut off by the header timeout")
+	assert.Contains(t, string(body), "chunk-5", "the whole stream should arrive")
 }

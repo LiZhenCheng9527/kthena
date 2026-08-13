@@ -7472,7 +7472,8 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			ms := &workloadv1alpha1.ModelServing{
 				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: msName},
 				Spec: workloadv1alpha1.ModelServingSpec{
-					Template: workloadv1alpha1.ServingGroup{Roles: tt.roles},
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+					Template:        workloadv1alpha1.ServingGroup{Roles: tt.roles},
 				},
 			}
 			store := datastore.New()

@@ -137,10 +137,10 @@ type RolloutStrategy struct {
 	// ServingGroupRollingUpdate and RoleRollingUpdate. It defaults to
 	// ServingGroupRollingUpdate.
 	//
-	// The configuration of `rolloutStrategy.rollingUpdateConfiguration` takes effect in `ServingGroupRollingUpdate`.
-	// RoleRollingUpdate settings on individual Roles are invalid.
-	// RoleRollingUpdate uses the rolling update configuration on each Role and
-	// during a rolling update, the `maxUnavailable` setting for the ServingGroup does not take effect.
+	// ServingGroupRollingUpdate uses rolloutStrategy.rollingUpdateConfiguration;
+	// rolling update settings on individual Roles do not take effect.
+	// RoleRollingUpdate uses the rolling update configuration on each Role;
+	// rolloutStrategy.rollingUpdateConfiguration must not be set.
 	// Kthena performs RoleRollingUpdate across all ServingGroups at the same time.
 	// Therefore, we recommend using it only in scenarios with a single ServingGroup.
 	//
@@ -149,7 +149,8 @@ type RolloutStrategy struct {
 	Type RolloutStrategyType `json:"type"`
 
 	// RollingUpdateConfiguration configures ServingGroupRollingUpdate.
-	// During a rolling update, the `maxUnavailable` setting for the ServingGroup does not take effect.
+	// It must not be set when type is RoleRollingUpdate; configure maxUnavailable
+	// and partition on each Role instead.
 	// +optional
 	RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
 }
@@ -168,12 +169,15 @@ const (
 	RoleRollingUpdate RolloutStrategyType = "RoleRollingUpdate"
 )
 
-// RollingUpdateConfiguration defines the parameters to be used for RollingUpdate.
+// RollingUpdateConfiguration defines availability and partition settings for
+// the rollout granularity where it is configured.
 type RollingUpdateConfiguration struct {
 	// MaxUnavailable is the maximum number of resources that may be
 	// unavailable during an update. It can be an absolute number (for example,
-	// 5) or a percentage of ModelServing replicas (for example, 10%). A
-	// percentage is rounded down. The value must not resolve to 0. Defaults to 1.
+	// 5) or a percentage (for example, 10%). A percentage is calculated from
+	// ModelServing replicas for ServingGroupRollingUpdate and from the
+	// corresponding Role's replicas for RoleRollingUpdate, then rounded down.
+	// The value must not resolve to 0. Defaults to 1.
 	// +kubebuilder:validation:XIntOrString
 	// +kubebuilder:default=1
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`

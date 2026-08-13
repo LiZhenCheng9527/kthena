@@ -171,9 +171,9 @@ type RollingUpdateConfiguration struct {
 	// +kubebuilder:default=1
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 
-	// Partition indicates the ordinal at which the ModelServing should be partitioned
-	// for updates. During a rolling update, all ServingGroups from ordinal Replicas-1 to
-	// Partition are updated. All ServingGroups from ordinal Partition-1 to 0 remain untouched.
+	// Partition protects the first N existing replicas in ascending ordinal order
+	// from updates. The remaining replicas are eligible for rolling update.
+	// For a contiguous ordinal set, this is equivalent to protecting [0, Partition).
 	// Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).
 	// Absolute number is calculated from percentage by rounding up.
 	// The default value is 0.
@@ -221,13 +221,13 @@ type ModelServingStatus struct {
 	// AvailableReplicas track the number of ServingGroup that are in ready state (updated or not).
 	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
 
-	// CurrentRevision, if not empty, indicates the ControllerRevision version used to generate
-	// ServingGroups in the sequence [0,currentReplicas).
+	// CurrentRevision, if not empty, indicates the ControllerRevision version preserved by
+	// ServingGroups that have not been updated.
 	// +optional
 	CurrentRevision string `json:"currentRevision,omitempty"`
 
-	// UpdateRevision, if not empty, indicates the ControllerRevision version used to generate
-	// ServingGroups in the sequence [replicas-updatedReplicas,replicas).
+	// UpdateRevision, if not empty, indicates the ControllerRevision version targeted by
+	// the current ModelServing spec.
 	// +optional
 	UpdateRevision string `json:"updateRevision,omitempty"`
 

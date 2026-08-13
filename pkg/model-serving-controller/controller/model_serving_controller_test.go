@@ -2324,8 +2324,16 @@ func TestScaleUpServingGroups(t *testing.T) {
 	}
 }
 
+// TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails verifies that
+// scale-up does not create a ServingGroup whose revision has no persisted template
+// snapshot. A partition-protected recovery may later need that ControllerRevision
+// to reconstruct the historical Role templates. Continuing after snapshot creation
+// fails would leave Pods and datastore entries referring to a revision that cannot
+// be resolved, so the reconciliation must fail before creating any workload.
 func TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
+	// Simulate an API server failure while persisting the template snapshot for
+	// new-revision. The workqueue will retry this reconciliation in production.
 	kubeClient.PrependReactor("create", "controllerrevisions", func(kubetesting.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("injected ControllerRevision creation failure")
 	})
@@ -2358,6 +2366,9 @@ func TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails(t *testing
 	err = controller.scaleUpServingGroups(context.Background(), ms, nil, 1, "new-revision")
 	require.ErrorContains(t, err, "failed to create ControllerRevision for new revision new-revision")
 
+	// The ControllerRevision must be created before Pods or datastore state. This
+	// keeps the operation retryable and prevents partially created ServingGroups
+	// from referencing a missing historical template.
 	_, storeErr := controller.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
 	assert.ErrorIs(t, storeErr, datastore.ErrServingGroupNotFound)
 	pods, listErr := kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{})

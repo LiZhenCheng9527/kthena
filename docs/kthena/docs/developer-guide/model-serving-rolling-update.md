@@ -4,7 +4,9 @@ Rolling updates represent a critical operational strategy for online services ai
 
 Currently, `ModelServing` supports rolling upgrades at the `ServingGroup` level, enabling users to configure `Partitions` to control the rolling process.
 
-- Partition: Indicates the ordinal at which the `ModelServing` should be partitioned for updates. During a rolling update, replicas with an ordinal greater than or equal to `Partition` will be updated. Replicas with an ordinal less than `Partition` will not be updated.
+- Partition: Protects the first N existing replicas in the datastore's ascending ordinal order. The remaining replicas are eligible for rolling update. With the normal contiguous ordinal set, this is equivalent to protecting ordinals in `[0, partition)`. Defining protection by list position also gives deterministic behavior for legacy or temporarily non-contiguous sets.
+
+When a protected replica is missing and must be recreated, the ordinal itself selects the template: a missing ordinal below `partition` uses `CurrentRevision` and its historical template, while other missing ordinals use `UpdateRevision` and the current template. Before creating a `ServingGroup` that references a new revision, the controller must successfully persist its `ControllerRevision`; otherwise reconciliation stops and retries without creating a partial `ServingGroup`.
 
 Here's a ModelServing configured with rollout strategy:
 
@@ -22,13 +24,13 @@ In the following we'll show how rolling update processes for a `ModelServing` wi
 - ❎ Replica hasn't been updated
 - ⏳ Replica is in rolling update
 
-|        | R-0 | R-1 | R-2 | R-3 | Note                                                                          |
-|--------|-----|-----|-----|-----|-------------------------------------------------------------------------------|
-| Stage1 | ✅   | ✅   | ✅   | ✅   | Before rolling update                                                         |
-| Stage2 | ❎   | ❎   | ❎   | ⏳   | Rolling update started, The replica with the highest ordinal (R-3) is updated |
-| Stage3 | ❎   | ❎   | ⏳   | ✅   | R-3 is updated. The next replica (R-2) is now being updated                   |
-| Stage4 | ❎   | ⏳   | ✅   | ✅   | R-2 is updated. The next replica (R-1) is now being updated                   |
-| Stage5 | ⏳   | ✅   | ✅   | ✅   | R-1 is updated. The last replica (R-0) is now being updated                   |
-| Stage6 | ✅   | ✅   | ✅   | ✅   | Update completed. All replicas are on the new version                         |
+| | R-0 | R-1 | R-2 | R-3 | Note |
+| --- | --- | --- | --- | --- | --- |
+| Stage1 | ✅ | ✅ | ✅ | ✅ | Before rolling update |
+| Stage2 | ❎ | ❎ | ❎ | ⏳ | Rolling update started; R-3 is selected first in this example |
+| Stage3 | ❎ | ❎ | ⏳ | ✅ | R-3 is updated. The next replica (R-2) is now being updated |
+| Stage4 | ❎ | ⏳ | ✅ | ✅ | R-2 is updated. The next replica (R-1) is now being updated |
+| Stage5 | ⏳ | ✅ | ✅ | ✅ | R-1 is updated. The last replica (R-0) is now being updated |
+| Stage6 | ✅ | ✅ | ✅ | ✅ | Update completed. All replicas are on the new version |
 
-During a rolling upgrade, the controller deletes and rebuilds the replica with the highest sequence number among the replicas need to be updated. The next replica will not be updated until the new replica is running normally.
+During a rolling upgrade, the controller selects an eligible outdated replica while respecting partition and availability constraints, then deletes and rebuilds it. Unhealthy outdated replicas are prioritized; ordinal order is used within the applicable candidate ordering. The controller does not proceed beyond the availability budget until replacement capacity is ready.

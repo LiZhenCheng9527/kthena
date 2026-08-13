@@ -996,6 +996,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		return nil
 	}
 
+	roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
 	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
 		if partitionConfigured && partition > 0 && ordinal < partition {
 			// Use CurrentRevision for partition-protected ordinals
@@ -1054,7 +1055,6 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 			}
 			return true
 		}
-		roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
 		if err := createRole(ordinal, newRevision, targetRole, roleTemplateHash); err != nil {
 			klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
 		}

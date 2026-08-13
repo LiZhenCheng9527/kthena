@@ -351,7 +351,7 @@ You can adjust both levels simultaneously. For instance, you can increase the nu
 
 Currently, `ModelServing` supports rolling upgrades at the `ServingGroup` level, enabling users to configure `Partitions` to control the rolling process.
 
-- Partition: Indicates the ordinal at which the `ModelServing` should be partitioned for updates. During a rolling update, replicas with an ordinal greater than or equal to `Partition` will be updated. Replicas with an ordinal less than `Partition` will not be updated.
+- Partition: Protects the first N existing `ServingGroups` in ascending ordinal order. The remaining `ServingGroups` are eligible for update. For the normal contiguous set, this is equivalent to protecting ordinals in `[0, partition)`.
   
 ### ServingGroup Rolling Update
 
@@ -378,7 +378,7 @@ llama-multinode-1-405b-0-0        vllm/vllm-openai:v0.10.1
 llama-multinode-1-405b-0-1        vllm/vllm-openai:v0.10.1                 
 ```
 
-From the pod runtime, we can see that only group 1 has been updated because we set `rolloutStrategy.partition = 1`.
+From the pod runtime, we can see that only group 1 has been updated because `rolloutStrategy.partition = 1` protects the first existing group, group 0. If the existing ordinal set is temporarily non-contiguous, protection still applies to the first existing group in ordinal order rather than to an ordinal threshold.
 
 ## Gang Scheduling and Network Topology
 

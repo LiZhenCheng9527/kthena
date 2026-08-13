@@ -272,12 +272,12 @@ func (c *ModelServingController) addModelServing(obj interface{}) {
 func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 	curms, ok := cur.(*workloadv1alpha1.ModelServing)
 	if !ok {
-		klog.Error("failed to parse ModelServing type when updatems")
+		klog.Errorf("failed to parse new ModelServing type when update %#v", cur)
 		return
 	}
 	oldms, ok := old.(*workloadv1alpha1.ModelServing)
 	if !ok {
-		klog.Error("failed to parse ModelServing type when updatems")
+		klog.Errorf("failed to parse old ModelServing type when update %#v", old)
 		return
 	}
 
@@ -306,7 +306,7 @@ func (c *ModelServingController) deleteModelServing(obj interface{}) {
 		// If the object is not a ModelServing, it might be a tombstone object.
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			klog.Errorf("failed to parse ModelServing type when deletems %#v", obj)
+			klog.Errorf("failed to parse ModelServing type when delete %#v", obj)
 			return
 		}
 		ms, ok = tombstone.Obj.(*workloadv1alpha1.ModelServing)
@@ -1296,7 +1296,7 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 	services, err := c.getServicesByIndex(RoleIDKey, roleIDValue)
 	if err != nil {
 		deleteErr = err
-		klog.Errorf("failed to get service %v", err)
+		klog.Errorf("failed to get services of role %s/%s: %v", groupName, roleID, err)
 		return
 	}
 	for _, svc := range services {

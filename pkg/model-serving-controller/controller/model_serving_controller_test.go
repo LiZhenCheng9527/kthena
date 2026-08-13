@@ -16,6 +16,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"testing"
 	"time"
@@ -2140,6 +2141,37 @@ func verifyRoles(t *testing.T, controller *ModelServingController, ms *workloadv
 	}
 }
 
+func TestFindMissingOrdinals(t *testing.T) {
+	tests := []struct {
+		name             string
+		expectedCount    int
+		existingOrdinals []int
+		limit            int
+		want             []int
+	}{
+		{name: "zero replicas", expectedCount: 0, existingOrdinals: []int{0}, limit: 1, want: []int{}},
+		{name: "zero limit", expectedCount: 3, limit: 0, want: []int{}},
+		{name: "empty", expectedCount: 3, limit: 3, want: []int{0, 1, 2}},
+		{name: "continuous", expectedCount: 3, existingOrdinals: []int{0, 1, 2}, limit: 3, want: []int{}},
+		{name: "gaps", expectedCount: 5, existingOrdinals: []int{0, 2, 4}, limit: 5, want: []int{1, 3}},
+		{name: "limited gaps", expectedCount: 5, existingOrdinals: []int{0, 2, 4}, limit: 1, want: []int{1}},
+		{name: "unsorted duplicates", expectedCount: 4, existingOrdinals: []int{2, 0, 2}, limit: 4, want: []int{1, 3}},
+		{name: "ignore out of range", expectedCount: 3, existingOrdinals: []int{-1, 1, 10}, limit: 3, want: []int{0, 2}},
+		{name: "int32 max replicas is lazy", expectedCount: math.MaxInt32, existingOrdinals: []int{0, 1}, limit: 2, want: []int{2, 3}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := []int{}
+			forEachMissingOrdinal(tt.expectedCount, tt.existingOrdinals, tt.limit, func(ordinal int) bool {
+				got = append(got, ordinal)
+				return true
+			})
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 // TestScaleUpServingGroups tests the scaleUpServingGroups function with various scenarios
 func TestScaleUpServingGroups(t *testing.T) {
 	tests := []struct {
@@ -2164,17 +2196,17 @@ func TestScaleUpServingGroups(t *testing.T) {
 			expectNoCreation:   false,
 		},
 		{
-			name:               "scale up with gap in indices - should use increasing indices from max",
+			name:               "scale up fills gaps within replicas",
 			existingIndices:    []int{0, 5}, // Gap: indices 1-4 missing
 			expectedCount:      4,
-			expectedNewIndices: []int{6, 7}, // Should continue from max index (5) + 1
+			expectedNewIndices: []int{1, 2},
 			expectNoCreation:   false,
 		},
 		{
 			name:               "scale up with only high index existing",
 			existingIndices:    []int{10},
 			expectedCount:      3,
-			expectedNewIndices: []int{11, 12}, // Should continue from max index (10) + 1
+			expectedNewIndices: []int{0, 1},
 			expectNoCreation:   false,
 		},
 		{
@@ -2285,9 +2317,64 @@ func TestScaleUpServingGroups(t *testing.T) {
 				// Verify total groups count
 				expectedTotal := len(tt.existingIndices) + len(tt.expectedNewIndices)
 				assert.Equal(t, expectedTotal, len(groups), "Total group count should match expected")
+				for _, expectedIdx := range tt.expectedNewIndices {
+					assert.Less(t, expectedIdx, tt.expectedCount, "New ServingGroup ordinal must be within replicas")
+				}
 			}
 		})
 	}
+}
+
+// TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails verifies that
+// scale-up does not create a ServingGroup whose revision has no persisted template
+// snapshot. A partition-protected recovery may later need that ControllerRevision
+// to reconstruct the historical Role templates. Continuing after snapshot creation
+// fails would leave Pods and datastore entries referring to a revision that cannot
+// be resolved, so the reconciliation must fail before creating any workload.
+func TestScaleUpServingGroupsStopsWhenControllerRevisionCreationFails(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	// Simulate an API server failure while persisting the template snapshot for
+	// new-revision. The workqueue will retry this reconciliation in production.
+	kubeClient.PrependReactor("create", "controllerrevisions", func(kubetesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("injected ControllerRevision creation failure")
+	})
+	controller, err := NewModelServingController(
+		kubeClient,
+		kthenafake.NewSimpleClientset(),
+		volcanofake.NewSimpleClientset(),
+		apiextfake.NewSimpleClientset(),
+	)
+	require.NoError(t, err)
+
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-revision-failure"},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas: ptr.To[int32](1),
+			Template: workloadv1alpha1.ServingGroup{
+				Roles: []workloadv1alpha1.Role{
+					{
+						Name:     "prefill",
+						Replicas: ptr.To[int32](1),
+						EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefill", Image: "test-image"}}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err = controller.scaleUpServingGroups(context.Background(), ms, nil, 1, "new-revision")
+	require.ErrorContains(t, err, "failed to create ControllerRevision for new revision new-revision")
+
+	// The ControllerRevision must be created before Pods or datastore state. This
+	// keeps the operation retryable and prevents partially created ServingGroups
+	// from referencing a missing historical template.
+	_, storeErr := controller.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
+	assert.ErrorIs(t, storeErr, datastore.ErrServingGroupNotFound)
+	pods, listErr := kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, listErr)
+	assert.Empty(t, pods.Items)
 }
 
 // TestScaleUpRoles tests the scaleUpRoles function with various scenarios
@@ -2317,17 +2404,17 @@ func TestScaleUpRoles(t *testing.T) {
 			expectNoCreation:   false,
 		},
 		{
-			name:               "scale up with gap in indices - should use increasing indices from max",
+			name:               "scale up fills gaps within replicas",
 			existingIndices:    []int{0, 5}, // Gap: indices 1-4 missing
 			expectedCount:      4,
-			expectedNewIndices: []int{6, 7}, // Should continue from max index (5) + 1
+			expectedNewIndices: []int{1, 2},
 			expectNoCreation:   false,
 		},
 		{
 			name:               "scale up with only high index existing",
 			existingIndices:    []int{10},
 			expectedCount:      3,
-			expectedNewIndices: []int{11, 12}, // Should continue from max index (10) + 1
+			expectedNewIndices: []int{0, 1},
 			expectNoCreation:   false,
 		},
 		{
@@ -2473,6 +2560,9 @@ func TestScaleUpRoles(t *testing.T) {
 				// Verify total roles count
 				expectedTotal := len(tt.existingIndices) + len(tt.expectedNewIndices)
 				assert.Equal(t, expectedTotal, len(roles), "Total role count should match expected")
+				for _, expectedIdx := range tt.expectedNewIndices {
+					assert.Less(t, expectedIdx, tt.expectedCount, "New Role ordinal must be within replicas")
+				}
 			}
 		})
 	}
@@ -4049,8 +4139,9 @@ func TestUpdateModelServingStatusRevisionFields(t *testing.T) {
 func TestScaleDownRoles(t *testing.T) {
 	tests := []struct {
 		name                   string
-		existingIndices        []int    // Indices of existing Roles
-		expectedCount          int      // Target count after scale down
+		existingIndices        []int // Indices of existing Roles
+		expectedCount          int   // Target count after scale down
+		partition              *intstr.IntOrString
 		expectedRemainingNames []string // Expected remaining Role names (without test prefix)
 	}{
 		{
@@ -4082,6 +4173,13 @@ func TestScaleDownRoles(t *testing.T) {
 			existingIndices:        []int{0, 2, 5, 8},
 			expectedCount:          2,
 			expectedRemainingNames: []string{"prefill-0", "prefill-2"}, // Higher indices (5, 8) deleted first
+		},
+		{
+			name:                   "partition protects first replicas with non-continuous indices",
+			existingIndices:        []int{1, 3, 5, 8},
+			expectedCount:          2,
+			partition:              ptr.To(intstr.FromInt(2)),
+			expectedRemainingNames: []string{"prefill-1", "prefill-3"},
 		},
 	}
 
@@ -4128,6 +4226,7 @@ func TestScaleDownRoles(t *testing.T) {
 			}
 
 			targetRole := ms.Spec.Template.Roles[0]
+			targetRole.RollingUpdateConfiguration.Partition = tt.partition
 
 			// Pre-populate the store with ServingGroup and Roles
 			controller.store.AddServingGroup(utils.GetNamespaceName(ms), 0, "test-revision")
@@ -7340,6 +7439,28 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 				store.AddServingGroup(utils.GetNamespaceName(ms), 0, oldRevision)
 				addRole(t, store, ms, "prefill", "prefill-0", "", datastore.RoleRunning)
 			},
+		},
+		{
+			name: "partition protects first outdated roles with non-continuous ordinals",
+			roles: []workloadv1alpha1.Role{
+				func() workloadv1alpha1.Role {
+					role := newRole("prefill", "nginx:latest", 4, nil)
+					role.RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt(2))
+					return role
+				}(),
+			},
+			setupStore: func(t *testing.T, store datastore.Store, ms *workloadv1alpha1.ModelServing) {
+				t.Helper()
+				store.AddServingGroup(utils.GetNamespaceName(ms), 0, oldRevision)
+				for _, ordinal := range []int{1, 3, 5, 8} {
+					addRole(t, store, ms, "prefill", fmt.Sprintf("prefill-%d", ordinal), "old-hash", datastore.RoleRunning)
+				}
+			},
+			expected: []roleToDelete{
+				{roleName: "prefill", roleID: "prefill-8"},
+				{roleName: "prefill", roleID: "prefill-5"},
+			},
+			expectedOutdated: true,
 		},
 		{
 			name: "missing serving group returns error",

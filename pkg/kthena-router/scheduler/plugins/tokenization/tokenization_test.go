@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -814,14 +815,14 @@ func TestJSONSerialization(t *testing.T) {
 // Test concurrent access
 func TestConcurrentAccess(t *testing.T) {
 	// Create a mock server for concurrent testing
-	requestCount := 0
+	var requestCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		count := requestCount.Add(1)
 		time.Sleep(10 * time.Millisecond) // Simulate processing time
 		response := map[string]interface{}{
 			"count":         1,
 			"max_model_len": 1024,
-			"tokens":        []int{requestCount},
+			"tokens":        []int32{count},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -859,8 +860,8 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify that all requests were processed
-	if requestCount != numRequests {
-		t.Errorf("Expected %d requests, got %d", numRequests, requestCount)
+	if got := requestCount.Load(); got != numRequests {
+		t.Errorf("Expected %d requests, got %d", numRequests, got)
 	}
 }
 

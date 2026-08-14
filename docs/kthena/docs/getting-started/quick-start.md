@@ -135,7 +135,7 @@ You can now perform inference using the model. Here's an example of how to send 
 curl -X POST http://<model-route-ip>/v1/chat/completions \
 -H "Content-Type: application/json" \
 -d '{
-  "model": "Qwen2.5-0.5B-Instruct",
+  "model": "demo",
   "messages": [
     {
       "role": "user",
@@ -149,7 +149,7 @@ curl -X POST http://<model-route-ip>/v1/chat/completions \
 Use the following command to get the `<model-route-ip>`:
 
 ```bash
-kubectl get svc kthena-router -o jsonpath='{.spec.clusterIP}' -n <your-namespace>
+kubectl get svc kthena-router -o jsonpath='{.spec.clusterIP}' -n kthena-system
 ```
 
 This IP can only be used inside the cluster. If you want to chat from outside the cluster, you can use the `EXTERNAL-IP`

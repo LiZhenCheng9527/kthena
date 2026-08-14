@@ -135,7 +135,7 @@ You can now perform inference using the model. Here's an example of how to send 
 curl -X POST http://<model-route-ip>/v1/chat/completions \
 -H "Content-Type: application/json" \
 -d '{
-  "model": "Qwen2.5-0.5B-Instruct",
+  "model": "demo",
   "messages": [
     {
       "role": "user",

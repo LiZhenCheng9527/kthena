@@ -167,16 +167,126 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 			listenerPort: 8080,
 		},
 		{
-			name: "skips unprocessed route with listener context",
+			name: "matches route without sectionName and port against active listener",
 			routes: []*gatewayv1.HTTPRoute{
 				route("route", nil, []gatewayv1.HTTPRouteRule{
 					pathRule("/chat", "pool"),
 				}),
 			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "public",
+			listenerPort:   8080,
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
+		},
+		{
+			name: "matches route with sectionName only against matching listener",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					section := gatewayv1.SectionName("public")
+					r.Spec.ParentRefs[0].SectionName = &section
+					return r
+				}(),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "public",
+			listenerPort:   8080,
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
+		},
+		{
+			name: "skips route with sectionName only against different listener",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					section := gatewayv1.SectionName("private")
+					r.Spec.ParentRefs[0].SectionName = &section
+					return r
+				}(),
+			},
 			host:         "api.example.com",
 			path:         "/chat",
 			listenerName: "public",
 			listenerPort: 8080,
+		},
+		{
+			name: "matches route with port only against matching port",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					port := gatewayv1.PortNumber(8080)
+					r.Spec.ParentRefs[0].Port = &port
+					return r
+				}(),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "public",
+			listenerPort:   8080,
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
+		},
+		{
+			name: "skips route with port only against different port",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					port := gatewayv1.PortNumber(9090)
+					r.Spec.ParentRefs[0].Port = &port
+					return r
+				}(),
+			},
+			host:         "api.example.com",
+			path:         "/chat",
+			listenerName: "public",
+			listenerPort: 8080,
+		},
+		{
+			name: "matches route with multiple parentRefs when second parentRef matches",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					otherGw := gatewayv1.ObjectName("other-gw")
+					sectionPrivate := gatewayv1.SectionName("private")
+					sectionPublic := gatewayv1.SectionName("public")
+					r.Spec.ParentRefs = []gatewayv1.ParentReference{
+						{
+							Name:        otherGw,
+							Kind:        &kind,
+							SectionName: &sectionPrivate,
+						},
+						{
+							Name:        "gw",
+							Kind:        &kind,
+							SectionName: &sectionPublic,
+						},
+					}
+					return r
+				}(),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			listenerName:   "public",
+			listenerPort:   8080,
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
 		},
 		{
 			name: "skips listener-scoped route without listener context",
@@ -187,6 +297,36 @@ func TestRouter_FindHTTPRouteMatch(t *testing.T) {
 			},
 			host: "api.example.com",
 			path: "/chat",
+		},
+		{
+			name: "matches multiple parentRefs without listener context when one has no section/port",
+			routes: []*gatewayv1.HTTPRoute{
+				func() *gatewayv1.HTTPRoute {
+					r := route("route", nil, []gatewayv1.HTTPRouteRule{
+						pathRule("/chat", "pool"),
+					})
+					sectionPrivate := gatewayv1.SectionName("private")
+					portPrivate := gatewayv1.PortNumber(8081)
+					r.Spec.ParentRefs = []gatewayv1.ParentReference{
+						{
+							Name:        "gw",
+							Kind:        &kind,
+							SectionName: &sectionPrivate,
+							Port:        &portPrivate,
+						},
+						{
+							Name: "gw",
+							Kind: &kind,
+						},
+					}
+					return r
+				}(),
+			},
+			host:           "api.example.com",
+			path:           "/chat",
+			expectedRoute:  "route",
+			expectedPool:   "pool",
+			expectedPrefix: "/chat",
 		},
 		{
 			name: "prefers longest prefix in a single route",

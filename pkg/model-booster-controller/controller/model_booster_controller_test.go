@@ -210,6 +210,27 @@ func TestCreateOrUpdateModelRouteUpdatesLiveRouteWhenListerIsStale(t *testing.T)
 	assert.Equal(t, desiredRoute.Labels[utils.RevisionLabelKey], updatedRoute.Labels[utils.RevisionLabelKey])
 }
 
+func TestCreateOrUpdateModelRouteDoesNotCreateWhenListerMissesLiveRoute(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := fake.NewClientset()
+	kthenaClient := kthenafake.NewSimpleClientset()
+	controller := NewModelBoosterController(kubeClient, kthenaClient)
+
+	model := loadYaml[workload.ModelBooster](t, "../convert/testdata/input/model.yaml")
+	desiredRoute := convert.BuildModelRoute(model)
+	_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(model.Namespace).Create(ctx, desiredRoute, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	var creates atomic.Int32
+	kthenaClient.PrependReactor("create", "modelroutes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		creates.Add(1)
+		return false, nil, nil
+	})
+
+	assert.NoError(t, controller.createOrUpdateModelRoute(ctx, model))
+	assert.Zero(t, creates.Load())
+}
+
 func TestReconcile_ReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -33,6 +33,23 @@ func (mc *ModelBoosterController) createOrUpdateModelRoute(ctx context.Context, 
 	oldModelRoute, err := mc.modelRoutesLister.ModelRoutes(modelRoute.Namespace).Get(modelRoute.Name)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			// The informer cache may lag behind a successful creation. Check the
+			// live object before issuing another Create request.
+			currentModelRoute, getErr := mc.client.NetworkingV1alpha1().ModelRoutes(model.Namespace).Get(ctx, modelRoute.Name, metav1.GetOptions{})
+			if getErr == nil {
+				if currentModelRoute.DeletionTimestamp != nil {
+					return nil
+				}
+				if currentModelRoute.Spec.ModelName != modelRoute.Spec.ModelName {
+					klog.Infof("Delete ModelBooster Route %s because spec.modelName is immutable", modelRoute.Name)
+					return mc.client.NetworkingV1alpha1().ModelRoutes(model.Namespace).Delete(ctx, modelRoute.Name, metav1.DeleteOptions{})
+				}
+				return mc.updateModelRoute(ctx, currentModelRoute, modelRoute)
+			}
+			if !apierrors.IsNotFound(getErr) {
+				klog.Errorf("failed to get live ModelRoute %s: %v", klog.KObj(modelRoute), getErr)
+				return getErr
+			}
 			klog.V(4).Infof("Create ModelBooster Route %s", modelRoute.Name)
 			if _, err := mc.client.NetworkingV1alpha1().ModelRoutes(model.Namespace).Create(ctx, modelRoute, metav1.CreateOptions{}); err != nil {
 				klog.Errorf("failed to create ModelRoute %s: %v", klog.KObj(modelRoute), err)

@@ -468,14 +468,7 @@ func TestGetPartition(t *testing.T) {
 			controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
 			assert.NoError(t, err)
 
-			var config *workloadv1alpha1.RollingUpdateConfiguration
-			if tt.partition != nil {
-				config = &workloadv1alpha1.RollingUpdateConfiguration{
-					Partition: tt.partition,
-				}
-			}
-
-			got, _, err := controller.getPartition(config, int(tt.replicas))
+			got, _, err := controller.getPartition(tt.partition, int(tt.replicas))
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expected, got)
 		})
@@ -7479,7 +7472,8 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			ms := &workloadv1alpha1.ModelServing{
 				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: msName},
 				Spec: workloadv1alpha1.ModelServingSpec{
-					Template: workloadv1alpha1.ServingGroup{Roles: tt.roles},
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+					Template:        workloadv1alpha1.ServingGroup{Roles: tt.roles},
 				},
 			}
 			store := datastore.New()

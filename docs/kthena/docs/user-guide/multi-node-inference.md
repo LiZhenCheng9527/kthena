@@ -349,9 +349,14 @@ You can adjust both levels simultaneously. For instance, you can increase the nu
 
 ## Rolling Update
 
-Currently, `ModelServing` supports rolling upgrades at the `ServingGroup` level, enabling users to configure `Partitions` to control the rolling process.
+`ModelServing` supports `ServingGroupRollingUpdate` and `RoleRollingUpdate`. Select one with `spec.rolloutStrategy.type`:
 
-- Partition: Protects the first N existing `ServingGroups` in ascending ordinal order. The remaining `ServingGroups` are eligible for update. For the normal contiguous set, this is equivalent to protecting ordinals in `[0, partition)`.
+- `ServingGroupRollingUpdate` reads `maxUnavailable` and `partition` from `spec.rolloutStrategy.rollingUpdateConfiguration`.
+- `RoleRollingUpdate` reads the inline `maxUnavailable` and `partition` from each entry in `spec.template.roles`. Do not set the ModelServing-level `rollingUpdateConfiguration` with this strategy.
+
+`maxUnavailable` defaults to `1`. Percentages use the number of `ServingGroups` for `ServingGroupRollingUpdate` and the corresponding Role's replica count for `RoleRollingUpdate`.
+
+`partition` protects the first N existing replicas in ascending ordinal order. The remaining replicas are eligible for update. For a normal contiguous set, this is equivalent to protecting ordinals in `[0, partition)`.
   
 ### ServingGroup Rolling Update
 
@@ -378,7 +383,26 @@ llama-multinode-1-405b-0-0        vllm/vllm-openai:v0.10.1
 llama-multinode-1-405b-0-1        vllm/vllm-openai:v0.10.1                 
 ```
 
-From the pod runtime, we can see that only group 1 has been updated because `rolloutStrategy.partition = 1` protects the first existing group, group 0. If the existing ordinal set is temporarily non-contiguous, protection still applies to the first existing group in ordinal order rather than to an ordinal threshold.
+From the pod runtime, we can see that only group 1 has been updated because `rolloutStrategy.rollingUpdateConfiguration.partition = 1` protects the first existing group, group 0. If the existing ordinal set is temporarily non-contiguous, protection still applies to the first existing group in ordinal order rather than to an ordinal threshold.
+
+### Role Rolling Update
+
+Use `RoleRollingUpdate` to recreate only changed Roles. Configure the rollout settings directly on each Role:
+
+```yaml
+spec:
+  rolloutStrategy:
+    type: RoleRollingUpdate
+  template:
+    roles:
+      - name: 405b
+        replicas: 2
+        maxUnavailable: 1
+        partition: 0
+        # entryTemplate and workerTemplate are omitted
+```
+
+The per-Role settings are applied in every `ServingGroup`; the ModelServing-level `rollingUpdateConfiguration` does not apply. `RoleRollingUpdate` is therefore recommended for a ModelServing with a single `ServingGroup`. To rebuild only the changed Role, use `recoveryPolicy: RoleRecreate`; `ServingGroupRecreate` causes the entire group to be recreated when an outdated Role is deleted.
 
 ## Gang Scheduling and Network Topology
 

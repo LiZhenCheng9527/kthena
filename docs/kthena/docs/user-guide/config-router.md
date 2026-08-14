@@ -67,7 +67,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kthena-router-config
-  namespace: default
+  namespace: <namespace>
 data:
   routerConfiguration: |-
     scheduler:

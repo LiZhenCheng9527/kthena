@@ -69,7 +69,7 @@ func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.In
 		syncPeriodSeconds = util.AutoscalingSyncPeriodSeconds
 	}
 	informerFactory := informersv1alpha1.NewSharedInformerFactory(client, 0)
-	modelInferInformer := informerFactory.Workload().V1alpha1().ModelServings()
+	modelServings := informerFactory.Workload().V1alpha1().ModelServings()
 	autoscalingPoliciesInformer := informerFactory.Workload().V1alpha1().AutoscalingPolicies()
 
 	selector, err := labels.NewRequirement(workload.GroupNameLabelKey, selection.Exists, nil)
@@ -88,8 +88,8 @@ func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.In
 		client:                      client,
 		autoscalingPoliciesLister:   autoscalingPoliciesInformer.Lister(),
 		autoscalingPoliciesInformer: autoscalingPoliciesInformer.Informer(),
-		modelServingLister:          modelInferInformer.Lister(),
-		modelServingInformer:        modelInferInformer.Informer(),
+		modelServingLister:          modelServings.Lister(),
+		modelServingInformer:        modelServings.Informer(),
 		podsLister:                  podsInformer.Lister(),
 		podsInformer:                podsInformer.Informer(),
 		scalerMap:                   make(map[string]*autoscaler.Autoscaler),

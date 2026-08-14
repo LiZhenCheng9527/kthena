@@ -10,7 +10,7 @@ spec:
     cacheURI: "hostpath://tmp/cache"
     replicas: 1
     env:
-      - name: "HF_ENDPOINT" # Use Hugging Face directly
+      - name: "HF_ENDPOINT" # Optional: set to https://hf-mirror.com if you have network issues
         value: "https://huggingface.co"
     workers:
       - type: "server"

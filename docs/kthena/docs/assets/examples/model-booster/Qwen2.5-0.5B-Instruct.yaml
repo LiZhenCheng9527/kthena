@@ -7,11 +7,11 @@ spec:
     name: "backend1"
     type: "vLLM"
     modelURI: "hf://Qwen/Qwen2.5-0.5B-Instruct"
-    cacheURI: "hostpath:///tmp/cache"
+    cacheURI: "hostpath://tmp/cache"
     replicas: 1
     env:
-      - name: "HF_ENDPOINT" # Optional: Use a Hugging Face mirror if you have network issues
-        value: "https://hf-mirror.com"
+      - name: "HF_ENDPOINT" # Optional: set to https://hf-mirror.com if you have network issues
+        value: "https://huggingface.co"
     workers:
       - type: "server"
         image: "vllm/vllm-openai-cpu:latest" # This model will run on CPU, for more details visit https://docs.vllm.ai/en/stable/getting_started/installation/cpu.html#pre-built-images

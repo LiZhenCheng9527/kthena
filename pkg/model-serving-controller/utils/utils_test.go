@@ -310,6 +310,43 @@ func TestGetMaxUnavailable(t *testing.T) {
 	}
 }
 
+func TestGetMaxSurge(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int32
+		maxSurge *intstr.IntOrString
+		want     int
+		wantErr  bool
+	}{
+		{name: "defaults to zero", replicas: 5, want: 0},
+		{name: "absolute value", replicas: 5, maxSurge: ptr.To(intstr.FromInt(2)), want: 2},
+		{name: "percentage rounds up", replicas: 5, maxSurge: ptr.To(intstr.FromString("25%")), want: 2},
+		{name: "zero percent", replicas: 5, maxSurge: ptr.To(intstr.FromString("0%")), want: 0},
+		{name: "invalid percentage", replicas: 5, maxSurge: ptr.To(intstr.FromString("invalid")), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ms := &workloadv1alpha1.ModelServing{
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: &tt.replicas,
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+						Type:                       workloadv1alpha1.ServingGroupRollingUpdate,
+						RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{MaxSurge: tt.maxSurge},
+					},
+				},
+			}
+			got, err := GetMaxSurge(ms)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestGetMaxUnavailableForRole(t *testing.T) {
 	tests := []struct {
 		name           string

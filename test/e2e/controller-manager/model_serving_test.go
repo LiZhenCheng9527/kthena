@@ -783,6 +783,51 @@ func TestModelServingRollingUpdateMaxUnavailable(t *testing.T) {
 	t.Log("ModelServing rolling update maxUnavailable test passed successfully")
 }
 
+func TestModelServingRollingUpdateMaxSurge(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	replicas := int32(4)
+	modelServing := createBasicModelServing("test-rolling-update-maxsurge", replicas, 1)
+	modelServing.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt(0))
+	modelServing.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge = ptr.To(intstr.FromInt(1))
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+
+	initial, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	initialRevision := initial.Status.CurrentRevision
+	require.NotEmpty(t, initialRevision)
+
+	updated := initial.DeepCopy()
+	updated.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updated, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	// Verify that one additional Running ServingGroup becomes available while
+	// old and new revisions coexist. Ordinals do not identify surge capacity:
+	// binpack scale-down may leave any ordinal in the final replica set.
+	require.Eventually(t, func() bool {
+		states, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
+		if err != nil || len(states) > int(replicas+1) {
+			return false
+		}
+		if len(states) != int(replicas+1) {
+			return false
+		}
+		hasOld, hasNew := false, false
+		for _, state := range states {
+			hasOld = hasOld || state.Revision == initialRevision
+			hasNew = hasNew || (state.Revision != initialRevision && state.Image == nginxAlpineImage)
+		}
+		return hasOld && hasNew
+	}, 2*time.Minute, time.Second, "expected maxSurge capacity while old and new ServingGroups coexist")
+
+	finalMS := waitForRollingUpdateConverged(t, ctx, kthenaClient, kubeClient, modelServing.Name, replicas, initialRevision, nginxAlpineImage)
+	assert.Equal(t, replicas, finalMS.Status.Replicas)
+	assert.Equal(t, replicas, finalMS.Status.AvailableReplicas)
+	assert.Equal(t, replicas, finalMS.Status.UpdatedReplicas)
+	assert.Equal(t, finalMS.Status.UpdateRevision, finalMS.Status.CurrentRevision)
+}
+
 // TestModelServingRoleStatusEvents verifies that role status transitions are surfaced via Kubernetes Events.
 func TestModelServingRoleStatusEvents(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)

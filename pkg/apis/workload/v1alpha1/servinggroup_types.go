@@ -79,8 +79,9 @@ type Role struct {
 	WorkerTemplate *PodTemplateSpec `json:"workerTemplate,omitempty"`
 
 	// RollingUpdateConfiguration defines the parameters to be used for RoleRollingUpdate.
-	// It is inlined so `maxUnavailable` and `partition` can be set directly under a Role.
+	// It is inlined so rolling update fields can be set directly under a Role.
 	// These fields do not take effect when ModelServing uses ServingGroupRollingUpdate.
+	// Role-level maxSurge is not supported yet.
 	// +optional
 	RollingUpdateConfiguration `json:",inline,omitempty"`
 }

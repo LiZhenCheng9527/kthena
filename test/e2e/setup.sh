@@ -36,11 +36,17 @@ kubectl wait --for=condition=Ready nodes --all --timeout=300s
 echo "Start to build Docker images"
 make docker-build-all HUB=${HUB} TAG=${TAG}
 
+echo "Download nginx image for testing"
+docker pull nginx:alpine
+docker pull nginx:1.28.2
+
 echo "Loading Docker images into Kind cluster"
 kind load docker-image ${HUB}/kthena-router:${TAG} --name "${CLUSTER_NAME}"
 kind load docker-image ${HUB}/kthena-controller-manager:${TAG} --name "${CLUSTER_NAME}"
 kind load docker-image ${HUB}/downloader:${TAG} --name "${CLUSTER_NAME}"
 kind load docker-image ${HUB}/runtime:${TAG} --name "${CLUSTER_NAME}"
+kind load docker-image nginx:alpine --name "${CLUSTER_NAME}"
+kind load docker-image nginx:1.28.2 --name "${CLUSTER_NAME}"
 
 echo "Start to install cert-manager"
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.2/cert-manager.yaml

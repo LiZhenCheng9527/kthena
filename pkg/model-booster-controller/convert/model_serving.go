@@ -223,13 +223,6 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 	if workersMap[workload.ModelWorkerTypeServer] == nil {
 		return nil, fmt.Errorf("server worker not found in backend: %s", backend.Name)
 	}
-	// Pods is the total pod count for the server role (1 leader + N-1 Ray workers), so a
-	// role can never meaningfully have zero pods. Because Pods is a plain int32, an omitted
-	// value is indistinguishable from an explicit 0, so both are treated as the documented
-	// single-pod baseline to avoid computing a negative WORKER_REPLICAS below.
-	if serverWorker := workersMap[workload.ModelWorkerTypeServer]; serverWorker.Pods < 1 {
-		serverWorker.Pods = 1
-	}
 	enginePort, err := utils.GetEnginePort(backend)
 	if err != nil {
 		return nil, err
@@ -341,11 +334,14 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 		"ENGINE_SERVER_RESOURCES":            workersMap[workload.ModelWorkerTypeServer].Resources,
 		"ENGINE_SERVER_IMAGE":                workersMap[workload.ModelWorkerTypeServer].Image,
 		"ENGINE_SERVER_COMMAND":              commands,
-		"WORKER_REPLICAS":                    workersMap[workload.ModelWorkerTypeServer].Pods - 1,
-		"SCHEDULER_NAME":                     backend.SchedulerName,
-		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
-		"SERVER_AFFINITY":                    workersMap[workload.ModelWorkerTypeServer].Affinity,
-		"SERVER_TOLERATIONS":                 workersMap[workload.ModelWorkerTypeServer].Tolerations,
+		// Pods has no schema default (Minimum is 0), so an omitted or explicit-zero value
+		// decodes to 0. Clamp to 1 here so WORKER_REPLICAS is never negative; buildCommands'
+		// only Pods-dependent branch is guarded by "> 1", so it behaves the same either way.
+		"WORKER_REPLICAS":    max(workersMap[workload.ModelWorkerTypeServer].Pods, 1) - 1,
+		"SCHEDULER_NAME":     backend.SchedulerName,
+		"RUNTIME_CLASS_NAME": backend.RuntimeClassName,
+		"SERVER_AFFINITY":    workersMap[workload.ModelWorkerTypeServer].Affinity,
+		"SERVER_TOLERATIONS": workersMap[workload.ModelWorkerTypeServer].Tolerations,
 	}
 	return loadModelServingTemplate(VllmTemplatePath, &data)
 }

@@ -373,19 +373,36 @@ func TestCreateModelServingResources(t *testing.T) {
 	}
 }
 
-// TestBuildModelServingWorkerPodsToWorkerReplicas covers the regression from #1612: an
-// omitted (or explicit zero) workers[].pods must not produce a negative workerReplicas.
-// Pods is a plain int32, so an omitted field and an explicit `pods: 0` are indistinguishable
-// on the wire; both are exercised here to demonstrate they intentionally resolve to the same
-// single-pod baseline (workerReplicas: 0) rather than diverging.
+// TestBuildModelServingWorkerPodsOmitted covers the regression from #1612 using a fixture
+// whose worker block has no `pods` key at all, so YAML unmarshalling naturally zeroes the
+// field (rather than a test setting Workers[0].Pods = 0 directly on an already-loaded
+// object). This is the actual shape of the reported bug: a ModelBooster manifest that never
+// mentions pods must still produce a valid (non-negative) workerReplicas.
+func TestBuildModelServingWorkerPodsOmitted(t *testing.T) {
+	model := loadYaml[workload.ModelBooster](t, "testdata/input/model-with-pods-omitted.yaml")
+	require.Equal(t, int32(0), model.Spec.Backend.Workers[0].Pods,
+		"fixture must omit pods so unmarshalling produces the zero value naturally")
+
+	got, err := BuildModelServing(model)
+	require.NoError(t, err)
+	require.Len(t, got.Spec.Template.Roles, 1)
+
+	workerReplicas := got.Spec.Template.Roles[0].WorkerReplicas
+	assert.GreaterOrEqual(t, workerReplicas, int32(0), "workerReplicas must never be negative")
+	assert.Equal(t, int32(0), workerReplicas)
+}
+
+// TestBuildModelServingWorkerPodsToWorkerReplicas covers the workerReplicas calculation for
+// explicit pods values: an explicit zero (distinct from the omitted-field fixture above,
+// which exercises the same zero value reached through YAML unmarshalling instead of direct
+// assignment), the single-pod baseline, and a multi-node value.
 func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
 	tests := []struct {
 		name               string
 		pods               int32
 		wantWorkerReplicas int32
 	}{
-		{name: "pods omitted defaults to a single pod", pods: 0, wantWorkerReplicas: 0},
-		{name: "pods: 0 behaves the same as omitted", pods: 0, wantWorkerReplicas: 0},
+		{name: "pods: 0 explicit", pods: 0, wantWorkerReplicas: 0},
 		{name: "pods: 1 is a single pod with no extra workers", pods: 1, wantWorkerReplicas: 0},
 		{name: "pods > 1 adds Ray workers", pods: 3, wantWorkerReplicas: 2},
 	}

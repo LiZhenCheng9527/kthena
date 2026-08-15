@@ -595,9 +595,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	}
 
 	upstreamModelForMetrics := modelName
-	if modelServer == nil {
-		upstreamModelForMetrics = metrics.DestinationLabelValueNone
-	} else if modelServer.Spec.Model != nil && !isLora {
+	if modelServer != nil && modelServer.Spec.Model != nil && !isLora {
 		upstreamModelForMetrics = *modelServer.Spec.Model
 	}
 

@@ -859,7 +859,7 @@ func TestRouter_HandlerFunc_InferencePoolAccessLogDestination(t *testing.T) {
 		metrics.DestinationLabelValueNone,
 		metrics.BackendTypeInferencePool,
 		"default/pool",
-		metrics.DestinationLabelValueNone,
+		"pool-model",
 	}
 	activeBefore := externalGaugeValue(t, &router.metrics.ActiveUpstreamRequests, activeLabels...)
 	done := make(chan struct{})
@@ -886,7 +886,7 @@ func TestRouter_HandlerFunc_InferencePoolAccessLogDestination(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, metrics.BackendTypeInferencePool, accessCtx.BackendType)
 	assert.Equal(t, "default/pool", accessCtx.BackendName)
-	assert.Equal(t, metrics.DestinationLabelValueNone, accessCtx.UpstreamModel)
+	assert.Equal(t, "pool-model", accessCtx.UpstreamModel)
 	assert.Equal(t, 1, accessCtx.UpstreamAttempts)
 	assert.Equal(t, http.StatusOK, accessCtx.UpstreamStatusCode)
 	assert.Equal(t, activeBefore, externalGaugeValue(t, &router.metrics.ActiveUpstreamRequests, activeLabels...))

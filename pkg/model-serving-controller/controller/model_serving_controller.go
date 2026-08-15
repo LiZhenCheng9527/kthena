@@ -1895,6 +1895,12 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	return true, nil
 }
 
+// rolesForServingGroupReadiness returns the Role templates that should be used
+// to evaluate the readiness of a ServingGroup. RoleRollingUpdate always uses
+// the current templates because Roles are updated independently. During a
+// ServingGroupRollingUpdate, a partition-protected ServingGroup may still run
+// an older revision whose replica counts and pod layout differ from the current
+// spec, so its templates are loaded from the corresponding ControllerRevision.
 func (c *ModelServingController) rolesForServingGroupReadiness(ms *workloadv1alpha1.ModelServing, servingGroupName string) ([]workloadv1alpha1.Role, error) {
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate {
 		return ms.Spec.Template.Roles, nil

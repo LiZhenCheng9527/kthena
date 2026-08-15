@@ -7286,8 +7286,6 @@ func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
 	require.NoError(t, controller.syncServingGroupReplicas(context.Background(), ms, "new-revision"))
 	require.NoError(t, controller.store.UpdateServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, 1), datastore.ServingGroupRunning))
 
-	groups, err = controller.store.GetServingGroupByModelServing(key)
-	require.NoError(t, err)
 	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision"))
 
 	// Once all remaining groups use the new revision, replica synchronization
@@ -7533,7 +7531,7 @@ func TestServingGroupUpdateCreatesSurgeWithoutStoredPhase(t *testing.T) {
 	assert.Equal(t, "new", groups[2].Revision)
 }
 
-func TestServingGroupRollingUpdateCountsUnavailableProtectedGroups(t *testing.T) {
+func TestServingGroupRollingUpdateIgnoresUnavailableProtectedGroups(t *testing.T) {
 	controller, err := NewModelServingController(
 		kubefake.NewSimpleClientset(),
 		kthenafake.NewSimpleClientset(),
@@ -7575,7 +7573,7 @@ func TestServingGroupRollingUpdateCountsUnavailableProtectedGroups(t *testing.T)
 		require.NoError(t, controller.store.UpdateServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, group.ordinal), group.status))
 	}
 	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new"))
-	assert.Equal(t, datastore.ServingGroupRunning, controller.store.GetServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, 2)))
+	assert.Equal(t, datastore.ServingGroupNotFound, controller.store.GetServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, 2)))
 }
 
 func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {

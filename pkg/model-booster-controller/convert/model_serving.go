@@ -223,6 +223,13 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 	if workersMap[workload.ModelWorkerTypeServer] == nil {
 		return nil, fmt.Errorf("server worker not found in backend: %s", backend.Name)
 	}
+	// Pods is the total pod count for the server role (1 leader + N-1 Ray workers), so a
+	// role can never meaningfully have zero pods. Because Pods is a plain int32, an omitted
+	// value is indistinguishable from an explicit 0, so both are treated as the documented
+	// single-pod baseline to avoid computing a negative WORKER_REPLICAS below.
+	if serverWorker := workersMap[workload.ModelWorkerTypeServer]; serverWorker.Pods < 1 {
+		serverWorker.Pods = 1
+	}
 	enginePort, err := utils.GetEnginePort(backend)
 	if err != nil {
 		return nil, err

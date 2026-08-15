@@ -373,6 +373,38 @@ func TestCreateModelServingResources(t *testing.T) {
 	}
 }
 
+// TestBuildModelServingWorkerPodsToWorkerReplicas covers the regression from #1612: an
+// omitted (or explicit zero) workers[].pods must not produce a negative workerReplicas.
+// Pods is a plain int32, so an omitted field and an explicit `pods: 0` are indistinguishable
+// on the wire; both are exercised here to demonstrate they intentionally resolve to the same
+// single-pod baseline (workerReplicas: 0) rather than diverging.
+func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
+	tests := []struct {
+		name               string
+		pods               int32
+		wantWorkerReplicas int32
+	}{
+		{name: "pods omitted defaults to a single pod", pods: 0, wantWorkerReplicas: 0},
+		{name: "pods: 0 behaves the same as omitted", pods: 0, wantWorkerReplicas: 0},
+		{name: "pods: 1 is a single pod with no extra workers", pods: 1, wantWorkerReplicas: 0},
+		{name: "pods > 1 adds Ray workers", pods: 3, wantWorkerReplicas: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := loadYaml[workload.ModelBooster](t, "testdata/input/model.yaml")
+			model.Spec.Backend.Workers[0].Pods = tt.pods
+
+			got, err := BuildModelServing(model)
+			require.NoError(t, err)
+			require.Len(t, got.Spec.Template.Roles, 1)
+
+			workerReplicas := got.Spec.Template.Roles[0].WorkerReplicas
+			assert.GreaterOrEqual(t, workerReplicas, int32(0), "workerReplicas must never be negative")
+			assert.Equal(t, tt.wantWorkerReplicas, workerReplicas)
+		})
+	}
+}
+
 func TestBuildModelServingVLLMPreStopHandlesUnavailableMetrics(t *testing.T) {
 	model := loadYaml[workload.ModelBooster](t, "testdata/input/model.yaml")
 	serving, err := BuildModelServing(model)

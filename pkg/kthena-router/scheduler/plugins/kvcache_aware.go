@@ -69,6 +69,7 @@ const (
 
 	// defaultSGLangTokenizerPort is the upstream-default port for sglang
 	defaultSGLangTokenizerPort = 30000
+	maxTokenizerPort           = 65535
 
 	// kvCacheFieldFreshDuration matches the runtime mapping key expiry
 	kvCacheFieldFreshDuration = 24 * time.Hour
@@ -142,14 +143,8 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 		maxBlocksToMatch = defaultMaxBlocksToMatch
 	}
 
-	vllmPort := args.VLLMTokenizerPort
-	if vllmPort <= 0 {
-		vllmPort = defaultVLLMTokenizerPort
-	}
-	sglangPort := args.SGLangTokenizerPort
-	if sglangPort <= 0 {
-		sglangPort = defaultSGLangTokenizerPort
-	}
+	vllmPort := normalizeTokenizerPort(tokenization.EngineVLLM, args.VLLMTokenizerPort, defaultVLLMTokenizerPort)
+	sglangPort := normalizeTokenizerPort(tokenization.EngineSGLang, args.SGLangTokenizerPort, defaultSGLangTokenizerPort)
 
 	klog.Infof("KVCacheAware: config blockSizeToHash=%d, maxBlocksToMatch=%d, vllmTokenizerPort=%d, sglangTokenizerPort=%d",
 		blockSizeToHash, maxBlocksToMatch, vllmPort, sglangPort)
@@ -179,6 +174,17 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 	}
 	plugin.startGC()
 	return plugin
+}
+
+func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {
+	if configuredPort == 0 {
+		return defaultPort
+	}
+	if configuredPort < 1 || configuredPort > maxTokenizerPort {
+		klog.Warningf("KVCacheAware: invalid %s tokenizer port %d, using default %d", engine, configuredPort, defaultPort)
+		return defaultPort
+	}
+	return configuredPort
 }
 
 func (t *KVCacheAware) Name() string {

@@ -625,6 +625,29 @@ func TestNewKVCacheAware_Core(t *testing.T) {
 	}
 }
 
+func TestNormalizeTokenizerPort(t *testing.T) {
+	tests := []struct {
+		name           string
+		configuredPort int
+		defaultPort    int
+		want           int
+	}{
+		{name: "unset uses default", configuredPort: 0, defaultPort: 8000, want: 8000},
+		{name: "negative uses default", configuredPort: -1, defaultPort: 8000, want: 8000},
+		{name: "minimum is accepted", configuredPort: 1, defaultPort: 8000, want: 1},
+		{name: "maximum is accepted", configuredPort: 65535, defaultPort: 8000, want: 65535},
+		{name: "above maximum uses default", configuredPort: 65536, defaultPort: 8000, want: 8000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeTokenizerPort(tokenization.EngineVLLM, tt.configuredPort, tt.defaultPort); got != tt.want {
+				t.Fatalf("normalizeTokenizerPort() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestKVCacheAware_Score_Core(t *testing.T) {
 	pods := createTestPods("pod1", "pod2", "pod3")
 

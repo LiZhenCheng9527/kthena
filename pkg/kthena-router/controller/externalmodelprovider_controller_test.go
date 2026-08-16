@@ -319,6 +319,44 @@ func TestExternalModelProviderController_StatusForCredentials(t *testing.T) {
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonReady)
 	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonCredentialResolved)
 
+	secretWithWhitespaceOnlyKey := secret.DeepCopy()
+	secretWithWhitespaceOnlyKey.Data = map[string][]byte{
+		"api-key": []byte(" \t\r\n"),
+	}
+	_, err = kubeClient.CoreV1().Secrets("default").Update(context.Background(), secretWithWhitespaceOnlyKey, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+	found = waitForObjectInCache(t, 2*time.Second, func() bool {
+		got, err := controller.secretLister.Secrets("default").Get("provider-secret")
+		return err == nil && string(got.Data["api-key"]) == " \t\r\n"
+	})
+	assert.True(t, found, "Secret update should be reflected in cache")
+
+	err = controller.syncSecretHandler("default/provider-secret")
+	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
+	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialInvalid)
+	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionFalse, aiv1alpha1.ExternalModelProviderReasonCredentialInvalid)
+
+	secretWithTrailingNewline := secret.DeepCopy()
+	secretWithTrailingNewline.Data = map[string][]byte{
+		"api-key": []byte("test-key\n"),
+	}
+	_, err = kubeClient.CoreV1().Secrets("default").Update(context.Background(), secretWithTrailingNewline, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+	found = waitForObjectInCache(t, 2*time.Second, func() bool {
+		got, err := controller.secretLister.Secrets("default").Get("provider-secret")
+		return err == nil && string(got.Data["api-key"]) == "test-key\n"
+	})
+	assert.True(t, found, "Secret update should be reflected in cache")
+
+	err = controller.syncSecretHandler("default/provider-secret")
+	assert.NoError(t, err)
+	err = controller.syncHandler("default/openai-provider")
+	assert.NoError(t, err)
+	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionReady, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonReady)
+	assertProviderCondition(t, kthenaClient, "default", "openai-provider", aiv1alpha1.ExternalModelProviderConditionCredentialsResolved, metav1.ConditionTrue, aiv1alpha1.ExternalModelProviderReasonCredentialResolved)
+
 	secretWithoutKey := secret.DeepCopy()
 	secretWithoutKey.Data = map[string][]byte{
 		"other-key": []byte("test-key"),

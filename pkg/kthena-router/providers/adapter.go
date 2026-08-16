@@ -256,7 +256,22 @@ func providerToken(provider *networkingv1alpha1.ExternalModelProvider, secret *c
 	if !ok || len(value) == 0 {
 		return "", newConfigurationError("secret key %s is not found", key)
 	}
-	return string(value), nil
+	return NormalizeCredential(value)
+}
+
+// NormalizeCredential removes surrounding whitespace commonly introduced by
+// Secret creation workflows and validates that the result is safe to place in
+// an HTTP header. Callers should use this for both status validation and
+// request construction so they agree on whether a credential is usable.
+func NormalizeCredential(value []byte) (string, error) {
+	token := strings.TrimSpace(string(value))
+	if token == "" {
+		return "", newConfigurationError("provider credential is empty after trimming whitespace")
+	}
+	if !httpguts.ValidHeaderFieldValue(token) {
+		return "", newConfigurationError("provider credential contains invalid HTTP header characters")
+	}
+	return token, nil
 }
 
 func applyProviderAuth(headers http.Header, provider *networkingv1alpha1.ExternalModelProvider, secret *corev1.Secret, defaultScheme networkingv1alpha1.ProviderAuthScheme) error {

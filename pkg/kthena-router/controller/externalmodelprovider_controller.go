@@ -367,6 +367,10 @@ func (c *ExternalModelProviderController) reconcileProviderStatus(provider *netw
 			credentialCondition.Status = metav1.ConditionFalse
 			credentialCondition.Reason = networkingv1alpha1.ExternalModelProviderReasonCredentialKeyNotFound
 			credentialCondition.Message = "Credential Secret key is not found"
+		} else if _, err := providers.NormalizeCredential(value); err != nil {
+			credentialCondition.Status = metav1.ConditionFalse
+			credentialCondition.Reason = networkingv1alpha1.ExternalModelProviderReasonCredentialInvalid
+			credentialCondition.Message = err.Error()
 		}
 	}
 

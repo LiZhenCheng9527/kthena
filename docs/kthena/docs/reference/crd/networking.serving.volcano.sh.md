@@ -335,7 +335,7 @@ _Appears in:_
 | `model` _string_ | The real model that the modelServers are running.<br />If the `model` in LLM inference request is different from this field, it should be overwritten by this field.<br />Otherwise, the `model` in LLM inference request will not be mutated. |  | MaxLength: 256 <br /> |
 | `inferenceEngine` _[InferenceEngine](#inferenceengine)_ | The inference engine used to serve the model. |  | Enum: [vLLM SGLang] <br />Required: \{\} <br /> |
 | `workloadSelector` _[WorkloadSelector](#workloadselector)_ | WorkloadSelector is used to match the model serving instances.<br />Currently, they must be pods within the same namespace as modelServer object. |  | Required: \{\} <br /> |
-| `workloadPort` _[WorkloadPort](#workloadport)_ | WorkloadPort defines the port and protocol configuration for the model server. |  |  |
+| `workloadPort` _[WorkloadPort](#workloadport)_ | WorkloadPort defines the port and protocol configuration for the model server. |  | Required: \{\} <br /> |
 | `trafficPolicy` _[TrafficPolicy](#trafficpolicy)_ | Traffic Policy for accessing the model server instance. |  |  |
 | `kvConnector` _[KVConnectorSpec](#kvconnectorspec)_ | KVConnector specifies the KV connector configuration for PD disaggregated routing |  |  |
 

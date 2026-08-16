@@ -1453,6 +1453,14 @@ func (r *Router) proxyToPDDisaggregated(
 
 // handleFairnessScheduling handles the fairness scheduling flow for requests.
 func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
+	// Reject unregistered models before Enqueue can spawn a model-specific queue
+	// and goroutine for them; queue cleanup is tied to the ModelRoute lifecycle,
+	// so a name with no ModelRoute would otherwise leak both indefinitely.
+	if !r.store.HasModel(modelName) {
+		c.AbortWithStatusJSON(http.StatusNotFound, "route not found")
+		return fmt.Errorf("route not found")
+	}
+
 	// Extract session ID from HTTP header for multi-turn conversation tracking.
 	sessionHeader := r.store.GetSessionIDHeader()
 	var sessionID string

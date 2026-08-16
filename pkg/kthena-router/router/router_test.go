@@ -2878,6 +2878,79 @@ func TestUpstreamTimeoutFor(t *testing.T) {
 	}
 }
 
+// enqueueSpyStore wraps a real Store and records whether Enqueue was invoked.
+// Enqueue is the sole place that creates a model-specific waiting queue and its
+// dequeue goroutine (on first use for a given model name), so asserting it was
+// never called is proof that no queue/goroutine was created for that request.
+type enqueueSpyStore struct {
+	datastore.Store
+	enqueued atomic.Bool
+}
+
+func (s *enqueueSpyStore) Enqueue(req *datastore.Request) error {
+	s.enqueued.Store(true)
+	return s.Store.Enqueue(req)
+}
+
+// TestHandleFairnessScheduling_UnknownModel covers the shared validation path
+// used by both ENABLE_FAIRNESS_SCHEDULING and ENABLE_SESSION_BOOST: a request
+// for a model with no registered ModelRoute must be rejected before it can
+// reach store.Enqueue, since Enqueue unconditionally creates a per-model queue
+// and goroutine keyed by the (client-supplied) model name, and that queue is
+// never cleaned up because cleanup is tied to the ModelRoute lifecycle.
+func TestHandleFairnessScheduling_UnknownModel(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableSessionBoost bool
+	}{
+		{name: "fairness mode"},
+		{name: "session boost mode", enableSessionBoost: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupFairnessTestRouter(t, nil)
+			defer backend.Close()
+
+			prevEnableSessionBoost := EnableSessionBoost
+			EnableSessionBoost = tt.enableSessionBoost
+			defer func() { EnableSessionBoost = prevEnableSessionBoost }()
+
+			spy := &enqueueSpyStore{Store: store}
+			router.store = spy
+			router.queueTimeout = 5 * time.Second
+
+			ctx, cancel := context.WithCancel(context.Background())
+			router.store.Run(ctx)
+			defer cancel()
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			reqBody := `{"model":"never-registered-model","prompt":"hello"}`
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			modelRequest, err := ParseModelRequest(c)
+			assert.NoError(t, err)
+			prompt, perr := utils.ParsePrompt(modelRequest)
+			assert.NoError(t, perr)
+			c.Set(PromptKey, prompt)
+			c.Set("metricsRecorder", metrics.NewRequestMetricsRecorder(router.metrics, "never-registered-model", "/v1/chat/completions"))
+
+			err = router.handleFairnessScheduling(c, modelRequest, "req-unknown", "never-registered-model")
+
+			assert.Error(t, err)
+			assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Contains(t, w.Body.String(), "route not found")
+			assert.False(t, spy.enqueued.Load(), "unknown model must be rejected before reaching Enqueue")
+
+			for _, stat := range store.GetRequestWaitingQueueStats() {
+				assert.NotEqual(t, "never-registered-model", stat.Model, "no queue should be created for an unregistered model")
+			}
+		})
+	}
+}
+
 // A backend that accepts the connection but never completes it must fail at the
 // configured timeout, which ResponseHeaderTimeout alone would not have bounded.
 func TestDoRequestBoundsConnectionSetup(t *testing.T) {
@@ -2995,4 +3068,51 @@ func TestDoRequestTimeoutDoesNotTruncateSlowStream(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err, "a slow stream must not be cut off by the header timeout")
 	assert.Contains(t, string(body), "chunk-5", "the whole stream should arrive")
+}
+
+// TestRouter_HandlerFunc_UnknownModel_QueueSchedulingRejectsBeforeQueueing is an
+// integration-style check that the same protection holds through the full
+// HandlerFunc entry point (HTTP request -> handleFairnessScheduling -> Enqueue)
+// for both scheduling strategies, matching the existing (non-queued) unknown
+// model behavior asserted by TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel.
+func TestRouter_HandlerFunc_UnknownModel_QueueSchedulingRejectsBeforeQueueing(t *testing.T) {
+	tests := []struct {
+		name                     string
+		enableFairnessScheduling bool
+		enableSessionBoost       bool
+	}{
+		{name: "fairness scheduling enabled", enableFairnessScheduling: true},
+		{name: "session boost enabled", enableSessionBoost: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupTestRouter(t, nil)
+			defer backend.Close()
+
+			prevEnableFairnessScheduling := EnableFairnessScheduling
+			prevEnableSessionBoost := EnableSessionBoost
+			EnableFairnessScheduling = tt.enableFairnessScheduling
+			EnableSessionBoost = tt.enableSessionBoost
+			defer func() {
+				EnableFairnessScheduling = prevEnableFairnessScheduling
+				EnableSessionBoost = prevEnableSessionBoost
+			}()
+
+			spy := &enqueueSpyStore{Store: store}
+			router.store = spy
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			reqBody := `{"model":"never-registered-model","prompt":"hello"}`
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Contains(t, w.Body.String(), "route not found")
+			assert.False(t, spy.enqueued.Load(), "unknown model must be rejected before reaching Enqueue")
+		})
+	}
 }

@@ -177,14 +177,13 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 }
 
 func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {
-	if configuredPort == 0 {
-		return defaultPort
+	if configuredPort >= 1 && configuredPort <= maxTokenizerPort {
+		return configuredPort
 	}
-	if configuredPort < 1 || configuredPort > maxTokenizerPort {
+	if configuredPort != 0 {
 		klog.Warningf("KVCacheAware: invalid %s tokenizer port %d, using default %d", engine, configuredPort, defaultPort)
-		return defaultPort
 	}
-	return configuredPort
+	return defaultPort
 }
 
 func (t *KVCacheAware) Name() string {

@@ -210,28 +210,44 @@ func runGetTemplate(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
-func getKthenaClient() (*versioned.Clientset, error) {
-	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+// getKthenaClient builds a kthena clientset and also returns the namespace
+// from the current kubeconfig context so callers can fall back to it when
+// the user hasn't passed -n/--namespace explicitly.
+func getKthenaClient() (client *versioned.Clientset, contextNamespace string, err error) {
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: clientcmd.RecommendedHomeFile}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
+
+	restConfig, err := kubeConfig.ClientConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load kubeconfig: %v", err)
+		return nil, "", fmt.Errorf("failed to load kubeconfig: %v", err)
 	}
 
-	client, err := versioned.NewForConfig(config)
+	client, err = versioned.NewForConfig(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create kthena client: %v", err)
+		return nil, "", fmt.Errorf("failed to create kthena client: %v", err)
 	}
 
-	return client, nil
+	// Namespace() falls back to "default" itself if the context has none set
+	// so contextNamespace is always non empty on success
+	contextNamespace, _, err = kubeConfig.Namespace()
+	if err != nil {
+		contextNamespace = "default"
+	}
+
+	return client, contextNamespace, nil
 }
 
-func resolveGetNamespace() string {
+// resolveGetNamespace picks the effective namespace with kubectl's usual
+// precedence: --all-namespaces wins outright, then an explicit -n/--namespace
+// flag, then the current kubeconfig context's namespace.
+func resolveGetNamespace(contextNamespace string) string {
 	if getAllNamespaces {
 		return ""
 	}
 	if getNamespace != "" {
 		return getNamespace
 	}
-	return "default"
+	return contextNamespace
 }
 
 // getModelServingStatus derives a human-readable status from ModelServing conditions.
@@ -275,12 +291,12 @@ func getModelBoosterStatus(conditions []metav1.Condition) string {
 }
 
 func runGetModelBoosters(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	models, err := client.WorkloadV1alpha1().ModelBoosters(namespace).List(ctx, metav1.ListOptions{})
@@ -340,12 +356,12 @@ func runGetModelBoosters(cmd *cobra.Command, args []string) error {
 }
 
 func runGetModelServings(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	modelServingList, err := client.WorkloadV1alpha1().ModelServings(namespace).List(ctx, metav1.ListOptions{})
@@ -385,12 +401,12 @@ func runGetModelServings(cmd *cobra.Command, args []string) error {
 }
 
 func runGetAutoscalingPolicies(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	policies, err := client.WorkloadV1alpha1().AutoscalingPolicies(namespace).List(ctx, metav1.ListOptions{})
@@ -445,12 +461,12 @@ var getModelServersCmd = &cobra.Command{
 }
 
 func runGetModelRoutes(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	routes, err := client.NetworkingV1alpha1().ModelRoutes(namespace).List(ctx, metav1.ListOptions{})
@@ -496,12 +512,12 @@ func runGetModelRoutes(cmd *cobra.Command, args []string) error {
 }
 
 func runGetModelServers(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	servers, err := client.NetworkingV1alpha1().ModelServers(namespace).List(ctx, metav1.ListOptions{})

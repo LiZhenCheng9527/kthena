@@ -52,15 +52,32 @@ been exercised.
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
-| `kthena_router_requests_total` | Counter | `model`, `path`, `status_code`, `error_type` | Completed HTTP requests |
-| `kthena_router_request_duration_seconds` | Histogram | `model`, `path`, `status_code` | End-to-end request latency |
+| `kthena_router_requests_total` | Counter | `model`, `path`, `status_code`, `error_type`, `model_route`, `backend_type`, `backend_name`, `upstream_model` | Completed HTTP requests |
+| `kthena_router_request_duration_seconds` | Histogram | `model`, `path`, `status_code`, `model_route`, `backend_type`, `backend_name`, `upstream_model` | End-to-end request latency |
 | `kthena_router_request_prefill_duration_seconds` | Histogram | `model`, `path`, `status_code` | Prefill latency for prefill/decode-disaggregated requests |
 | `kthena_router_request_decode_duration_seconds` | Histogram | `model`, `path`, `status_code` | Decode latency for prefill/decode-disaggregated requests |
-| `kthena_router_tokens_total` | Counter | `model`, `path`, `token_type` | Input or output tokens; `token_type` is `input` or `output` |
+| `kthena_router_tokens_total` | Counter | `model`, `path`, `token_type`, `model_route`, `backend_type`, `backend_name`, `upstream_model` | Input or output tokens; `token_type` is `input` or `output` |
 | `kthena_router_rate_limit_exceeded_total` | Counter | `model`, `limit_type`, `path` | Requests rejected by input-token, output-token, or request rate limits |
 | `kthena_router_active_requests` | Gauge | none | All requests currently handled by this router process |
 | `kthena_router_active_downstream_requests` | Gauge | `model` | Active client-to-router requests |
-| `kthena_router_active_upstream_requests` | Gauge | `model_server`, `model_route` | Active router-to-backend requests |
+| `kthena_router_active_upstream_requests` | Gauge | `model_server`, `model_route`, `backend_type`, `backend_name`, `upstream_model` | Active router-to-backend requests |
+
+Input token values come from the Router's pre-dispatch tokenizer and are also
+used for input rate limiting. Output token values use upstream-reported usage
+when it is available. For external providers, the input value may differ from
+billing usage because tokenizers, system prompts, and cache accounting vary by
+provider.
+
+Destination labels use values from resolved routing configuration:
+
+- `backend_type` is `model_server`, `external_provider`, `inference_pool`,
+  `unresolved`, or `none`.
+- `model_route` and `backend_name` use `namespace/name`; `none` means the label
+  does not apply.
+- `upstream_model` is the model sent to the backend. Without a backend override,
+  it is the requested model. LoRA requests use the matched adapter name.
+- `model_server` remains on `kthena_router_active_upstream_requests` for
+  compatibility and is `none` for other backend types.
 
 ### Scheduler and user-fairness queue
 
@@ -78,6 +95,30 @@ been exercised.
 Raw user identifiers are deliberately not exported. The `user_id` label is
 fixed to `_all`, keeping cardinality bounded and avoiding exposure of user
 identity through the metrics endpoint.
+
+### Metric schema migration
+
+This release adds `model_route`, `backend_type`, `backend_name`, and
+`upstream_model` to the existing request, request-duration, and token metrics.
+It also adds destination labels to
+`kthena_router_active_upstream_requests`. The metric names are unchanged, but
+the label sets are not. Prometheus therefore starts new time series after the
+Router upgrade; old counter series do not continue under the new labels.
+
+Update dashboards, alerts, recording rules, and tests that match an exact label
+set. To reproduce the previous aggregate view, sum over the destination labels:
+
+```promql
+sum by (model, path, status_code, error_type) (
+  rate(kthena_router_requests_total[5m])
+)
+```
+
+The label values come from Kubernetes objects and fixed enums, not request IDs,
+URLs, Secret names, or error text. Cardinality still grows with the product of
+ModelRoutes, backends, upstream models, paths, status codes, and error types.
+Estimate those combinations before upgrading, especially for clusters with many
+routes or long Prometheus retention.
 
 ### Tokenizer and cache-aware scheduling
 
@@ -156,6 +197,11 @@ The JSON field names below match the emitted contract:
   "model_route": "prod/llama3-70b-route",
   "model_server": "prod/llama3-70b-server",
   "selected_pod": "llama3-70b-deployment-7b9f4c2d-kjx9p",
+  "backend_type": "model_server",
+  "backend_name": "prod/llama3-70b-server",
+  "upstream_model": "llama3-70b-instruct",
+  "upstream_status_code": 200,
+  "upstream_attempts": 1,
   "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "input_tokens": 412,
   "output_tokens": 189,

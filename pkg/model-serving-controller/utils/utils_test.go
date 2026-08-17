@@ -410,3 +410,72 @@ func TestGetMaxUnavailableForRole(t *testing.T) {
 		})
 	}
 }
+
+func TestGetMaxSurgeForRole(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    workloadv1alpha1.Role
+		want    int
+		wantErr bool
+	}{
+		{
+			name: "unset defaults to zero",
+			role: workloadv1alpha1.Role{Name: "decode", Replicas: ptr.To[int32](4)},
+		},
+		{
+			name: "absolute value",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](4),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromInt(2)),
+				},
+			},
+			want: 2,
+		},
+		{
+			name: "percentage rounds up",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](5),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("25%")),
+				},
+			},
+			want: 2,
+		},
+		{
+			name: "nil replicas defaults to one",
+			role: workloadv1alpha1.Role{
+				Name: "decode",
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("50%")),
+				},
+			},
+			want: 1,
+		},
+		{
+			name: "invalid percentage",
+			role: workloadv1alpha1.Role{
+				Name:     "decode",
+				Replicas: ptr.To[int32](4),
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge: ptr.To(intstr.FromString("invalid")),
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetMaxSurgeForRole(tt.role)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

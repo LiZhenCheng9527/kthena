@@ -220,10 +220,12 @@ func validateMaxUnavailableForRoles(ms *workloadv1alpha1.ModelServing) field.Err
 		}
 
 		rollingCfgPath := field.NewPath("spec").Child("template").Child("roles").Index(i)
+		maxSurgePath := rollingCfgPath.Child("maxSurge")
 		if role.MaxSurge != nil {
-			fieldPath := rollingCfgPath.Child("maxSurge")
-			allErrs = append(allErrs, validateIntOrPercent(role.MaxSurge, fieldPath)...)
-			allErrs = append(allErrs, field.Forbidden(fieldPath, "role-level maxSurge is not supported yet"))
+			allErrs = append(allErrs, validateIntOrPercent(role.MaxSurge, maxSurgePath)...)
+			if !roleRollingUpdate {
+				allErrs = append(allErrs, field.Forbidden(maxSurgePath, "maxSurge is only valid when rolloutStrategy.type is RoleRollingUpdate"))
+			}
 		}
 
 		if role.Partition != nil {
@@ -238,21 +240,45 @@ func validateMaxUnavailableForRoles(ms *workloadv1alpha1.ModelServing) field.Err
 			continue
 		}
 
+		replicas := 1
+		if role.Replicas != nil {
+			replicas = int(*role.Replicas)
+		}
+		maxUnavailableValue := 1
+		maxSurgeValue := 0
+		budgetsValid := true
+		maxUnavailablePath := rollingCfgPath.Child("maxUnavailable")
 		if role.MaxUnavailable != nil {
-			fieldPath := rollingCfgPath.Child("maxUnavailable")
-			allErrs = append(allErrs, validateIntOrPercent(role.MaxUnavailable, fieldPath)...)
-			replicas := 1
-			if role.Replicas != nil {
-				replicas = int(*role.Replicas)
-			}
+			allErrs = append(allErrs, validateIntOrPercent(role.MaxUnavailable, maxUnavailablePath)...)
 			maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(role.MaxUnavailable, replicas, false)
 			if err != nil {
-				allErrs = append(allErrs, field.Invalid(fieldPath, role.MaxUnavailable, fmt.Sprintf("invalid maxUnavailable: %v", err)))
-			} else if maxUnavailable == 0 {
-				allErrs = append(allErrs, field.Invalid(fieldPath, role.MaxUnavailable, "maxUnavailable cannot be 0"))
+				budgetsValid = false
+				allErrs = append(allErrs, field.Invalid(maxUnavailablePath, role.MaxUnavailable, fmt.Sprintf("invalid maxUnavailable: %v", err)))
 			} else if maxUnavailable > replicas {
-				allErrs = append(allErrs, field.Invalid(fieldPath, role.MaxUnavailable, fmt.Sprintf("maxUnavailable cannot be greater than replicas (%d)", replicas)))
+				allErrs = append(allErrs, field.Invalid(maxUnavailablePath, role.MaxUnavailable, fmt.Sprintf("maxUnavailable cannot be greater than replicas (%d)", replicas)))
+			} else {
+				maxUnavailableValue = maxUnavailable
 			}
+		}
+		if role.MaxSurge != nil {
+			maxSurge, err := intstr.GetScaledValueFromIntOrPercent(role.MaxSurge, replicas, true)
+			if err != nil {
+				budgetsValid = false
+				allErrs = append(allErrs, field.Invalid(maxSurgePath, role.MaxSurge, fmt.Sprintf("invalid maxSurge: %v", err)))
+			} else {
+				maxSurgeValue = maxSurge
+			}
+		}
+
+		partition := 0
+		if role.Partition != nil {
+			resolvedPartition, err := intstr.GetScaledValueFromIntOrPercent(role.Partition, replicas, true)
+			if err == nil {
+				partition = resolvedPartition
+			}
+		}
+		if budgetsValid && replicas > partition && maxUnavailableValue == 0 && maxSurgeValue == 0 {
+			allErrs = append(allErrs, field.Invalid(rollingCfgPath, "", "maxUnavailable and maxSurge cannot both resolve to 0"))
 		}
 	}
 	return allErrs

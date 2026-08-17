@@ -2818,6 +2818,122 @@ func TestManageRoleReplicas(t *testing.T) {
 	}
 }
 
+func TestManageRoleReplicasUsesMaxSurgeDuringRoleRollingUpdate(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	controller, err := NewModelServingController(
+		kubeClient,
+		kthenafake.NewSimpleClientset(),
+		nil,
+		apiextfake.NewSimpleClientset(),
+	)
+	require.NoError(t, err)
+
+	maxUnavailable := intstr.FromInt(0)
+	maxSurge := intstr.FromInt(1)
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "role-surge", UID: types.UID("role-surge-uid")},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas:        ptr.To[int32](1),
+			RecoveryPolicy:  workloadv1alpha1.RoleRecreate,
+			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+			Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+				Name:           "decode",
+				Replicas:       ptr.To[int32](2),
+				WorkerReplicas: 0,
+				RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+					MaxUnavailable: &maxUnavailable,
+					MaxSurge:       &maxSurge,
+				},
+				EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "entry", Image: "new-image"}}},
+				},
+			}}},
+		},
+	}
+	key := utils.GetNamespaceName(ms)
+	groupName := utils.GenerateServingGroupName(ms.Name, 0)
+	controller.store.AddServingGroup(key, 0, "old-revision")
+	for ordinal := 0; ordinal < 2; ordinal++ {
+		controller.store.AddRole(key, groupName, "decode", utils.GenerateRoleID("decode", ordinal), "old-revision", "old-hash")
+	}
+
+	controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, "new-revision")
+
+	roles, err := controller.store.GetRoleList(key, groupName, "decode")
+	require.NoError(t, err)
+	require.Len(t, roles, 3)
+	assert.Equal(t, "decode-2", roles[2].Name)
+	assert.Equal(t, "new-revision", roles[2].Revision)
+	assert.Equal(t, utils.CalRoleTemplateHash(ms.Spec.Template.Roles[0]), roles[2].RoleTemplateHash)
+
+	pods, err := kubeClient.CoreV1().Pods(ms.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.Len(t, pods.Items, 3)
+}
+
+func TestHasUpdateableOutdatedRole(t *testing.T) {
+	controller := &ModelServingController{}
+	partition := intstr.FromInt(1)
+	targetRole := workloadv1alpha1.Role{
+		Name:     "decode",
+		Replicas: ptr.To[int32](2),
+		RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+			Partition: &partition,
+		},
+		EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "entry", Image: "new-image"}}},
+		},
+	}
+	ms := &workloadv1alpha1.ModelServing{
+		Spec: workloadv1alpha1.ModelServingSpec{
+			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+		},
+	}
+	newHash := utils.CalRoleTemplateHash(targetRole)
+
+	tests := []struct {
+		name  string
+		roles []datastore.Role
+		want  bool
+	}{
+		{
+			name: "outdated replica after partition enables surge",
+			roles: []datastore.Role{
+				{Name: "decode-0", RoleTemplateHash: "old-hash", Status: datastore.RoleRunning},
+				{Name: "decode-4", RoleTemplateHash: "old-hash", Status: datastore.RoleRunning},
+			},
+			want: true,
+		},
+		{
+			name: "partition-protected outdated replica does not enable surge",
+			roles: []datastore.Role{
+				{Name: "decode-0", RoleTemplateHash: "old-hash", Status: datastore.RoleRunning},
+				{Name: "decode-4", RoleTemplateHash: newHash, Status: datastore.RoleRunning},
+			},
+		},
+		{
+			name: "all replicas updated",
+			roles: []datastore.Role{
+				{Name: "decode-0", RoleTemplateHash: newHash, Status: datastore.RoleRunning},
+				{Name: "decode-4", RoleTemplateHash: newHash, Status: datastore.RoleRunning},
+			},
+		},
+		{
+			name: "deleting outdated replica does not enable surge",
+			roles: []datastore.Role{
+				{Name: "decode-0", RoleTemplateHash: newHash, Status: datastore.RoleRunning},
+				{Name: "decode-4", RoleTemplateHash: "old-hash", Status: datastore.RoleDeleting},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, controller.hasUpdateableOutdatedRole(ms, "test-0", targetRole, tt.roles))
+		})
+	}
+}
+
 // TestScaleDownServingGroups tests the scaleDownServingGroups function with various scenarios
 func TestScaleDownServingGroups(t *testing.T) {
 	tests := []struct {
@@ -7852,6 +7968,43 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			},
 			expected: []roleToDelete{
 				{roleName: "prefill", roleID: "prefill-1"},
+			},
+			expectedOutdated: true,
+		},
+		{
+			name: "ready surge role increases deletion budget",
+			roles: []workloadv1alpha1.Role{func() workloadv1alpha1.Role {
+				role := newRole("prefill", "nginx:latest", 2, ptr.To(intstr.FromInt(0)))
+				role.MaxSurge = ptr.To(intstr.FromInt(1))
+				return role
+			}()},
+			setupStore: func(t *testing.T, store datastore.Store, ms *workloadv1alpha1.ModelServing) {
+				t.Helper()
+				store.AddServingGroup(utils.GetNamespaceName(ms), 0, oldRevision)
+				hash := utils.CalRoleTemplateHash(ms.Spec.Template.Roles[0])
+				addRole(t, store, ms, "prefill", "prefill-0", "old-hash", datastore.RoleRunning)
+				addRole(t, store, ms, "prefill", "prefill-1", "old-hash", datastore.RoleRunning)
+				addRole(t, store, ms, "prefill", "prefill-2", hash, datastore.RoleRunning)
+			},
+			expected: []roleToDelete{
+				{roleName: "prefill", roleID: "prefill-1"},
+			},
+			expectedOutdated: true,
+		},
+		{
+			name: "unready surge role blocks deletion with zero maxUnavailable",
+			roles: []workloadv1alpha1.Role{func() workloadv1alpha1.Role {
+				role := newRole("prefill", "nginx:latest", 2, ptr.To(intstr.FromInt(0)))
+				role.MaxSurge = ptr.To(intstr.FromInt(1))
+				return role
+			}()},
+			setupStore: func(t *testing.T, store datastore.Store, ms *workloadv1alpha1.ModelServing) {
+				t.Helper()
+				store.AddServingGroup(utils.GetNamespaceName(ms), 0, oldRevision)
+				hash := utils.CalRoleTemplateHash(ms.Spec.Template.Roles[0])
+				addRole(t, store, ms, "prefill", "prefill-0", "old-hash", datastore.RoleRunning)
+				addRole(t, store, ms, "prefill", "prefill-1", "old-hash", datastore.RoleRunning)
+				addRole(t, store, ms, "prefill", "prefill-2", hash, datastore.RoleCreating)
 			},
 			expectedOutdated: true,
 		},

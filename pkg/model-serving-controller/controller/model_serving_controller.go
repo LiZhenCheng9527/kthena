@@ -1121,7 +1121,16 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		return
 	}
 
-	expectedCount := int(*targetRole.Replicas)
+	expectedCount := roleReplicas(targetRole)
+	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate &&
+		c.hasUpdateableOutdatedRole(ms, groupName, targetRole, roleList) {
+		maxSurge, err := utils.GetMaxSurgeForRole(targetRole)
+		if err != nil {
+			klog.Errorf("manageRoleReplicasPerGroup: failed to calculate maxSurge for role %s in ServingGroup %s: %v", targetRole.Name, groupName, err)
+		} else {
+			expectedCount += maxSurge
+		}
+	}
 	expectedPods := 1 + int(targetRole.WorkerReplicas)
 	partition, partitionConfigured, partitionErr := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
 	if partitionErr != nil {
@@ -1165,6 +1174,36 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		klog.V(2).Infof("manageRoleReplicasPerGroup: scaling DOWN role %s in ServingGroup %s: current=%d, expected=%d", targetRole.Name, groupName, len(roleList), expectedCount)
 		c.scaleDownRoles(ctx, ms, groupName, targetRole, roleList, expectedCount)
 	}
+}
+
+// hasUpdateableOutdatedRole reports whether a Role has an outdated replica
+// outside its partition-protected prefix. maxSurge changes only the temporary
+// expected replica count; individual replicas are not classified as surge by
+// ordinal because binpack scale-down may leave sparse or high ordinals.
+func (c *ModelServingController) hasUpdateableOutdatedRole(
+	ms *workloadv1alpha1.ModelServing,
+	groupName string,
+	targetRole workloadv1alpha1.Role,
+	roleList []datastore.Role,
+) bool {
+	partition, _, err := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
+	if err != nil {
+		klog.Errorf("hasUpdateableOutdatedRole: failed to calculate partition for role %s in ServingGroup %s: %v", targetRole.Name, groupName, err)
+		return false
+	}
+	expectedHash := utils.CalRoleTemplateHash(targetRole)
+	for index, role := range roleList {
+		if index < partition || role.Status == datastore.RoleDeleting {
+			continue
+		}
+		if observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, datastore.ServingGroup{
+			Name:     groupName,
+			Revision: role.Revision,
+		}, targetRole.Name, role); ok && observedHash != expectedHash {
+			return true
+		}
+	}
+	return false
 }
 
 // roleTemplateForReplica resolves the role template, revision, and hash to use when recreating pods for a replica.

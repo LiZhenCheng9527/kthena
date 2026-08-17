@@ -618,3 +618,20 @@ func GetMaxUnavailableForRole(role workloadv1alpha1.Role) (int, bool, error) {
 	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(role.MaxUnavailable, replicas, false)
 	return maxUnavailable, true, err
 }
+
+// GetMaxSurgeForRole resolves a Role's surge budget against its latest desired
+// replica count. Percentage values are rounded up.
+func GetMaxSurgeForRole(role workloadv1alpha1.Role) (int, error) {
+	if role.MaxSurge == nil {
+		return 0, nil
+	}
+	replicas := roleReplicas(role)
+	return intstr.GetScaledValueFromIntOrPercent(role.MaxSurge, replicas, true)
+}
+
+func roleReplicas(role workloadv1alpha1.Role) int {
+	if role.Replicas == nil {
+		return 1
+	}
+	return int(*role.Replicas)
+}

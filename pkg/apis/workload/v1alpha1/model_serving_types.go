@@ -150,7 +150,7 @@ type RolloutStrategy struct {
 
 	// RollingUpdateConfiguration configures ServingGroupRollingUpdate.
 	// It must not be set when type is RoleRollingUpdate; configure maxUnavailable
-	// and partition on each Role instead.
+	// maxSurge, and partition on each Role instead.
 	// +optional
 	RollingUpdateConfiguration *RollingUpdateConfiguration `json:"rollingUpdateConfiguration,omitempty"`
 }
@@ -185,9 +185,9 @@ type RollingUpdateConfiguration struct {
 	// MaxSurge is the maximum number of resources that may be created above
 	// the desired replica count during an update. It can be an absolute number
 	// (for example, 1) or a percentage (for example, 25%). A percentage is
-	// calculated from the latest desired replica count and rounded up.
-	// It defaults to 0. ServingGroupRollingUpdate supports this field;
-	// RoleRollingUpdate support will be added separately.
+	// calculated from ModelServing replicas for ServingGroupRollingUpdate and
+	// from the corresponding Role's replicas for RoleRollingUpdate, then rounded
+	// up. It defaults to 0.
 	// +kubebuilder:validation:XIntOrString
 	// +optional
 	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`

@@ -133,12 +133,18 @@ func httpRouteMatchesGatewayListener(route *gatewayv1.HTTPRoute, gatewayKey, lis
 			continue
 		}
 		if listenerName == "" && listenerPort == 0 {
-			return parentRef.SectionName == nil && parentRef.Port == nil
+			if parentRef.SectionName == nil && parentRef.Port == nil {
+				return true
+			}
+			continue
 		}
-		if parentRef.SectionName != nil && string(*parentRef.SectionName) == listenerName &&
-			parentRef.Port != nil && int(*parentRef.Port) == listenerPort {
-			return true
+		if parentRef.SectionName != nil && string(*parentRef.SectionName) != listenerName {
+			continue
 		}
+		if parentRef.Port != nil && int(*parentRef.Port) != listenerPort {
+			continue
+		}
+		return true
 	}
 	return false
 }

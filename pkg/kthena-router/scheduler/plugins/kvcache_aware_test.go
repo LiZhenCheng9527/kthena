@@ -2518,3 +2518,52 @@ func TestKVCacheAware_QueryRedisForBlocks_DropsOldOwnershipAfterLongAgoRestart(t
 		t.Errorf("stale ownership survived a long-ago restart: got %v, want none", result[hash])
 	}
 }
+
+// benchPodScoreInput builds a prefix-matching workload: matchFrac of the blocks are held by
+// every pod, and the rest by an unrelated pod so the intersection empties there.
+func benchPodScoreInput(blocks, pods int, matchFrac float64) ([]uint64, map[uint64][]string) {
+	hashes := make([]uint64, blocks)
+	blockToPods := make(map[uint64][]string, blocks)
+	names := make([]string, pods)
+	for p := 0; p < pods; p++ {
+		names[p] = fmt.Sprintf("vllm-decode-%d.default", p)
+	}
+	cut := int(float64(blocks) * matchFrac)
+	for b := 0; b < blocks; b++ {
+		hashes[b] = uint64(b + 1)
+		if b < cut {
+			owners := make([]string, pods)
+			copy(owners, names)
+			blockToPods[hashes[b]] = owners
+			continue
+		}
+		blockToPods[hashes[b]] = []string{"other.default"}
+	}
+	return hashes, blockToPods
+}
+
+func BenchmarkCalculatePodScores(b *testing.B) {
+	cases := []struct {
+		pods      int
+		matchFrac float64
+	}{
+		{2, 1.0},
+		{8, 1.0},
+		{32, 1.0},
+		{8, 0.3},
+		{32, 0.3},
+	}
+
+	for _, c := range cases {
+		name := fmt.Sprintf("blocks=%d/pods=%d/match=%.0f%%", defaultMaxBlocksToMatch, c.pods, c.matchFrac*100)
+		b.Run(name, func(b *testing.B) {
+			blockHashes, blockToPods := benchPodScoreInput(defaultMaxBlocksToMatch, c.pods, c.matchFrac)
+			plugin := &KVCacheAware{}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				plugin.calculatePodScores(blockHashes, blockToPods)
+			}
+		})
+	}
+}

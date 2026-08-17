@@ -433,25 +433,62 @@ func TestHashPromptEquivalence(t *testing.T) {
 	}
 }
 
-// BenchmarkHashPrompt isolates the per-request hashing allocation, the data-plane
-// hot path. b.ReportAllocs surfaces the per-op allocations eliminated by the
-// strconv.AppendUint buffer reuse.
-func BenchmarkHashPrompt(b *testing.B) {
-	var promptBuf strings.Builder
-	promptBuf.Grow(8192)
-	for i := 0; i < 8192; i++ {
-		promptBuf.WriteByte(byte('a' + (i % 26)))
-	}
-	prompt := promptBuf.String()
-
+// TestHashPromptResultCapacity pins the result slice to the blocks the prompt
+// produces. Sizing it at maxBlocksToMatch instead gives every prompt the full
+// backing array, which costs short prompts far more than the growth it avoids.
+func TestHashPromptResultCapacity(t *testing.T) {
 	p := &PrefixCache{
 		blockSizeToHash:  64,
 		maxBlocksToMatch: 128,
 	}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = p.hashPrompt("bench-model", prompt)
+	// Block counts are deliberately not powers of two. Growing the slice by append
+	// lands on a power-of-two capacity, so these are the lengths where a grown
+	// result and a sized one differ.
+	cases := []struct {
+		promptLen  int
+		wantHashes int
+	}{
+		{192, 3},
+		{320, 5},
+		{1600, 25},
+		{32768, 128}, // capped at maxBlocksToMatch
+	}
+	for _, tc := range cases {
+		got := p.hashPrompt("test-model", strings.Repeat("a", tc.promptLen))
+		if len(got) != tc.wantHashes {
+			t.Fatalf("prompt %dB: got %d hashes, want %d", tc.promptLen, len(got), tc.wantHashes)
+		}
+		if cap(got) != tc.wantHashes {
+			t.Fatalf("prompt %dB: result cap %d, want %d", tc.promptLen, cap(got), tc.wantHashes)
+		}
+	}
+}
+
+// BenchmarkHashPrompt isolates the per-request hashing allocation, the data-plane
+// hot path. b.ReportAllocs surfaces the per-op allocations eliminated by the
+// strconv.AppendUint buffer reuse and by sizing the result slice up front. Sizes
+// span a single block to beyond maxBlocksToMatch.
+func BenchmarkHashPrompt(b *testing.B) {
+	p := &PrefixCache{
+		blockSizeToHash:  64,
+		maxBlocksToMatch: 128,
+	}
+
+	for _, promptLen := range []int{64, 512, 2048, 8192, 32768} {
+		var promptBuf strings.Builder
+		promptBuf.Grow(promptLen)
+		for i := 0; i < promptLen; i++ {
+			promptBuf.WriteByte(byte('a' + (i % 26)))
+		}
+		prompt := promptBuf.String()
+
+		b.Run(fmt.Sprintf("prompt=%dB", promptLen), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = p.hashPrompt("bench-model", prompt)
+			}
+		})
 	}
 }

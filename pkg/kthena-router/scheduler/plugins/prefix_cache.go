@@ -225,10 +225,17 @@ func (p *PrefixCache) PostSchedule(ctx *framework.Context, index int) {
 }
 
 func (p *PrefixCache) hashPrompt(model string, prompt string) []uint64 {
-	res := []uint64{}
 	if len(prompt) == 0 {
-		return res
+		return []uint64{}
 	}
+
+	// Size from the blocks this prompt will produce. Capping at maxBlocksToMatch
+	// instead would give a single-block prompt the full maximum backing array.
+	blocks := (len(prompt) + p.blockSizeToHash - 1) / p.blockSizeToHash
+	if blocks > p.maxBlocksToMatch {
+		blocks = p.maxBlocksToMatch
+	}
+	res := make([]uint64, 0, blocks)
 
 	// Initialize first block hash
 	// Use model name as the first hash to avoid hash collision

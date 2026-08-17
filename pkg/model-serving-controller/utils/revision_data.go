@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
 
@@ -103,6 +105,7 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 			continue
 		}
 		sort.Strings(plugin.Scope.Roles)
+		plugin.Scope.Roles = slices.Compact(plugin.Scope.Roles)
 		if plugin.Scope.Target == "" {
 			plugin.Scope.Target = workloadv1alpha1.PluginTargetAll
 		}
@@ -114,6 +117,8 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 	roles := make([]modelServingRevisionRole, len(normalized.Spec.Template.Roles))
 	for i := range normalized.Spec.Template.Roles {
 		role := &normalized.Spec.Template.Roles[i]
+		normalizePodTemplate(&role.EntryTemplate, normalized.Spec.SchedulerName)
+		normalizePodTemplate(role.WorkerTemplate, normalized.Spec.SchedulerName)
 		roles[i] = modelServingRevisionRole{
 			Name:           role.Name,
 			EntryTemplate:  role.EntryTemplate,
@@ -134,6 +139,34 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 			},
 		},
 	}, nil
+}
+
+// normalizePodTemplate applies the PodSpec defaults materialized for workload
+// templates by built-in controllers. ModelServing's scheduler wins because Pod
+// generation always overrides the scheduler in the Role template.
+func normalizePodTemplate(template *workloadv1alpha1.PodTemplateSpec, schedulerName string) {
+	if template == nil {
+		return
+	}
+	if template.Metadata != nil && len(template.Metadata.Labels) == 0 && len(template.Metadata.Annotations) == 0 {
+		template.Metadata = nil
+	}
+
+	spec := &template.Spec
+	if spec.DNSPolicy == "" {
+		spec.DNSPolicy = corev1.DNSClusterFirst
+	}
+	if spec.RestartPolicy == "" {
+		spec.RestartPolicy = corev1.RestartPolicyAlways
+	}
+	if spec.SecurityContext == nil {
+		spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		gracePeriod := int64(corev1.DefaultTerminationGracePeriodSeconds)
+		spec.TerminationGracePeriodSeconds = &gracePeriod
+	}
+	spec.SchedulerName = schedulerName
 }
 
 func canonicalJSON(data []byte) ([]byte, error) {

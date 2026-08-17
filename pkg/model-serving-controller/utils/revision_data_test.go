@@ -91,6 +91,34 @@ func TestBuildRevisionDataCanonicalSemantics(t *testing.T) {
 	if got := base.Spec.Template.Roles[0].Name; got != "prefill" {
 		t.Fatalf("BuildRevisionData mutated role order: first role = %q", got)
 	}
+	if got := base.Spec.Template.Roles[0].EntryTemplate.Spec.RestartPolicy; got != "" {
+		t.Fatalf("BuildRevisionData mutated input restart policy to %q", got)
+	}
+}
+
+func TestBuildRevisionDataDeduplicatesPluginScopeRoles(t *testing.T) {
+	base := revisionTestModelServing(revisionTestRole("prefill", "prefill:v1"))
+	base.Spec.Plugins = []workloadv1alpha1.PluginSpec{{
+		Name:  "plugin",
+		Scope: &workloadv1alpha1.PluginScope{Roles: []string{"prefill"}},
+	}}
+	equivalent := base.DeepCopy()
+	equivalent.Spec.Plugins[0].Scope.Roles = []string{"prefill", "prefill"}
+
+	baseData, err := BuildRevisionData(base)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(base) error = %v", err)
+	}
+	equivalentData, err := BuildRevisionData(equivalent)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(equivalent) error = %v", err)
+	}
+	if string(baseData) != string(equivalentData) {
+		t.Fatalf("duplicate plugin scope roles produced different data:\nbase: %s\nother: %s", baseData, equivalentData)
+	}
+	if got := len(equivalent.Spec.Plugins[0].Scope.Roles); got != 2 {
+		t.Fatalf("BuildRevisionData mutated input plugin scope roles: %v", equivalent.Spec.Plugins[0].Scope.Roles)
+	}
 }
 
 func TestBuildRevisionDataTracksRevisionedFields(t *testing.T) {
@@ -144,6 +172,11 @@ func TestBuildRevisionDataNormalizesDefaultsAndEmptyValues(t *testing.T) {
 		Roles:  []string{},
 		Target: workloadv1alpha1.PluginTargetAll,
 	}
+	for i := range equivalent.Spec.Template.Roles {
+		role := &equivalent.Spec.Template.Roles[i]
+		normalizeTemplateDefaultsForTest(&role.EntryTemplate)
+		normalizeTemplateDefaultsForTest(role.WorkerTemplate)
+	}
 
 	baseData, err := BuildRevisionData(base)
 	if err != nil {
@@ -156,6 +189,19 @@ func TestBuildRevisionDataNormalizesDefaultsAndEmptyValues(t *testing.T) {
 	if string(baseData) != string(equivalentData) {
 		t.Fatalf("defaults and empty values produced different data:\nbase: %s\nother: %s", baseData, equivalentData)
 	}
+}
+
+func normalizeTemplateDefaultsForTest(template *workloadv1alpha1.PodTemplateSpec) {
+	if template == nil {
+		return
+	}
+	template.Metadata = &workloadv1alpha1.Metadata{}
+	template.Spec.DNSPolicy = corev1.DNSClusterFirst
+	template.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	template.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	template.Spec.TerminationGracePeriodSeconds = ptr.To[int64](corev1.DefaultTerminationGracePeriodSeconds)
+	// The Role template scheduler is ignored when rendering Pods.
+	template.Spec.SchedulerName = "ignored-template-scheduler"
 }
 
 func TestBuildRevisionDataPreservesPluginConfigNumberPrecision(t *testing.T) {

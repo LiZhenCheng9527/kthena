@@ -598,6 +598,9 @@ func GetMaxUnavailable(ms *workloadv1alpha1.ModelServing) (int, error) {
 // desired replica count. Percentage values are rounded up.
 func GetMaxSurge(ms *workloadv1alpha1.ModelServing) (int, error) {
 	maxSurge := intstr.FromInt(0)
+	if ms.Spec.Replicas == nil {
+		return 0, fmt.Errorf("replicas must be set")
+	}
 	replicas := int(*ms.Spec.Replicas)
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.RollingUpdateConfiguration != nil {
 		if ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge != nil {

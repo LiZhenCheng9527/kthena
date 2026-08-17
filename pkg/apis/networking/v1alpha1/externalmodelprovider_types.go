@@ -55,6 +55,7 @@ const (
 	ExternalModelProviderReasonCredentialResolved    = "CredentialResolved"
 	ExternalModelProviderReasonCredentialNotFound    = "CredentialNotFound"
 	ExternalModelProviderReasonCredentialKeyNotFound = "CredentialKeyNotFound"
+	ExternalModelProviderReasonCredentialInvalid     = "CredentialInvalid"
 )
 
 // ExternalModelProviderSpec defines the desired state of ExternalModelProvider.

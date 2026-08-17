@@ -514,6 +514,72 @@ func TestProviderAuthSchemeOverride(t *testing.T) {
 	}
 }
 
+func TestApplyProviderAuthNormalizesCredential(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		scheme     networkingv1alpha1.ProviderAuthScheme
+		wantHeader string
+		wantValue  string
+		wantErr    bool
+	}{
+		{
+			name:       "bearer token with trailing newline",
+			value:      "provider-key\n",
+			scheme:     networkingv1alpha1.ProviderAuthSchemeBearer,
+			wantHeader: "Authorization",
+			wantValue:  "Bearer provider-key",
+		},
+		{
+			name:       "api key with surrounding whitespace",
+			value:      " \tprovider-key\r\n",
+			scheme:     networkingv1alpha1.ProviderAuthSchemeAPIKey,
+			wantHeader: "x-api-key",
+			wantValue:  "provider-key",
+		},
+		{
+			name:    "whitespace only credential",
+			value:   " \t\r\n",
+			scheme:  networkingv1alpha1.ProviderAuthSchemeBearer,
+			wantErr: true,
+		},
+		{
+			name:    "embedded newline",
+			value:   "provider\nkey",
+			scheme:  networkingv1alpha1.ProviderAuthSchemeAPIKey,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &networkingv1alpha1.ExternalModelProvider{
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: tt.scheme,
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+							Key:                  "api-key",
+						},
+					},
+				},
+			}
+			secret := &corev1.Secret{Data: map[string][]byte{"api-key": []byte(tt.value)}}
+			headers := http.Header{}
+
+			err := applyProviderAuth(headers, provider, secret, networkingv1alpha1.ProviderAuthSchemeBearer)
+			if tt.wantErr {
+				assert.Error(t, err)
+				var configurationError *ConfigurationError
+				assert.ErrorAs(t, err, &configurationError)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantValue, headers.Get(tt.wantHeader))
+		})
+	}
+}
+
 func TestOpenAIAdapterResponseParser(t *testing.T) {
 	adapter, err := NewAdapter(networkingv1alpha1.OpenAI)
 	assert.NoError(t, err)

@@ -38,7 +38,8 @@ type ModelServerSpec struct {
 	WorkloadSelector *WorkloadSelector `json:"workloadSelector"`
 
 	// WorkloadPort defines the port and protocol configuration for the model server.
-	WorkloadPort WorkloadPort `json:"workloadPort,omitempty"`
+	// +kubebuilder:validation:Required
+	WorkloadPort WorkloadPort `json:"workloadPort"`
 
 	// Traffic Policy for accessing the model server instance.
 	// +optional

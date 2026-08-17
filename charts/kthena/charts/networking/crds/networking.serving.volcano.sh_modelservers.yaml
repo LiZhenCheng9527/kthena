@@ -171,6 +171,7 @@ spec:
                 type: object
             required:
             - inferenceEngine
+            - workloadPort
             - workloadSelector
             type: object
           status:

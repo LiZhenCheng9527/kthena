@@ -18,6 +18,7 @@ package convert
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -395,16 +396,20 @@ func TestBuildModelServingWorkerPodsOmitted(t *testing.T) {
 // TestBuildModelServingWorkerPodsToWorkerReplicas covers the workerReplicas calculation for
 // explicit pods values: an explicit zero (distinct from the omitted-field fixture above,
 // which exercises the same zero value reached through YAML unmarshalling instead of direct
-// assignment), the single-pod baseline, and a multi-node value.
+// assignment), the single-pod baseline, and a multi-node value. It also asserts that
+// buildCommands' Ray-leader command generation - which reads the same effectiveServerPods
+// value as WORKER_REPLICAS - keeps its existing "> 1" behavior for every case, so the
+// centralized clamp doesn't change command generation.
 func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
 	tests := []struct {
 		name               string
 		pods               int32
 		wantWorkerReplicas int32
+		wantRayLeaderCmd   bool
 	}{
-		{name: "pods: 0 explicit", pods: 0, wantWorkerReplicas: 0},
-		{name: "pods: 1 is a single pod with no extra workers", pods: 1, wantWorkerReplicas: 0},
-		{name: "pods > 1 adds Ray workers", pods: 3, wantWorkerReplicas: 2},
+		{name: "pods: 0 explicit", pods: 0, wantWorkerReplicas: 0, wantRayLeaderCmd: false},
+		{name: "pods: 1 is a single pod with no extra workers", pods: 1, wantWorkerReplicas: 0, wantRayLeaderCmd: false},
+		{name: "pods > 1 adds Ray workers", pods: 3, wantWorkerReplicas: 2, wantRayLeaderCmd: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -418,6 +423,24 @@ func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
 			workerReplicas := got.Spec.Template.Roles[0].WorkerReplicas
 			assert.GreaterOrEqual(t, workerReplicas, int32(0), "workerReplicas must never be negative")
 			assert.Equal(t, tt.wantWorkerReplicas, workerReplicas)
+
+			var engine *corev1.Container
+			for i := range got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers {
+				container := &got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[i]
+				if container.Name == "engine" {
+					engine = container
+					break
+				}
+			}
+			require.NotNil(t, engine)
+			command := strings.Join(engine.Command, " ")
+			if tt.wantRayLeaderCmd {
+				assert.Contains(t, command, fmt.Sprintf("leader --ray_cluster_size=%d", tt.wantWorkerReplicas+1))
+				assert.Contains(t, command, "--distributed_executor_backend ray")
+			} else {
+				assert.NotContains(t, command, "leader --ray_cluster_size")
+				assert.NotContains(t, command, "--distributed_executor_backend")
+			}
 		})
 	}
 }

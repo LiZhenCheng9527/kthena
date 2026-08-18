@@ -140,6 +140,12 @@ func TestBuildRevisionDataTracksRevisionedFields(t *testing.T) {
 		{name: "role template", mutate: func(ms *workloadv1alpha1.ModelServing) {
 			ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
 		}},
+		{name: "role environment", mutate: func(ms *workloadv1alpha1.ModelServing) {
+			ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env = append(
+				ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env,
+				corev1.EnvVar{Name: "CUSTOM_SETTING", Value: "enabled"},
+			)
+		}},
 		{name: "worker replicas", mutate: func(ms *workloadv1alpha1.ModelServing) {
 			ms.Spec.Template.Roles[0].WorkerReplicas++
 		}},
@@ -160,7 +166,7 @@ func TestBuildRevisionDataTracksRevisionedFields(t *testing.T) {
 	}
 }
 
-func TestBuildRevisionDataNormalizesDefaultsAndEmptyValues(t *testing.T) {
+func TestBuildRevisionDataNormalizesModelServingDefaultsAndEmptyValues(t *testing.T) {
 	base := revisionTestModelServing(revisionTestRole("prefill", "prefill:v1"))
 	base.Spec.Plugins = []workloadv1alpha1.PluginSpec{{Name: "plugin"}}
 
@@ -174,8 +180,10 @@ func TestBuildRevisionDataNormalizesDefaultsAndEmptyValues(t *testing.T) {
 	}
 	for i := range equivalent.Spec.Template.Roles {
 		role := &equivalent.Spec.Template.Roles[i]
-		normalizeTemplateDefaultsForTest(&role.EntryTemplate)
-		normalizeTemplateDefaultsForTest(role.WorkerTemplate)
+		role.EntryTemplate.Metadata = &workloadv1alpha1.Metadata{}
+		role.EntryTemplate.Spec.SchedulerName = "ignored-template-scheduler"
+		role.WorkerTemplate.Metadata = &workloadv1alpha1.Metadata{}
+		role.WorkerTemplate.Spec.SchedulerName = "ignored-template-scheduler"
 	}
 
 	baseData, err := BuildRevisionData(base)
@@ -191,17 +199,71 @@ func TestBuildRevisionDataNormalizesDefaultsAndEmptyValues(t *testing.T) {
 	}
 }
 
-func normalizeTemplateDefaultsForTest(template *workloadv1alpha1.PodTemplateSpec) {
-	if template == nil {
-		return
+func TestBuildRevisionDataPreservesPodAPIDefaultIntent(t *testing.T) {
+	base := revisionTestModelServing(revisionTestRole("prefill", "prefill:v1"))
+	explicit := base.DeepCopy()
+	explicit.Spec.Template.Roles[0].EntryTemplate.Spec.RestartPolicy = corev1.RestartPolicyAlways
+
+	baseData, err := BuildRevisionData(base)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(base) error = %v", err)
 	}
-	template.Metadata = &workloadv1alpha1.Metadata{}
-	template.Spec.DNSPolicy = corev1.DNSClusterFirst
-	template.Spec.RestartPolicy = corev1.RestartPolicyAlways
-	template.Spec.SecurityContext = &corev1.PodSecurityContext{}
-	template.Spec.TerminationGracePeriodSeconds = ptr.To[int64](corev1.DefaultTerminationGracePeriodSeconds)
-	// The Role template scheduler is ignored when rendering Pods.
-	template.Spec.SchedulerName = "ignored-template-scheduler"
+	explicitData, err := BuildRevisionData(explicit)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(explicit) error = %v", err)
+	}
+	if string(baseData) == string(explicitData) {
+		t.Fatalf("explicit Pod API default did not change revision data: %s", explicitData)
+	}
+}
+
+func TestBuildRevisionDataIgnoresControllerOwnedEnvValues(t *testing.T) {
+	base := revisionTestModelServing(revisionTestRole("prefill", "prefill:v1"))
+	role := &base.Spec.Template.Roles[0]
+	role.EntryTemplate.Spec.InitContainers = []corev1.Container{{
+		Name: "entry-init", Image: "init:v1", Env: []corev1.EnvVar{{Name: "KEEP", Value: "entry-init"}},
+	}}
+	role.EntryTemplate.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "KEEP", Value: "entry"}}
+	role.WorkerTemplate.Spec.InitContainers = []corev1.Container{{
+		Name: "worker-init", Image: "init:v1", Env: []corev1.EnvVar{{Name: "KEEP", Value: "worker-init"}},
+	}}
+	role.WorkerTemplate.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "KEEP", Value: "worker"}}
+
+	equivalent := base.DeepCopy()
+	for _, template := range []*workloadv1alpha1.PodTemplateSpec{
+		&equivalent.Spec.Template.Roles[0].EntryTemplate,
+		equivalent.Spec.Template.Roles[0].WorkerTemplate,
+	} {
+		for i := range template.Spec.InitContainers {
+			addControllerOwnedEnvForTest(&template.Spec.InitContainers[i])
+		}
+		for i := range template.Spec.Containers {
+			addControllerOwnedEnvForTest(&template.Spec.Containers[i])
+		}
+	}
+
+	baseData, err := BuildRevisionData(base)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(base) error = %v", err)
+	}
+	equivalentData, err := BuildRevisionData(equivalent)
+	if err != nil {
+		t.Fatalf("BuildRevisionData(equivalent) error = %v", err)
+	}
+	if string(baseData) != string(equivalentData) {
+		t.Fatalf("controller-owned environment values produced different data:\nbase: %s\nother: %s", baseData, equivalentData)
+	}
+	if got := len(equivalent.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env); got != 4 {
+		t.Fatalf("BuildRevisionData mutated input environment: %v", equivalent.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env)
+	}
+}
+
+func addControllerOwnedEnvForTest(container *corev1.Container) {
+	container.Env = append(container.Env,
+		corev1.EnvVar{Name: workloadv1alpha1.GroupSizeEnv, Value: "invalid-group-size"},
+		corev1.EnvVar{Name: workloadv1alpha1.EntryAddressEnv, Value: "invalid-entry-address"},
+		corev1.EnvVar{Name: workloadv1alpha1.WorkerIndexEnv, Value: "invalid-worker-index"},
+	)
 }
 
 func TestBuildRevisionDataPreservesPluginConfigNumberPrecision(t *testing.T) {

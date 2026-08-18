@@ -141,9 +141,9 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 	}, nil
 }
 
-// normalizePodTemplate applies the PodSpec defaults materialized for workload
-// templates by built-in controllers. ModelServing's scheduler wins because Pod
-// generation always overrides the scheduler in the Role template.
+// normalizePodTemplate removes only differences that ModelServing itself
+// overwrites before plugins render the workload. Kubernetes Pod API defaults
+// remain part of the template because plugins can observe the pre-admission Pod.
 func normalizePodTemplate(template *workloadv1alpha1.PodTemplateSpec, schedulerName string) {
 	if template == nil {
 		return
@@ -153,20 +153,24 @@ func normalizePodTemplate(template *workloadv1alpha1.PodTemplateSpec, schedulerN
 	}
 
 	spec := &template.Spec
-	if spec.DNSPolicy == "" {
-		spec.DNSPolicy = corev1.DNSClusterFirst
-	}
-	if spec.RestartPolicy == "" {
-		spec.RestartPolicy = corev1.RestartPolicyAlways
-	}
-	if spec.SecurityContext == nil {
-		spec.SecurityContext = &corev1.PodSecurityContext{}
-	}
-	if spec.TerminationGracePeriodSeconds == nil {
-		gracePeriod := int64(corev1.DefaultTerminationGracePeriodSeconds)
-		spec.TerminationGracePeriodSeconds = &gracePeriod
-	}
 	spec.SchedulerName = schedulerName
+	for i := range spec.InitContainers {
+		removeControllerOwnedEnv(&spec.InitContainers[i])
+	}
+	for i := range spec.Containers {
+		removeControllerOwnedEnv(&spec.Containers[i])
+	}
+}
+
+func removeControllerOwnedEnv(container *corev1.Container) {
+	container.Env = slices.DeleteFunc(container.Env, func(env corev1.EnvVar) bool {
+		switch env.Name {
+		case workloadv1alpha1.GroupSizeEnv, workloadv1alpha1.EntryAddressEnv, workloadv1alpha1.WorkerIndexEnv:
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 func canonicalJSON(data []byte) ([]byte, error) {

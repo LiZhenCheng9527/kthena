@@ -476,56 +476,51 @@ func freshOwners(entries map[string]string, ownerStartedAt map[string]int64) []s
 
 // calculatePodScores returns per-pod scores and the longest block match length (used for the match_ratio metric).
 func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
-	podScores := make(map[string]int)
-
 	if len(blockHashes) == 0 {
 		klog.V(4).Infof("KVCacheAware.calculateScores: no block hashes to process")
-		return podScores, 0
+		return map[string]int{}, 0
 	}
 
 	firstBlockPods, exists := blockToPods[blockHashes[0]]
 	if !exists || len(firstBlockPods) == 0 {
 		klog.V(4).Infof("KVCacheAware.calculateScores: first block hash=%d has no cached pods — all scores 0", blockHashes[0])
-		return podScores, 0
+		return map[string]int{}, 0
 	}
+
+	// only pods holding the first block can ever score, so this is the final size.
+	podScores := make(map[string]int, len(firstBlockPods))
 
 	klog.V(4).Infof("KVCacheAware.calculateScores: first block matched pods=%v, starting prefix matching across %d blocks",
 		firstBlockPods, len(blockHashes))
 
-	activePods := make(map[string]bool, len(firstBlockPods))
 	for _, podName := range firstBlockPods {
-		activePods[podName] = true
 		podScores[podName] = 1
 	}
 
+	// A pod is still matching at block i exactly when its score is i, so podScores
+	// doubles as the active set and no per-block intersection map is needed.
 	lastMatchedBlock := 0
 	for i := 1; i < len(blockHashes); i++ {
-		if len(activePods) == 0 {
-			klog.V(4).Infof("KVCacheAware.calculateScores: no active pods left at block %d", i)
-			break
-		}
-
 		blockPods, exists := blockToPods[blockHashes[i]]
 		if !exists || len(blockPods) == 0 {
 			klog.V(4).Infof("KVCacheAware.calculateScores: block[%d] hash=%d has no cached pods, stopping", i, blockHashes[i])
 			break
 		}
 
-		nextActivePods := make(map[string]bool)
+		stillActive := 0
 		for _, podName := range blockPods {
-			if activePods[podName] {
-				nextActivePods[podName] = true
+			if podScores[podName] == i {
 				podScores[podName]++
+				stillActive++
 			}
 		}
 
-		if len(nextActivePods) == 0 {
+		if stillActive == 0 {
 			klog.V(4).Infof("KVCacheAware.calculateScores: no pod survived intersection at block %d", i)
 			break
 		}
 
 		lastMatchedBlock = i
-		activePods = nextActivePods
 	}
 
 	totalBlocks := len(blockHashes)

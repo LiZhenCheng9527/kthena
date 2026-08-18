@@ -191,6 +191,17 @@ func TestBuildTokenizerEndpoint(t *testing.T) {
 	}
 }
 
+func TestTokenizerManagerRejectsOutOfRangePort(t *testing.T) {
+	manager := NewTokenizerManager(TokenizerManagerConfig{
+		EndpointPorts: map[string]int{EngineVLLM: maxEndpointPort + 1},
+	})
+	pod := testutil.PodInfoWithEngine("pod-vllm", "default", "10.0.0.10", EngineVLLM)
+
+	if tokenizer := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod}); tokenizer != nil {
+		t.Fatalf("expected no tokenizer for an out-of-range endpoint port, got %T", tokenizer)
+	}
+}
+
 // Test error types
 func TestErrorTypes(t *testing.T) {
 	t.Run("ErrTokenizationFailed", func(t *testing.T) {

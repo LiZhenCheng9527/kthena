@@ -32,6 +32,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const maxEndpointPort = 65535
+
 // Remote tokenization is always attempted when an engine port exists.
 type TokenizerManagerConfig struct {
 	EndpointPorts map[string]int
@@ -81,7 +83,7 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 			continue
 		}
 		port, ok := m.config.EndpointPorts[engine]
-		if !ok || port <= 0 {
+		if !ok || port < 1 || port > maxEndpointPort {
 			klog.Warningf("TokenizerManager: no valid endpoint port for engine %q, skipping pod %s", engine, pod.Name)
 			continue
 		}

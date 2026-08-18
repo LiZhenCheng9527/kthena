@@ -121,8 +121,10 @@ type KVConnectorSpec struct {
 }
 
 type TrafficPolicy struct {
-	// The request timeout for the inference request.
-	// By default, there is no timeout.
+	// Timeout bounds how long the router waits for the backend to start responding,
+	// covering connection setup, sending the request and waiting for the response
+	// headers. It does not bound the response body, so a streamed response may run
+	// longer. By default, there is no timeout.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 	// The retry policy for the inference request.

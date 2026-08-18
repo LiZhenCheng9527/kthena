@@ -656,7 +656,8 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	}
 
 	req := c.Request
-	if err := r.proxyModelEndpoint(c, req, ctx, modelRequest, port); err != nil {
+	upstreamTimeout := upstreamTimeoutFor(modelServer)
+	if err := r.proxyModelEndpoint(c, req, ctx, modelRequest, port, upstreamTimeout); err != nil {
 		klog.Errorf("request failed reqID: %s: %v", c.Request.Header.Get("x-request-id"), err)
 		accesslog.SetError(c, "proxy", "request processing failed")
 		if !c.Writer.Written() {
@@ -665,6 +666,14 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		return err
 	}
 	return nil
+}
+
+// upstreamTimeoutFor returns the timeout configured on the ModelServer, or zero
+func upstreamTimeoutFor(ms *v1alpha1.ModelServer) time.Duration {
+	if ms == nil || ms.Spec.TrafficPolicy == nil || ms.Spec.TrafficPolicy.Timeout == nil {
+		return 0
+	}
+	return ms.Spec.TrafficPolicy.Timeout.Duration
 }
 
 func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
@@ -805,6 +814,7 @@ func (r *Router) proxy(
 	ctx *framework.Context,
 	stream bool,
 	port int32,
+	timeout time.Duration,
 	onUsage func(u providers.TokenUsage),
 ) error {
 	// Capture body bytes once so each retry attempt gets a fresh reader.
@@ -835,7 +845,7 @@ func (r *Router) proxy(
 		}
 
 		// Request dispatched to the pod.
-		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, onUsage)
+		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, timeout, onUsage)
 
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.DecActiveUpstreamRequests()
@@ -866,6 +876,7 @@ func (r *Router) proxyModelEndpoint(
 	ctx *framework.Context,
 	modelRequest ModelRequest,
 	port int32,
+	timeout time.Duration,
 ) error {
 	// Mark start of upstream processing
 	accesslog.MarkUpstreamStart(c)
@@ -885,7 +896,7 @@ func (r *Router) proxyModelEndpoint(
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, func(usage providers.TokenUsage) {
+		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -1095,9 +1106,10 @@ func proxyRequest(
 	podIP string,
 	port int32,
 	stream bool,
+	timeout time.Duration,
 	onUsage func(u providers.TokenUsage),
 ) error {
-	resp, err := doRequest(req, podIP, port)
+	resp, err := doRequest(req, podIP, port, timeout)
 	if resp != nil {
 		defer resp.Body.Close()
 		accesslog.SetUpstreamInfo(c, resp.StatusCode, 0)
@@ -1275,19 +1287,46 @@ var hopByHopResponseHeaders = []string{
 	"Upgrade",
 }
 
+// cancelOnClose releases the request context once the caller is done with the body.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
 func doRequest(
 	req *http.Request,
 	podIP string,
 	port int32,
+	timeout time.Duration,
 ) (*http.Response, error) {
 	// step 1: change request URL to prefill pod URL.
 	req.URL.Host = net.JoinHostPort(podIP, strconv.Itoa(int(port)))
 
 	// step 2: use http.Transport to do request to prefill pod.
-	transport := http.DefaultTransport
-	resp, err := transport.RoundTrip(req)
+	// One budget for dial, TLS, request upload and the header wait. Cancelling once
+	// headers arrive would close the body too, so release it on Body.Close instead
+	cancel := context.CancelFunc(func() {})
+	if timeout > 0 {
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(req.Context())
+		timer := time.AfterFunc(timeout, cancel)
+		defer timer.Stop()
+		req = req.WithContext(ctx)
+	}
+
+	resp, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
+		cancel()
 		return nil, err
+	}
+	if timeout > 0 {
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp, fmt.Errorf("http resp error, http code is %d", resp.StatusCode)

@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
 )
 
@@ -226,9 +225,7 @@ func askForConfirmation(question string) bool {
 
 func applyResources(yamlContent string) error {
 	// Load kubeconfig with kubectl's precedence: KUBECONFIG first, then ~/.kube/config.
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
-	config, err := kubeConfig.ClientConfig()
+	config, err := newKubeConfig().ClientConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load kubeconfig: %v", err)
 	}

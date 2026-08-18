@@ -225,8 +225,10 @@ func askForConfirmation(question string) bool {
 }
 
 func applyResources(yamlContent string) error {
-	// Load kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	// Load kubeconfig with kubectl's precedence: KUBECONFIG first, then ~/.kube/config.
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
+	config, err := kubeConfig.ClientConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load kubeconfig: %v", err)
 	}

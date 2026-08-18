@@ -214,7 +214,7 @@ func runGetTemplate(cmd *cobra.Command, args []string) error {
 // from the current kubeconfig context so callers can fall back to it when
 // the user hasn't passed -n/--namespace explicitly.
 func getKthenaClient() (client *versioned.Clientset, contextNamespace string, err error) {
-	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: clientcmd.RecommendedHomeFile}
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
 
 	restConfig, err := kubeConfig.ClientConfig()

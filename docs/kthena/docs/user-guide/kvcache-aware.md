@@ -295,10 +295,12 @@ data:
 
 **Plugin arguments:**
 
-| Parameter          | Default | Description                                                                      |
-| ------------------ | ------- | -------------------------------------------------------------------------------- |
-| `blockSizeToHash`  | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
-| `maxBlocksToMatch` | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
+| Parameter             | Default | Description                                                                      |
+| --------------------- | ------- | -------------------------------------------------------------------------------- |
+| `blockSizeToHash`     | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
+| `maxBlocksToMatch`    | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
+| `vllmTokenizerPort`   | 8000    | Port used to fetch the tokenizer from vLLM pods.                                 |
+| `sglangTokenizerPort` | 30000   | Port used to fetch the tokenizer from SGLang pods.                               |
 
 **Helm values:**
 

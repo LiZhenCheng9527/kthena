@@ -15,6 +15,7 @@ rules:
       - update
       - patch
       - get
+      - delete
   - apiGroups:
       - apiextensions.k8s.io
     resources:

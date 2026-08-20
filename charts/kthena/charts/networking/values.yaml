@@ -9,6 +9,9 @@ kthenaRouter:
     # exposeOnRouterPort restores the legacy /metrics endpoint on the inference listener.
     # Keep disabled when the inference Service is publicly reachable.
     exposeOnRouterPort: false
+  service:
+    # -- Kubernetes Service type used to expose kthena-router.
+    type: LoadBalancer
   tls:
     enabled: false
     # The DNS name to use for the certificate.

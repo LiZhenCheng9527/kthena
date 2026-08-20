@@ -38,6 +38,7 @@ A Helm chart for deploying Kthena
 | networking.kthenaRouter.metrics.port | int | `9090` | Internal Prometheus metrics port for Kthena Router. |
 | networking.kthenaRouter.port | int | `8080` | Container port for Kthena Router. |
 | networking.kthenaRouter.replicas | int | `1` | Number of Kthena Router instances to run. |
+| networking.kthenaRouter.service.type | string | `"LoadBalancer"` | Kubernetes Service type used to expose Kthena Router. |
 | networking.kthenaRouter.sessionBoost.enabled | bool | `false` | Enable session-boost scheduling. Mutually exclusive with fairness. |
 | networking.kthenaRouter.sessionBoost.gracePeriod | string | `"0s"` | Wait time after a request completes for a same-session follow-up.<br/> Disabled by default (`0s`). |
 | networking.kthenaRouter.sessionBoost.header | string | `"X-Session-ID"` | HTTP header used to identify conversation sessions. |

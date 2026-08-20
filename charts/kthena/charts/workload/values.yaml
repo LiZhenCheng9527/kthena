@@ -13,7 +13,7 @@ controllerManager:
     # node: edit by CI. No need to modify manually
     tag: latest
     pullPolicy: IfNotPresent
-    # set --enable-webhook false to disable webhook, default is true
+    # to turn the webhook off, set controllerManager.webhook.enabled to false
     args: [ "--v=2" ]
   resource:
     limits:

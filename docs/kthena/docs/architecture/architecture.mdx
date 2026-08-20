@@ -102,7 +102,7 @@ Kthena is intentionally lightweight: the whole platform is two self-contained Go
 
 | Subchart | Binary | CRD group | Owns |
 |---|---|---|---|
-| `workload` | `kthena-controller-manager` | `workload.serving.volcano.sh` | `ModelServing`, `ModelBooster`, `AutoScalingPolicy`, `AutoScalingPolicyBinding` |
+| `workload` | `kthena-controller-manager` | `workload.serving.volcano.sh` | `ModelServing`, `ModelBooster`, `AutoscalingPolicy` |
 | `networking` | `kthena-router` | `networking.serving.volcano.sh` | `ModelRoute`, `ModelServer`, `ExternalModelProvider` |
 
 Because the planes are decoupled, three deployment shapes are supported:

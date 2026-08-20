@@ -33,7 +33,7 @@ Kthena ships as **two independent, self-contained components** — workload cont
 Kthena is built to be adopted incrementally and to stay out of your way.
 
 - **Small footprint** — Two self-contained Go binaries with a minimal dependency surface, quick to install and simple to upgrade.
-- **Independently deployable planes** — The **workload** controllers (`ModelServing`, `AutoScalingPolicy`) and the **networking** router (`ModelRoute`, `ModelServer`) are separate Helm subcharts with separate CRD groups and separate release lifecycles.
+- **Independently deployable planes** — The **workload** controllers (`ModelServing`, `AutoscalingPolicy`) and the **networking** router (`ModelRoute`, `ModelServer`) are separate Helm subcharts with separate CRD groups and separate release lifecycles.
 - **No cross-plane runtime coupling** — Each component talks only to the Kubernetes API, never to the other. Run the router in front of workloads managed by Deployments or another operator; or run the controllers and expose pods through your own gateway.
 - **Opt-in extras** — Gang scheduling (Volcano), webhooks, Gateway API support, and TLS are all optional, so a minimal install stays minimal.
 

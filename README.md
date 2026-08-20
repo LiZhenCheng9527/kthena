@@ -74,7 +74,7 @@ The two components talk to Kubernetes, not to each other, so you can mix and mat
 
 | You want to...               | Install               | Notes                                                                                                  |
 | ---------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------ |
-| Manage model workloads only  | `workload` subchart   | Use `ModelServing` / `AutoScalingPolicy` and expose pods with your own gateway or `Service`.           |
+| Manage model workloads only  | `workload` subchart   | Use `ModelServing` / `AutoscalingPolicy` and expose pods with your own gateway or `Service`.           |
 | Route inference traffic only | `networking` subchart | Point `ModelServer` at any pods — Deployments, StatefulSets, or workloads managed by another operator. |
 | Full platform                | Both subcharts        | Required for the one-stop `ModelBooster` API, which cascades into both CRD groups.                     |
 

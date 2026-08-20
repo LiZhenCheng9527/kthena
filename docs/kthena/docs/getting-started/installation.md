@@ -77,10 +77,10 @@ You can also download the Helm chart package from [GitHub releases](https://gith
 
 Kthena is modular: the **workload** controllers and the **networking** router are separate Helm subcharts with separate CRD groups, and neither depends on the other at runtime. Install only what you need — a component-scoped install brings in just that component's CRDs, RBAC, and webhooks.
 
-| Subchart     | Component                                                  | CRDs installed                                                                  |
-| :----------- | :--------------------------------------------------------- | :------------------------------------------------------------------------------ |
-| `workload`   | `kthena-controller-manager` (model lifecycle, autoscaling) | `ModelServing`, `ModelBooster`, `AutoScalingPolicy`, `AutoScalingPolicyBinding` |
-| `networking` | `kthena-router` (inference traffic routing)                | `ModelRoute`, `ModelServer`, `ExternalModelProvider`                            |
+| Subchart     | Component                                                  | CRDs installed                                       |
+| :----------- | :--------------------------------------------------------- | :--------------------------------------------------- |
+| `workload`   | `kthena-controller-manager` (model lifecycle, autoscaling) | `ModelServing`, `ModelBooster`, `AutoscalingPolicy`  |
+| `networking` | `kthena-router` (inference traffic routing)                | `ModelRoute`, `ModelServer`, `ExternalModelProvider` |
 
 **Workload controllers only** — manage model workloads with Kthena while keeping your existing gateway for traffic:
 

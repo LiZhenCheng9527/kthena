@@ -34,7 +34,7 @@ Kthena is deliberately **lightweight and composable**. The entire platform is tw
 ### **Lightweight & Modular**
 - **Small footprint**: Two self-contained Go binaries with a minimal dependency surface — quick to install, cheap to run, and simple to upgrade.
 - **Independently deployable planes**: The controller manager (workload) and the router (networking) are separate Helm subcharts with separate CRD groups and release lifecycles. Deploy either one alone, or both together.
-- **No runtime coupling**: Each component reconciles against the Kubernetes API rather than against the other, so a partial install is a first-class scenario, not a degraded mode.
+- **No runtime coupling**: Each component talks only to the Kubernetes API, never to the other, so a partial install is a first-class scenario, not a degraded mode.
 - **Bring your own stack**: Keep your existing API gateway, ingress, and observability tooling — Kthena plugs into them instead of replacing them.
 - **Opt-in capabilities**: Gang scheduling (Volcano), webhooks, Gateway API support, and TLS are all optional, so a minimal install stays minimal.
 

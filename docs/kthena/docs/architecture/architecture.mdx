@@ -6,7 +6,7 @@ import requestPipeline from '../assets/diagrams/architecture/request_pipeline.sv
 
 Kthena follows a **two-plane architecture** that cleanly separates *what you declare* from *how requests flow*. The **Control Plane** reconciles your CRDs into a running system; the **Data Plane** routes every inference request through a model-aware pipeline to the right pod at the right time.
 
-The two planes are **independently deployable**. They share no in-process state and never call each other — both reconcile purely against the Kubernetes API. Each plane is a single self-contained Go binary packaged as its own Helm subchart with its own CRD group, so you can run either one alone. See [Modular Deployment](#modular-deployment) below.
+The two planes are **independently deployable**. They share no in-process state and never call each other — both interact only with the Kubernetes API. Each plane is a single self-contained Go binary packaged as its own Helm subchart with its own CRD group, so you can run either one alone. See [Modular Deployment](#modular-deployment) below.
 
 <LightboxImage src={architectureOverview} alt="Architecture Overview"/>
 

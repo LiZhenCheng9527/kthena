@@ -105,10 +105,16 @@ The one-stop `ModelBooster` API cascades into both CRD groups, so it requires **
 You can enable the other component later with `helm upgrade --set <subchart>.enabled=true`. Note that Helm does not install files under a chart's `crds/` directory during an upgrade, so apply the newly enabled component's CRDs yourself first:
 
 ```bash
-# Fetch and unpack the chart, then apply the CRDs of the component you are enabling
-helm pull oci://ghcr.io/volcano-sh/charts/kthena --version v1.0.0 --untar
-kubectl apply --server-side -f kthena/charts/networking/crds/
+# 1. Fetch and unpack the chart. Replace <chart-version> with the chart version
+#    you have installed — `helm list -n kthena-system` shows it.
+helm pull oci://ghcr.io/volcano-sh/charts/kthena --version <chart-version> --untar
 
+# 2. Apply the CRDs of the subchart you are enabling: use `networking` for the
+#    router, or `workload` for the controllers.
+kubectl apply --server-side -f kthena/charts/<subchart>/crds/
+
+# 3. Enable the subchart. This example turns on the router; use
+#    `--set workload.enabled=true` to turn on the controllers instead.
 helm upgrade kthena oci://ghcr.io/volcano-sh/charts/kthena \
   --namespace kthena-system --reuse-values \
   --set networking.enabled=true

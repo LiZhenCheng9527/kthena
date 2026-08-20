@@ -18,6 +18,7 @@ package convert
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -368,6 +369,76 @@ func TestCreateModelServingResources(t *testing.T) {
 			diff := cmp.Diff(tt.expected, got)
 			if diff != "" {
 				t.Errorf("ModelServing mismatch (-expected +actual):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestBuildModelServingWorkerPodsOmitted covers the regression from #1612 using a fixture
+// whose worker block has no `pods` key at all, so YAML unmarshalling naturally zeroes the
+// field (rather than a test setting Workers[0].Pods = 0 directly on an already-loaded
+// object). This is the actual shape of the reported bug: a ModelBooster manifest that never
+// mentions pods must still produce a valid (non-negative) workerReplicas.
+func TestBuildModelServingWorkerPodsOmitted(t *testing.T) {
+	model := loadYaml[workload.ModelBooster](t, "testdata/input/model-with-pods-omitted.yaml")
+	require.Equal(t, int32(0), model.Spec.Backend.Workers[0].Pods,
+		"fixture must omit pods so unmarshalling produces the zero value naturally")
+
+	got, err := BuildModelServing(model)
+	require.NoError(t, err)
+	require.Len(t, got.Spec.Template.Roles, 1)
+
+	workerReplicas := got.Spec.Template.Roles[0].WorkerReplicas
+	assert.GreaterOrEqual(t, workerReplicas, int32(0), "workerReplicas must never be negative")
+	assert.Equal(t, int32(0), workerReplicas)
+}
+
+// TestBuildModelServingWorkerPodsToWorkerReplicas covers the workerReplicas calculation for
+// explicit pods values: an explicit zero (distinct from the omitted-field fixture above,
+// which exercises the same zero value reached through YAML unmarshalling instead of direct
+// assignment), the single-pod baseline, and a multi-node value. It also asserts that
+// buildCommands' Ray-leader command generation, which is derived from the same Pods field
+// as WORKER_REPLICAS, keeps its existing "> 1" behavior for every case.
+func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
+	tests := []struct {
+		name               string
+		pods               int32
+		wantWorkerReplicas int32
+		wantRayLeaderCmd   bool
+	}{
+		{name: "pods: 0 explicit", pods: 0, wantWorkerReplicas: 0, wantRayLeaderCmd: false},
+		{name: "pods: 1 is a single pod with no extra workers", pods: 1, wantWorkerReplicas: 0, wantRayLeaderCmd: false},
+		{name: "pods > 1 adds Ray workers", pods: 3, wantWorkerReplicas: 2, wantRayLeaderCmd: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := loadYaml[workload.ModelBooster](t, "testdata/input/model.yaml")
+			model.Spec.Backend.Workers[0].Pods = tt.pods
+
+			got, err := BuildModelServing(model)
+			require.NoError(t, err)
+			require.Len(t, got.Spec.Template.Roles, 1)
+
+			workerReplicas := got.Spec.Template.Roles[0].WorkerReplicas
+			assert.GreaterOrEqual(t, workerReplicas, int32(0), "workerReplicas must never be negative")
+			assert.Equal(t, tt.wantWorkerReplicas, workerReplicas)
+
+			var engine *corev1.Container
+			for i := range got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers {
+				container := &got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[i]
+				if container.Name == "engine" {
+					engine = container
+					break
+				}
+			}
+			require.NotNil(t, engine)
+			command := strings.Join(engine.Command, " ")
+			if tt.wantRayLeaderCmd {
+				assert.Contains(t, command, fmt.Sprintf("leader --ray_cluster_size=%d", tt.wantWorkerReplicas+1))
+				assert.Contains(t, command, "--distributed_executor_backend ray")
+			} else {
+				assert.NotContains(t, command, "leader --ray_cluster_size")
+				assert.NotContains(t, command, "--distributed_executor_backend")
 			}
 		})
 	}

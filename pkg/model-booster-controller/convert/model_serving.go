@@ -282,6 +282,13 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 	}
 
 	engineEnv := buildEngineEnvVars(backend)
+	// Pods has no schema default (Minimum is 0), so an omitted or explicit-zero value
+	// decodes to 0. A role can never meaningfully have zero pods, so treat that as the
+	// single-pod baseline (no extra Ray workers) instead of computing a negative replicas.
+	workerReplicas := workersMap[workload.ModelWorkerTypeServer].Pods - 1
+	if workersMap[workload.ModelWorkerTypeServer].Pods <= 1 {
+		workerReplicas = 0
+	}
 	data := map[string]interface{}{
 		"MODEL_SERVING_TEMPLATE_METADATA": &metav1.ObjectMeta{
 			Name:      utils.GetBackendResourceName(model.Name, backend.Name),
@@ -334,7 +341,7 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 		"ENGINE_SERVER_RESOURCES":            workersMap[workload.ModelWorkerTypeServer].Resources,
 		"ENGINE_SERVER_IMAGE":                workersMap[workload.ModelWorkerTypeServer].Image,
 		"ENGINE_SERVER_COMMAND":              commands,
-		"WORKER_REPLICAS":                    workersMap[workload.ModelWorkerTypeServer].Pods - 1,
+		"WORKER_REPLICAS":                    workerReplicas,
 		"SCHEDULER_NAME":                     backend.SchedulerName,
 		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
 		"SERVER_AFFINITY":                    workersMap[workload.ModelWorkerTypeServer].Affinity,

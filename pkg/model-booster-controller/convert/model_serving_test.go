@@ -397,9 +397,8 @@ func TestBuildModelServingWorkerPodsOmitted(t *testing.T) {
 // explicit pods values: an explicit zero (distinct from the omitted-field fixture above,
 // which exercises the same zero value reached through YAML unmarshalling instead of direct
 // assignment), the single-pod baseline, and a multi-node value. It also asserts that
-// buildCommands' Ray-leader command generation - which reads the same effectiveServerPods
-// value as WORKER_REPLICAS - keeps its existing "> 1" behavior for every case, so the
-// centralized clamp doesn't change command generation.
+// buildCommands' Ray-leader command generation, which is derived from the same Pods field
+// as WORKER_REPLICAS, keeps its existing "> 1" behavior for every case.
 func TestBuildModelServingWorkerPodsToWorkerReplicas(t *testing.T) {
 	tests := []struct {
 		name               string

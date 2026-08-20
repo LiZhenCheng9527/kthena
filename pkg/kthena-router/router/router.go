@@ -297,8 +297,9 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 
 		// Create metrics recorder for this request
 		path := c.Request.URL.Path
+		hasModel := r.store.HasModel(modelName)
 		metricsModel := metrics.UnknownModel
-		if r.store.HasModel(modelName) {
+		if hasModel {
 			metricsModel = modelName
 		}
 		metricsRecorder := metrics.NewRequestMetricsRecorder(r.metrics, metricsModel, path)
@@ -378,7 +379,9 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 		c.Set("metricsRecorder", metricsRecorder)
 
 		// step 3.1: direct load balancing when neither fairness scheduling nor
-		// session boost is enabled.
+		// session boost is enabled. doLoadbalance validates the route itself
+		// (a model may be routable via InferencePool/HTTPRoute even without a
+		// registered ModelRoute), so HasModel is not checked here.
 		if !EnableFairnessScheduling && !EnableSessionBoost {
 			_ = r.doLoadbalance(c, modelRequest)
 			return
@@ -386,6 +389,25 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 
 		// step 3.2: queue scheduling. The queue orders requests by the active
 		// strategy: per-user fairness or session boost (mutually exclusive).
+		//
+		// Reject models with no registered ModelRoute here, before
+		// handleFairnessScheduling, so store.Enqueue can never be reached for
+		// an unregistered model name — which would otherwise leak a
+		// model-specific queue and goroutine forever, since queue cleanup is
+		// tied to the ModelRoute lifecycle. Fairness/session-boost priority is
+		// computed from ModelRoute-level rate-limit configuration, so (unlike
+		// the direct load-balancing path above) an InferencePool-only route
+		// cannot be scheduled through this path anyway. Using the same
+		// response and route_not_found observability labeling as the
+		// equivalent unregistered-model case in doLoadbalance keeps both
+		// paths consistent for callers and metrics/logging.
+		if !hasModel {
+			accesslog.SetError(c, "route_not_found", "route not found")
+			c.AbortWithStatusJSON(http.StatusNotFound, "route not found")
+			c.Set("finishReason", "route_not_found")
+			return
+		}
+
 		if err := r.handleFairnessScheduling(c, modelRequest, requestID, modelName); err != nil {
 			accesslog.SetError(c, "scheduling", err.Error())
 			c.Set("finishReason", "scheduling")
@@ -1452,6 +1474,9 @@ func (r *Router) proxyToPDDisaggregated(
 }
 
 // handleFairnessScheduling handles the fairness scheduling flow for requests.
+// The caller (HandlerFunc) validates that modelName has a registered
+// ModelRoute before invoking this function, so Enqueue can never be reached
+// for an unregistered model name.
 func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
 	// Extract session ID from HTTP header for multi-turn conversation tracking.
 	sessionHeader := r.store.GetSessionIDHeader()

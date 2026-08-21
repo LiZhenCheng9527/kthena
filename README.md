@@ -136,7 +136,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed guidelines.
 
 Regular Community Meeting:
 
-- Community biweekly meeting for Asia: 16:00 - 17:00 (UTC+8) Wednesday. [Convert to your timezone](https://dateful.com/time-zone-converter?t=16&tz2=UTC%2B8).
+- Community weekly meeting for Asia: 16:00 - 17:00 (UTC+8) Wednesday. [Convert to your timezone](https://dateful.com/time-zone-converter?t=16&tz2=UTC%2B8).
 
 Resources:
 - [Meeting notes and agenda](https://docs.google.com/document/d/1bph_MA1UU3tKCV9T8XmJ0cIH3o85uAxExep412fDToE/edit?tab=t.0)

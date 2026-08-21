@@ -460,8 +460,8 @@ func wildcardHostnameMatch(pattern, hostname string) bool {
 	}
 
 	prefix := hostnameLower[:len(hostnameLower)-len(suffix)]
-	// Gateway wildcard hostnames represent exactly one leading label.
-	return prefix != "" && !strings.Contains(prefix, ".")
+	// Gateway wildcard hostnames use suffix matching.
+	return prefix != ""
 }
 
 // listenerConfigKey creates a unique key for a listener config for comparison

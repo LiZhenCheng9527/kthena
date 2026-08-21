@@ -73,10 +73,10 @@ func TestWildcardHostnameMatch(t *testing.T) {
 			want:     true,
 		},
 		{
-			name:     "multi label subdomain should not match",
+			name:     "multi label subdomain match",
 			pattern:  "*.example.com",
 			hostname: "a.b.example.com",
-			want:     false,
+			want:     true,
 		},
 		{
 			name:     "apex hostname should not match",

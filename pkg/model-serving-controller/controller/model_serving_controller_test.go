@@ -2051,6 +2051,40 @@ func createStandardModelServing(name string, replicas int32, roleReplicas int32)
 	}
 }
 
+// TestHandleDeletedPodNoneEnqueues verifies the RecoveryPolicy=None branch of
+// handleDeletedPod: a deleted pod must re-enqueue the ModelServing so the
+// reconcile loop refills it (deployment-style), and must NOT delete the whole
+// role/serving group.
+func TestHandleDeletedPodNoneEnqueues(t *testing.T) {
+	ms := createStandardModelServing("ms-none-recovery", 1, 1)
+	ms.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
+	h := newTestController(t, ms)
+	controller := h.controller
+
+	require.Eventually(t, func() bool {
+		_, err := controller.modelServingLister.ModelServings("default").Get(ms.Name)
+		return err == nil
+	}, 2*time.Second, 10*time.Millisecond)
+	drainWorkqueue(t, controller.workqueue)
+	assertQueueEmpty(t, controller.workqueue)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ms.Namespace,
+			Name:      ms.Name + "-0-prefill-0-0",
+			Labels: map[string]string{
+				workloadv1alpha1.ModelServingNameLabelKey: ms.Name,
+				workloadv1alpha1.GroupNameLabelKey:        ms.Name + "-0",
+			},
+		},
+	}
+
+	// None must enqueue the ModelServing for reconcile; the other policies
+	// delete the role/serving group here, None must not.
+	require.NoError(t, controller.handleDeletedPod(ms, ms.Name+"-0", pod))
+	h.expectQueuedKey(namespacedKey(ms.Namespace, ms.Name))
+}
+
 // createGangModelServing creates a ModelServing with gang policy
 func createGangModelServing(name string, replicas int32, roleReplicas int32) *workloadv1alpha1.ModelServing {
 	ms := createStandardModelServing(name, replicas, roleReplicas)

@@ -1775,6 +1775,13 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 			}
 		}
 		c.DeleteRole(context.Background(), ms, servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod))
+	case workloadv1alpha1.NoneRestartPolicy:
+		// None follows the default deployment behavior: only the deleted pod is
+		// gone. Re-enqueue so the reconcile loop refills it via
+		// manageRoleReplicasPerGroup (len(pods) < expectedPods -> recreate),
+		// without deleting the whole role/serving group.
+		klog.V(2).Infof("RecoveryPolicy=None, re-enqueue %s/%s to refill deleted pod %s", ms.Namespace, ms.Name, pod.Name)
+		c.enqueueModelServing(ms)
 	}
 	return nil
 }

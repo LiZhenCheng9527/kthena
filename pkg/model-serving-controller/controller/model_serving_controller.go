@@ -1662,6 +1662,14 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 }
 
 func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, errPod *corev1.Pod) error {
+	// RecoveryPolicy=None: leave a restarted, still-alive pod to the kubelet's
+	// restartPolicy instead of deleting it. A terminal PodFailed pod still falls
+	// through to deletion + refill (handleDeletedPod None case).
+	if ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy &&
+		utils.ContainerRestarted(errPod) && !utils.IsPodFailed(errPod) {
+		klog.V(4).Infof("RecoveryPolicy=None: leave restarted pod %s to kubelet", errPod.Name)
+		return nil
+	}
 	// pod is already in the grace period and does not need to be processed for the time being.
 	key := getPodGracePeriodKey(errPod)
 	now := time.Now()
@@ -1776,11 +1784,9 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 		}
 		c.DeleteRole(context.Background(), ms, servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod))
 	case workloadv1alpha1.NoneRestartPolicy:
-		// None follows the default deployment behavior: only the deleted pod is
-		// gone. Re-enqueue so the reconcile loop refills it via
-		// manageRoleReplicasPerGroup (len(pods) < expectedPods -> recreate),
-		// without deleting the whole role/serving group.
-		klog.V(4).Infof("RecoveryPolicy=None, re-enqueue %s/%s to refill deleted pod %s", ms.Namespace, ms.Name, pod.Name)
+		// None (deployment-style): re-enqueue so the reconcile loop refills the
+		// single missing pod, without deleting the whole role/serving group.
+		klog.V(4).Infof("RecoveryPolicy=None: re-enqueue to refill deleted pod %s", pod.Name)
 		c.enqueueModelServing(ms)
 	}
 	return nil

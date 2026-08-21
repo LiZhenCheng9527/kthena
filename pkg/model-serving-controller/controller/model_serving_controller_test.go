@@ -6128,6 +6128,45 @@ func TestHandleErrorPodTracksReplacementByUID(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
+// TestHandleErrorPodNoneLeavesRestartedPod verifies that under RecoveryPolicy=None,
+// a pod whose container the kubelet has restarted (pod still alive, not PodFailed)
+// is NOT deleted by handleErrorPod — it is left to the pod's own restartPolicy,
+// avoiding the pod churn the Recreate policies cause. A terminal PodFailed pod
+// still falls through to deletion + refill (handled by handleDeletedPod None case).
+func TestHandleErrorPodNoneLeavesRestartedPod(t *testing.T) {
+	const (
+		namespace = "default"
+		podName   = "test-none-0-prefill-0-0"
+	)
+	restartedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID("restarted-pod"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{RestartCount: 1},
+			},
+		},
+	}
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "test-none"},
+		Spec:       workloadv1alpha1.ModelServingSpec{RecoveryPolicy: workloadv1alpha1.NoneRestartPolicy},
+	}
+	controller, kubeClient := newGracePeriodTestController(t, restartedPod)
+
+	// None must early-return before touching the store/graceMap or deleting the pod.
+	require.NoError(t, controller.handleErrorPod(ms, "test-none-0", restartedPod))
+
+	// No pod delete was issued — the pod is left to kubelet's restartPolicy.
+	for _, action := range kubeClient.Actions() {
+		require.Falsef(t, action.Matches("delete", "pods"),
+			"None must not delete a restarted pod; got unexpected action %v", action)
+	}
+}
+
 func newGracePeriodTestController(t *testing.T, pod *corev1.Pod) (*ModelServingController, *kubefake.Clientset) {
 	t.Helper()
 

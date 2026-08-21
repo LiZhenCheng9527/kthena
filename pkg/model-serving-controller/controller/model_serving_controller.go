@@ -1780,7 +1780,7 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 		// gone. Re-enqueue so the reconcile loop refills it via
 		// manageRoleReplicasPerGroup (len(pods) < expectedPods -> recreate),
 		// without deleting the whole role/serving group.
-		klog.V(2).Infof("RecoveryPolicy=None, re-enqueue %s/%s to refill deleted pod %s", ms.Namespace, ms.Name, pod.Name)
+		klog.V(4).Infof("RecoveryPolicy=None, re-enqueue %s/%s to refill deleted pod %s", ms.Namespace, ms.Name, pod.Name)
 		c.enqueueModelServing(ms)
 	}
 	return nil

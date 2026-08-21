@@ -708,12 +708,10 @@ func hasUpdateableOutdatedServingGroup(
 	revision string,
 	partition int,
 ) bool {
-	for _, group := range groups {
-		_, ordinal := utils.GetParentNameAndOrdinal(group.Name)
-		if ordinal < 0 {
-			continue
-		}
-		if ordinal >= partition && group.Revision != revision {
+	// Partition protects the first N existing groups, including when binpack
+	// scale-down has left a sparse ordinal set.
+	for index, group := range groups {
+		if index >= partition && group.Revision != revision {
 			return true
 		}
 	}
@@ -1956,8 +1954,24 @@ func (c *ModelServingController) rolesForServingGroupReadiness(ms *workloadv1alp
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve partition for ServingGroup %s: %v", servingGroupName, err)
 	}
-	_, ordinal := utils.GetParentNameAndOrdinal(servingGroupName)
-	if ordinal < 0 || ordinal >= partition {
+	if partition <= 0 {
+		return ms.Spec.Template.Roles, nil
+	}
+	servingGroups, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
+	if err != nil {
+		if errors.Is(err, datastore.ErrServingGroupNotFound) {
+			return ms.Spec.Template.Roles, nil
+		}
+		return nil, fmt.Errorf("failed to get ServingGroups for readiness: %v", err)
+	}
+	groupIndex := -1
+	for index, group := range servingGroups {
+		if group.Name == servingGroupName {
+			groupIndex = index
+			break
+		}
+	}
+	if groupIndex < 0 || groupIndex >= partition {
 		return ms.Spec.Template.Roles, nil
 	}
 	revision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), servingGroupName)
@@ -2289,7 +2303,7 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 				currentGroups = append(currentGroups, ordinal)
 				// Count revisions for non-updated groups to find the most common one
 				revisionCount[group.Revision]++
-				if ordinal >= partition {
+				if index >= partition {
 					rolloutActive = true
 				}
 			}
@@ -2508,6 +2522,14 @@ func forEachMissingOrdinal(expectedCount int, existingOrdinals []int, limit int,
 func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupList []datastore.ServingGroup, expectedCount int) error {
 	partition, _, _ := c.getPartition(modelServingPartition(ms), modelServingReplicas(ms))
 
+	// Partition protects the first N existing groups in ordinal order. The
+	// datastore returns servingGroupList in that order, including when binpack
+	// scale-down has left sparse ordinals.
+	protectedGroupNames := sets.New[string]()
+	for index := 0; index < partition && index < len(servingGroupList); index++ {
+		protectedGroupNames.Insert(servingGroupList[index].Name)
+	}
+
 	// Calculate scores for all servingGroups first
 	allScores := make([]ServingGroupWithScore, 0, len(servingGroupList))
 	for _, group := range servingGroupList {
@@ -2515,13 +2537,10 @@ func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms 
 		allScores = append(allScores, scoreInfo)
 	}
 
-	// Partition protection is based on ordinal and is independent of the target
-	// replica count. Binpack scale-down can leave a high ordinal as a normal
-	// replica, so it must not be reclassified merely because replicas changed.
 	var protectedScores []ServingGroupWithScore
 	var nonProtectedScores []ServingGroupWithScore
 	for _, score := range allScores {
-		if score.Index >= 0 && score.Index < partition {
+		if protectedGroupNames.Contains(score.Name) {
 			protectedScores = append(protectedScores, score)
 		} else {
 			nonProtectedScores = append(nonProtectedScores, score)

@@ -3320,9 +3320,8 @@ func TestScaleDownServingGroupsWithPriorityAndDeletionCost(t *testing.T) {
 	}
 }
 
-// TestScaleDownServingGroupsWithPartition tests the scaleDownServingGroups function with partition protection
-// This test verifies that when partition is set, only ServingGroups with ordinal >= partition
-// are considered for deletion, protecting partition-protected replicas.
+// TestScaleDownServingGroupsWithPartition tests the scaleDownServingGroups function with partition protection.
+// Partition protects the first N existing ServingGroups in ordinal order.
 func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 	tests := []struct {
 		name                   string
@@ -3335,16 +3334,16 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 		description            string
 	}{
 		{
-			name:            "partition=3, protect replicas below partition",
+			name:            "partition=3 protects first three existing groups",
 			partition:       ptr.To(intstr.FromInt32(3)),
 			existingIndices: []int{0, 1, 2, 3, 4},
 			expectedCount:   3,
 			podDeletionCosts: map[int]int{
-				0: 0,   // Low cost but protected (ordinal < partition)
-				1: 0,   // Low cost but protected (ordinal < partition)
-				2: 0,   // Low cost but protected (ordinal < partition)
-				3: 100, // High cost, not protected (ordinal >= partition)
-				4: 50,  // Medium cost, not protected (ordinal >= partition)
+				0: 0,   // Low cost but protected by the partition prefix.
+				1: 0,   // Low cost but protected by the partition prefix.
+				2: 0,   // Low cost but protected by the partition prefix.
+				3: 100, // High cost, outside the partition prefix.
+				4: 50,  // Medium cost, outside the partition prefix.
 			},
 			groupStatuses: map[int]datastore.ServingGroupStatus{
 				0: datastore.ServingGroupRunning,
@@ -3353,24 +3352,40 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 				3: datastore.ServingGroupRunning,
 				4: datastore.ServingGroupRunning,
 			},
-			expectedRemainingNames: []string{"0", "1", "2"}, // R-3, R-4 deleted (ordinal >= partition), R-0, R-1, R-2 protected
+			expectedRemainingNames: []string{"0", "1", "2"}, // R-3 and R-4 are outside the protected prefix.
 			description:            "Partition-protected replicas (R-0, R-1, R-2) should never be deleted even with low deletion cost",
 		},
 		{
-			name:             "partition=3, not-ready groups below partition still protected",
+			name:             "partition=3 protects not-ready groups in prefix",
 			partition:        ptr.To(intstr.FromInt32(3)),
 			existingIndices:  []int{0, 1, 2, 3, 4},
 			expectedCount:    3,
 			podDeletionCosts: map[int]int{},
 			groupStatuses: map[int]datastore.ServingGroupStatus{
 				0: datastore.ServingGroupRunning,
-				1: datastore.ServingGroupCreating, // Not ready but protected (ordinal < partition)
+				1: datastore.ServingGroupCreating, // Not ready but protected by the partition prefix.
 				2: datastore.ServingGroupRunning,
 				3: datastore.ServingGroupRunning,
 				4: datastore.ServingGroupRunning,
 			},
 			expectedRemainingNames: []string{"0", "1", "2"}, // R-3, R-4 deleted, R-1 protected even though not ready
 			description:            "Partition-protected replicas should never be deleted even if not ready",
+		},
+		{
+			name:            "partition=1 protects first existing group with sparse ordinals",
+			partition:       ptr.To(intstr.FromInt32(1)),
+			existingIndices: []int{2, 5},
+			expectedCount:   1,
+			podDeletionCosts: map[int]int{
+				2: 0,   // Lowest cost but protected as the first existing group.
+				5: 100, // Higher cost but not protected.
+			},
+			groupStatuses: map[int]datastore.ServingGroupStatus{
+				2: datastore.ServingGroupRunning,
+				5: datastore.ServingGroupRunning,
+			},
+			expectedRemainingNames: []string{"2"},
+			description:            "Sparse ordinals do not change the partition-protected prefix",
 		},
 		{
 			name:            "no partition, all replicas can be deleted",
@@ -3393,7 +3408,7 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 			description:            "Without partition, all replicas are candidates for deletion based on binpack scoring",
 		},
 		{
-			name:            "partition=5 protects ordinals independently of replica count",
+			name:            "partition larger than group count protects all existing groups",
 			partition:       ptr.To(intstr.FromInt32(5)),
 			existingIndices: []int{0, 1, 2, 3},
 			expectedCount:   2, // Scale down to trigger deletion of protected replicas
@@ -3410,7 +3425,7 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 				3: datastore.ServingGroupRunning,
 			},
 			expectedRemainingNames: []string{"0", "3"}, // All groups are protected equally; binpack cost decides which remain
-			description:            "Partition does not reclassify high ordinals after replica count changes",
+			description:            "A partition larger than the group count protects all existing groups equally",
 		},
 		{
 			name:            "partition=3, scale down below partition - delete protected after non-protected",
@@ -3570,32 +3585,27 @@ func TestScaleDownServingGroupsWithPartition(t *testing.T) {
 				fmt.Sprintf("[%s] Remaining group indices should match expected. Got: %v, Want: %v",
 					tt.description, actualNames, tt.expectedRemainingNames))
 
-			// Verify partition protection: protected groups should only be deleted after all non-protected groups are deleted
+			// Verify partition protection: protected groups should only be deleted after all non-protected groups are deleted.
 			if tt.partition != nil && tt.partition.IntValue() > 0 {
-				// Count how many non-protected groups existed
-				nonProtectedCount := 0
-				for _, ordinal := range tt.existingIndices {
-					if ordinal >= tt.partition.IntValue() {
-						nonProtectedCount++
-					}
+				protectedOrdinals := make(map[int]struct{})
+				for i := 0; i < tt.partition.IntValue() && i < len(tt.existingIndices); i++ {
+					protectedOrdinals[tt.existingIndices[i]] = struct{}{}
 				}
 				// Count how many non-protected groups remain
 				remainingNonProtectedCount := 0
 				for _, g := range groups {
 					_, ordinal := utils.GetParentNameAndOrdinal(g.Name)
-					if ordinal >= tt.partition.IntValue() {
+					if _, protected := protectedOrdinals[ordinal]; !protected {
 						remainingNonProtectedCount++
 					}
 				}
 				// If there are remaining non-protected groups, protected groups should not be deleted
 				if remainingNonProtectedCount > 0 {
-					for _, ordinal := range tt.existingIndices {
-						if ordinal < tt.partition.IntValue() {
-							groupName := utils.GenerateServingGroupName(msName, ordinal)
-							_, exists := controller.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName)
-							assert.True(t, exists,
-								fmt.Sprintf("[%s] Partition-protected replica R-%d should not be deleted when non-protected groups still exist", tt.description, ordinal))
-						}
+					for ordinal := range protectedOrdinals {
+						groupName := utils.GenerateServingGroupName(msName, ordinal)
+						_, exists := controller.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName)
+						assert.True(t, exists,
+							fmt.Sprintf("[%s] Partition-protected replica R-%d should not be deleted when non-protected groups still exist", tt.description, ordinal))
 					}
 				}
 			}
@@ -7592,6 +7602,24 @@ func TestHasUpdateableOutdatedServingGroup(t *testing.T) {
 			partition: 2,
 			want:      false,
 		},
+		{
+			name: "partition protects first existing group with sparse ordinals",
+			groups: []datastore.ServingGroup{
+				{Name: "recovery-2", Revision: "old", Status: datastore.ServingGroupRunning},
+				{Name: "recovery-5", Revision: "new", Status: datastore.ServingGroupRunning},
+			},
+			partition: 1,
+			want:      false,
+		},
+		{
+			name: "outdated group after sparse partition prefix requires surge",
+			groups: []datastore.ServingGroup{
+				{Name: "recovery-2", Revision: "old", Status: datastore.ServingGroupRunning},
+				{Name: "recovery-5", Revision: "old", Status: datastore.ServingGroupRunning},
+			},
+			partition: 1,
+			want:      true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -7753,7 +7781,7 @@ func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {
 	assert.Equal(t, utils.GenerateServingGroupName(ms.Name, 2), groups[1].Name)
 }
 
-func TestPartitionProtectedServingGroupReadinessUsesHistoricalTemplate(t *testing.T) {
+func TestPartitionProtectedServingGroupReadinessUsesHistoricalTemplateWithSparseOrdinals(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	controller, err := NewModelServingController(kubeClient, kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
@@ -7775,8 +7803,8 @@ func TestPartitionProtectedServingGroupReadinessUsesHistoricalTemplate(t *testin
 	require.NoError(t, err)
 
 	key := utils.GetNamespaceName(ms)
-	groupName := utils.GenerateServingGroupName(ms.Name, 0)
-	controller.store.AddServingGroup(key, 0, "old-revision")
+	groupName := utils.GenerateServingGroupName(ms.Name, 2)
+	controller.store.AddServingGroup(key, 2, "old-revision")
 	controller.store.AddRole(key, groupName, "decode", utils.GenerateRoleID("decode", 0), "old-revision", utils.CalRoleTemplateHash(oldRoles[0]))
 	require.NoError(t, controller.store.UpdateRoleStatus(key, groupName, "decode", utils.GenerateRoleID("decode", 0), datastore.RoleRunning))
 

@@ -167,15 +167,21 @@ func updateControllerRevision(
 		if clone.Revision >= newRevision {
 			return nil
 		}
-		clone.Revision = newRevision
-		updated, err := client.AppsV1().ControllerRevisions(clone.Namespace).Update(ctx, clone, metav1.UpdateOptions{})
+		candidate := clone.DeepCopy()
+		candidate.Revision = newRevision
+		updated, err := client.AppsV1().ControllerRevisions(candidate.Namespace).Update(ctx, candidate, metav1.UpdateOptions{})
 		if err == nil {
 			clone = updated
 			return nil
 		}
-		if current, getErr := client.AppsV1().ControllerRevisions(clone.Namespace).Get(ctx, clone.Name, metav1.GetOptions{}); getErr == nil {
-			clone = current
+		if !apierrors.IsConflict(err) {
+			return err
 		}
+		current, getErr := client.AppsV1().ControllerRevisions(clone.Namespace).Get(ctx, clone.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("refresh controller revision %s after conflict: %w", clone.Name, getErr)
+		}
+		clone = current
 		return err
 	})
 	if err != nil {

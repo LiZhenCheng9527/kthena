@@ -16,6 +16,7 @@ package utils
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -267,6 +268,45 @@ func TestUpdateControllerRevisionRetriesConflict(t *testing.T) {
 	}
 	if updated.Revision != 2 {
 		t.Fatalf("updated.Revision = %d, want 2", updated.Revision)
+	}
+}
+
+func TestUpdateControllerRevisionReturnsRefreshErrorAfterConflict(t *testing.T) {
+	ctx := context.Background()
+	revision := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: "revision", Namespace: "default"},
+		Revision:   1,
+	}
+	client := kubefake.NewSimpleClientset(revision)
+	updateAttempts := 0
+	refreshErr := errors.New("refresh failed")
+	client.PrependReactor("update", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		updateAttempts++
+		return true, nil, apierrors.NewConflict(
+			schema.GroupResource{Group: "apps", Resource: "controllerrevisions"},
+			revision.Name,
+			fmt.Errorf("concurrent update"),
+		)
+	})
+	client.PrependReactor("get", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, refreshErr
+	})
+
+	updated, err := updateControllerRevision(ctx, client, revision, 2)
+	if err == nil {
+		t.Fatal("updateControllerRevision() error = nil, want refresh error")
+	}
+	if !errors.Is(err, refreshErr) {
+		t.Fatalf("updateControllerRevision() error = %v, want refresh error", err)
+	}
+	if updated != nil {
+		t.Fatalf("updated = %#v, want nil", updated)
+	}
+	if updateAttempts != 1 {
+		t.Fatalf("update attempts = %d, want 1", updateAttempts)
+	}
+	if revision.Revision != 1 {
+		t.Fatalf("input revision = %d, want unchanged value 1", revision.Revision)
 	}
 }
 

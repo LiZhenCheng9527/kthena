@@ -46,7 +46,7 @@ func newRemoteTokenizer(config RemoteTokenizerConfig, client *httpClient, ownsCl
 	}
 
 	if client == nil {
-		client = newHTTPClient(config.Endpoint)
+		client = newHTTPClient(config.Endpoint, newRetryableHTTPClient())
 	}
 	return &remoteTokenizerImpl{
 		config:     config,

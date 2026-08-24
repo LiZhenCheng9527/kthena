@@ -102,7 +102,7 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 			ReturnTokenStrings: false,
 		}
 
-		client := newHTTPClientWithRetryClient(endpoint, m.client)
+		client := newHTTPClient(endpoint, m.client)
 		tok, err := newRemoteTokenizer(config, client, false)
 		if err != nil {
 			klog.Warningf("Failed to create %s tokenizer for model %s at %s: %v", engine, model, endpoint, err)

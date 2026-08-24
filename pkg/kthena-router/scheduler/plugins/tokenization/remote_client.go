@@ -38,10 +38,6 @@ type httpClient struct {
 	baseURL string
 }
 
-func newHTTPClient(baseURL string) *httpClient {
-	return newHTTPClientWithRetryClient(baseURL, newRetryableHTTPClient())
-}
-
 func newRetryableHTTPClient() *retryablehttp.Client {
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = defaultMaxRetries
@@ -52,7 +48,7 @@ func newRetryableHTTPClient() *retryablehttp.Client {
 	return retryClient
 }
 
-func newHTTPClientWithRetryClient(baseURL string, retryClient *retryablehttp.Client) *httpClient {
+func newHTTPClient(baseURL string, retryClient *retryablehttp.Client) *httpClient {
 	return &httpClient{
 		client:  retryClient,
 		baseURL: baseURL,

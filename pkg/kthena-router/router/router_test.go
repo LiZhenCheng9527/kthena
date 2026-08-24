@@ -3092,10 +3092,8 @@ func (m *mockKVConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 	return 0, nil
 }
 
-func TestRouter_ProxyToPDDisaggregated_DoesNotRetryWhenResponseWritten(t *testing.T) {
+func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
 
 	pod1 := &corev1.Pod{
 		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
@@ -3108,116 +3106,92 @@ func TestRouter_ProxyToPDDisaggregated_DoesNotRetryWhenResponseWritten(t *testin
 	info1 := &datastore.PodInfo{Pod: pod1}
 	info2 := &datastore.PodInfo{Pod: pod2}
 
-	ctx := &framework.Context{
-		Model:       "test-model",
-		PrefillPods: []*datastore.PodInfo{info1, info2},
-		DecodePods:  []*datastore.PodInfo{info1, info2},
-	}
-
-	mockConnector := &mockKVConnector{
-		proxyHandler: func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
-			// Simulate response headers / chunks being written before error occurs
-			c.Writer.WriteHeader(http.StatusOK)
-			_, _ = c.Writer.Write([]byte("data: partial response\n\n"))
-			return 5, fmt.Errorf("decode connection reset mid-stream")
+	tests := []struct {
+		name            string
+		proxyHandler    func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error)
+		wantErr         bool
+		wantErrContains string
+		wantCalls       int32
+		wantStatus      int
+		callsMsg        string
+	}{
+		{
+			name: "does not retry when response written",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					// Simulate response headers / chunks being written before error occurs
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte("data: partial response\n\n"))
+					return 5, fmt.Errorf("decode connection reset mid-stream")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "decode connection reset mid-stream",
+			wantCalls:       1,
+			wantStatus:      http.StatusOK,
+			callsMsg:        "must not retry to second pod pair when response was already written to client",
+		},
+		{
+			name: "retries when response not written",
+			proxyHandler: func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					if connector.calls.Load() == 1 {
+						// First attempt fails without writing any headers/body
+						return 0, fmt.Errorf("prefill connection refused")
+					}
+					// Second attempt succeeds
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+					return 10, nil
+				}
+			},
+			wantErr:    false,
+			wantCalls:  2,
+			wantStatus: http.StatusOK,
+			callsMsg:   "must retry to second pod pair when response was not written",
+		},
+		{
+			name: "all attempts fail without write",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					return 0, fmt.Errorf("connection refused")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "all prefill/decode attempts failed",
+			wantCalls:       2,
+			wantStatus:      http.StatusInternalServerError,
 		},
 	}
 
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
 
-	err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "decode connection reset mid-stream")
-	assert.Equal(t, int32(1), mockConnector.calls.Load(), "must not retry to second pod pair when response was already written to client")
-	assert.Equal(t, http.StatusOK, w.Code, "status code must remain 200 without attempting to overwrite with 500 JSON")
-}
-
-func TestRouter_ProxyToPDDisaggregated_RetriesWhenResponseNotWritten(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
-
-	pod1 := &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
-	}
-	pod2 := &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
-	}
-	info1 := &datastore.PodInfo{Pod: pod1}
-	info2 := &datastore.PodInfo{Pod: pod2}
-
-	ctx := &framework.Context{
-		Model:       "test-model",
-		PrefillPods: []*datastore.PodInfo{info1, info2},
-		DecodePods:  []*datastore.PodInfo{info1, info2},
-	}
-
-	var mockConnector *mockKVConnector
-	mockConnector = &mockKVConnector{
-		proxyHandler: func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
-			if mockConnector.calls.Load() == 1 {
-				// First attempt fails without writing any headers/body
-				return 0, fmt.Errorf("prefill connection refused")
+			ctx := &framework.Context{
+				Model:       "test-model",
+				PrefillPods: []*datastore.PodInfo{info1, info2},
+				DecodePods:  []*datastore.PodInfo{info1, info2},
 			}
-			// Second attempt succeeds
-			c.Writer.WriteHeader(http.StatusOK)
-			_, _ = c.Writer.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
-			return 10, nil
-		},
+
+			mockConnector := &mockKVConnector{}
+			mockConnector.proxyHandler = tt.proxyHandler(mockConnector)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+			err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrContains)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantCalls, mockConnector.calls.Load(), tt.callsMsg)
+			assert.Equal(t, tt.wantStatus, w.Code)
+		})
 	}
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
-
-	err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
-
-	assert.NoError(t, err)
-	assert.Equal(t, int32(2), mockConnector.calls.Load(), "must retry to second pod pair when response was not written")
-	assert.Equal(t, http.StatusOK, w.Code)
-}
-
-func TestRouter_ProxyToPDDisaggregated_AllAttemptsFailWithoutWrite(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
-
-	pod1 := &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
-	}
-	pod2 := &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
-	}
-	info1 := &datastore.PodInfo{Pod: pod1}
-	info2 := &datastore.PodInfo{Pod: pod2}
-
-	ctx := &framework.Context{
-		Model:       "test-model",
-		PrefillPods: []*datastore.PodInfo{info1, info2},
-		DecodePods:  []*datastore.PodInfo{info1, info2},
-	}
-
-	mockConnector := &mockKVConnector{
-		proxyHandler: func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
-			return 0, fmt.Errorf("connection refused")
-		},
-	}
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
-
-	err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "all prefill/decode attempts failed")
-	assert.Equal(t, int32(2), mockConnector.calls.Load())
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

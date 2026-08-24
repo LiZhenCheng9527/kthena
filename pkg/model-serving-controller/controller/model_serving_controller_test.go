@@ -6130,19 +6130,27 @@ func TestHandleErrorPodTracksReplacementByUID(t *testing.T) {
 
 // TestHandleErrorPodNoneLeavesRestartedPod verifies that under RecoveryPolicy=None,
 // a pod whose container the kubelet has restarted (pod still alive, not PodFailed)
-// is NOT deleted by handleErrorPod — it is left to the pod's own restartPolicy,
-// avoiding the pod churn the Recreate policies cause. A terminal PodFailed pod
-// still falls through to deletion + refill (handled by handleDeletedPod None case).
+// is NOT deleted — it is left to the pod's own restartPolicy — while the failure
+// is still bookkept: role/group transition out of Running and the pod leaves the
+// running set, so AvailableReplicas reflects the unavailable replica.
 func TestHandleErrorPodNoneLeavesRestartedPod(t *testing.T) {
 	const (
 		namespace = "default"
-		podName   = "test-none-0-prefill-0-0"
+		msName    = "test-none"
+		groupName = msName + "-0"
+		roleName  = "prefill"
+		roleID    = "prefill-0"
+		podName   = groupName + "-prefill-0-0"
 	)
 	restartedPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      podName,
 			UID:       types.UID("restarted-pod"),
+			Labels: map[string]string{
+				workloadv1alpha1.RoleLabelKey: roleName,
+				workloadv1alpha1.RoleIDKey:    roleID,
+			},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -6152,19 +6160,34 @@ func TestHandleErrorPodNoneLeavesRestartedPod(t *testing.T) {
 		},
 	}
 	ms := &workloadv1alpha1.ModelServing{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "test-none"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: msName},
 		Spec:       workloadv1alpha1.ModelServingSpec{RecoveryPolicy: workloadv1alpha1.NoneRestartPolicy},
 	}
 	controller, kubeClient := newGracePeriodTestController(t, restartedPod)
 
-	// None must early-return before touching the store/graceMap or deleting the pod.
-	require.NoError(t, controller.handleErrorPod(ms, "test-none-0", restartedPod))
+	// Seed a Running serving group + role with the pod in the running set.
+	msKey := types.NamespacedName{Namespace: namespace, Name: msName}
+	controller.store = datastore.New()
+	controller.store.AddServingGroupAndRole(msKey, groupName, "", "", roleName, roleID)
+	controller.store.AddRunningPodToServingGroup(msKey, groupName, podName, "", "", roleName, roleID)
+	require.NoError(t, controller.store.UpdateRoleStatus(msKey, groupName, roleName, roleID, datastore.RoleRunning))
+	require.NoError(t, controller.store.UpdateServingGroupStatus(msKey, groupName, datastore.ServingGroupRunning))
+	controller.workqueue = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()) //nolint:staticcheck
+	t.Cleanup(controller.workqueue.ShutDown)
 
-	// No pod delete was issued — the pod is left to kubelet's restartPolicy.
+	require.NoError(t, controller.handleErrorPod(ms, groupName, restartedPod))
+
+	// Pod not deleted — left to kubelet's restartPolicy.
 	for _, action := range kubeClient.Actions() {
 		require.Falsef(t, action.Matches("delete", "pods"),
 			"None must not delete a restarted pod; got unexpected action %v", action)
 	}
+	// Failure bookkeeping: role and group transitioned out of Running.
+	assert.Equal(t, datastore.RoleCreating, controller.store.GetRoleStatus(msKey, groupName, roleName, roleID))
+	assert.Equal(t, datastore.ServingGroupCreating, controller.store.GetServingGroupStatus(msKey, groupName))
+	running, err := controller.store.GetRunningPodNumByServingGroup(msKey, groupName)
+	require.NoError(t, err)
+	assert.Equal(t, 0, running, "restarted pod must leave the running set")
 }
 
 func newGracePeriodTestController(t *testing.T, pod *corev1.Pod) (*ModelServingController, *kubefake.Clientset) {

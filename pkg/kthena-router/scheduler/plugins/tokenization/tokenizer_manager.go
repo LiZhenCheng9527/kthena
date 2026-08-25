@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
@@ -41,11 +42,15 @@ type TokenizerManagerConfig struct {
 
 type TokenizerManager struct {
 	config TokenizerManagerConfig
+	// client owns the connection pool shared by the short-lived tokenizer
+	// wrappers created for individual scheduling requests.
+	client *retryablehttp.Client
 }
 
 func NewTokenizerManager(config TokenizerManagerConfig) *TokenizerManager {
 	return &TokenizerManager{
 		config: config,
+		client: newRetryableHTTPClient(),
 	}
 }
 
@@ -97,7 +102,8 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 			ReturnTokenStrings: false,
 		}
 
-		tok, err := NewRemoteTokenizer(config)
+		client := newHTTPClient(endpoint, m.client)
+		tok, err := newRemoteTokenizer(config, client, false)
 		if err != nil {
 			klog.Warningf("Failed to create %s tokenizer for model %s at %s: %v", engine, model, endpoint, err)
 			continue

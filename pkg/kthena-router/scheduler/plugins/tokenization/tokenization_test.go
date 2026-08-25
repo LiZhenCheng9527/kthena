@@ -19,6 +19,8 @@ package tokenization
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -199,6 +201,45 @@ func TestTokenizerManagerRejectsOutOfRangePort(t *testing.T) {
 
 	if tokenizer := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod}); tokenizer != nil {
 		t.Fatalf("expected no tokenizer for an out-of-range endpoint port, got %T", tokenizer)
+	}
+}
+
+func TestTokenizerManagerReusesHTTPConnections(t *testing.T) {
+	const requests = 20
+
+	var newConnections atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  3,
+			"tokens": []int{1, 2, 3},
+		})
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConnections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	address := server.Listener.Addr().(*net.TCPAddr)
+	manager := NewTokenizerManager(TokenizerManagerConfig{
+		EndpointPorts: map[string]int{EngineVLLM: address.Port},
+	})
+	defer manager.client.HTTPClient.CloseIdleConnections()
+	pod := testutil.PodInfoWithEngine("pod-vllm", "default", address.IP.String(), EngineVLLM)
+	prompt := &common.ChatMessage{Text: "hello"}
+
+	for range requests {
+		if _, err := manager.TokenizePrompt("test-model", prompt, []*datastore.PodInfo{pod}); err != nil {
+			t.Fatalf("TokenizePrompt failed: %v", err)
+		}
+	}
+
+	if got := newConnections.Load(); got != 1 {
+		t.Fatalf("new TCP connections after %d sequential requests = %d, want 1", requests, got)
 	}
 }
 

@@ -54,6 +54,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
@@ -3070,6 +3071,127 @@ func TestRouter_HandlerFunc_UnknownModel_RejectsBeforeQueueing(t *testing.T) {
 			for _, stat := range store.GetRequestWaitingQueueStats() {
 				assert.NotEqual(t, "never-registered-model", stat.Model, "no queue should be created for an unregistered model")
 			}
+		})
+	}
+}
+
+type mockKVConnector struct {
+	calls        atomic.Int32
+	proxyHandler func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error)
+}
+
+func (m *mockKVConnector) Name() string {
+	return "mock"
+}
+
+func (m *mockKVConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+	m.calls.Add(1)
+	if m.proxyHandler != nil {
+		return m.proxyHandler(c, reqBody, prefillAddr, decodeAddr, hooks)
+	}
+	return 0, nil
+}
+
+func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	info1 := &datastore.PodInfo{Pod: pod1}
+	info2 := &datastore.PodInfo{Pod: pod2}
+
+	tests := []struct {
+		name            string
+		proxyHandler    func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error)
+		wantErr         bool
+		wantErrContains string
+		wantCalls       int32
+		wantStatus      int
+		callsMsg        string
+	}{
+		{
+			name: "does not retry when response written",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					// Simulate response headers / chunks being written before error occurs
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte("data: partial response\n\n"))
+					return 5, fmt.Errorf("decode connection reset mid-stream")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "decode connection reset mid-stream",
+			wantCalls:       1,
+			wantStatus:      http.StatusOK,
+			callsMsg:        "must not retry to second pod pair when response was already written to client",
+		},
+		{
+			name: "retries when response not written",
+			proxyHandler: func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					if connector.calls.Load() == 1 {
+						// First attempt fails without writing any headers/body
+						return 0, fmt.Errorf("prefill connection refused")
+					}
+					// Second attempt succeeds
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+					return 10, nil
+				}
+			},
+			wantErr:    false,
+			wantCalls:  2,
+			wantStatus: http.StatusOK,
+			callsMsg:   "must retry to second pod pair when response was not written",
+		},
+		{
+			name: "all attempts fail without write",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					return 0, fmt.Errorf("connection refused")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "all prefill/decode attempts failed",
+			wantCalls:       2,
+			wantStatus:      http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+
+			ctx := &framework.Context{
+				Model:       "test-model",
+				PrefillPods: []*datastore.PodInfo{info1, info2},
+				DecodePods:  []*datastore.PodInfo{info1, info2},
+			}
+
+			mockConnector := &mockKVConnector{}
+			mockConnector.proxyHandler = tt.proxyHandler(mockConnector)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+			err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrContains)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantCalls, mockConnector.calls.Load(), tt.callsMsg)
+			assert.Equal(t, tt.wantStatus, w.Code)
 		})
 	}
 }

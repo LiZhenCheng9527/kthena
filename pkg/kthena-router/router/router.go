@@ -1447,6 +1447,9 @@ func (r *Router) proxyToPDDisaggregated(
 		if err != nil {
 			klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
 				prefillPod.Name, decodePod.Name, err)
+			if c.Writer.Written() {
+				return err
+			}
 			continue
 		}
 
@@ -1469,7 +1472,9 @@ func (r *Router) proxyToPDDisaggregated(
 		return nil
 	}
 
-	c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
+	if !c.Writer.Written() {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
+	}
 	return fmt.Errorf("all prefill/decode attempts failed")
 }
 

@@ -785,6 +785,11 @@ func TestBuildRequestRejectsInvalidRuntimeConfiguration(t *testing.T) {
 			baseURL: "https://api.example.com",
 			headers: map[string]string{"X-Tenant": "tenant-a\r\nX-Injected: true"},
 		},
+		{
+			name:    "header value contains DEL",
+			baseURL: "https://api.example.com",
+			headers: map[string]string{"X-Tenant": "tenant-a\x7f"},
+		},
 	}
 
 	for _, tt := range tests {

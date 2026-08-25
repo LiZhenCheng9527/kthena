@@ -355,8 +355,8 @@ func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networki
 		if common.IsReservedProviderHeader(header) {
 			allErrs = append(allErrs, field.Invalid(headerField, header, "header is reserved and cannot be configured as a static header"))
 		}
-		if strings.ContainsAny(value, "\r\n") {
-			allErrs = append(allErrs, field.Invalid(headerField, value, "header value must not contain CR or LF"))
+		if !httpguts.ValidHeaderFieldValue(value) {
+			allErrs = append(allErrs, field.Invalid(headerField, value, "header value must be a valid HTTP header field value"))
 		}
 	}
 

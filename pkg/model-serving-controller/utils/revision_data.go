@@ -26,6 +26,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
@@ -211,6 +212,9 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 	if cr == nil || len(cr.Data.Raw) == 0 {
 		return nil, fmt.Errorf("controller revision or its data is nil")
 	}
+	if !metav1.IsControlledBy(cr, ms) {
+		return nil, fmt.Errorf("controller revision %q is not controlled by ModelServing %s/%s", cr.Name, ms.Namespace, ms.Name)
+	}
 	if cr.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
 		return nil, fmt.Errorf("controller revision %q does not contain v1 revision data", cr.Name)
 	}
@@ -221,9 +225,6 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 	}
 	targetRoles := make(map[string]modelServingRevisionRole, len(patch.Spec.Template.Roles))
 	for _, role := range patch.Spec.Template.Roles {
-		if _, exists := targetRoles[role.Name]; exists {
-			return nil, fmt.Errorf("revision data contains duplicate role %q", role.Name)
-		}
 		targetRoles[role.Name] = role
 	}
 
@@ -262,6 +263,13 @@ func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
 	}
 	if len(patch.Spec.Template.Roles) == 0 {
 		return nil, fmt.Errorf("v1 controller revision data has no roles")
+	}
+	roleNames := make(map[string]struct{}, len(patch.Spec.Template.Roles))
+	for _, role := range patch.Spec.Template.Roles {
+		if _, exists := roleNames[role.Name]; exists {
+			return nil, fmt.Errorf("revision data contains duplicate role %q", role.Name)
+		}
+		roleNames[role.Name] = struct{}{}
 	}
 	return &patch, nil
 }

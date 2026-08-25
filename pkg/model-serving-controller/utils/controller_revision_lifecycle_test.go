@@ -93,12 +93,34 @@ func TestRecordModelServingRevisionLifecycle(t *testing.T) {
 	}
 }
 
+func TestRecordModelServingRevisionRejectsInvalidDataBeforeAPIAccess(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "invalid JSON", data: []byte(`{`)},
+		{name: "no roles", data: []byte(`{"spec":{"template":{"roles":[]}}}`)},
+		{name: "duplicate roles", data: []byte(`{"spec":{"template":{"roles":[{"name":"role"},{"name":"role"}]}}}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := kubefake.NewSimpleClientset()
+			if _, _, err := RecordModelServingRevision(context.Background(), client, lifecycleTestModelServing(), tt.data); err == nil {
+				t.Fatal("RecordModelServingRevision() error = nil")
+			}
+			if actions := client.Actions(); len(actions) != 0 {
+				t.Fatalf("Kubernetes API actions = %v, want none", actions)
+			}
+		})
+	}
+}
+
 func TestRecordModelServingRevisionResolvesNameCollisionWithoutMutatingData(t *testing.T) {
 	ctx := context.Background()
 	client := kubefake.NewSimpleClientset()
 	ms := lifecycleTestModelServing()
-	desiredData := []byte(`{"spec":{"schedulerName":"desired"}}`)
-	collidingData := []byte(`{"spec":{"schedulerName":"collision"}}`)
+	desiredData := lifecycleRevisionData("desired")
+	collidingData := lifecycleRevisionData("collision")
 	initialCollisionCount := int32(0)
 	unsaltedHash := RevisionDataHash(desiredData, &initialCollisionCount)
 	colliding := &appsv1.ControllerRevision{
@@ -150,7 +172,7 @@ func TestRecordModelServingRevisionResolvesNameCollisionWithoutMutatingData(t *t
 func TestRecordModelServingRevisionIgnoresForeignOwnedHistory(t *testing.T) {
 	ctx := context.Background()
 	ms := lifecycleTestModelServing()
-	data := []byte(`{"spec":{"schedulerName":"desired"}}`)
+	data := lifecycleRevisionData("desired")
 	foreign := &appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "foreign-history",
@@ -162,7 +184,7 @@ func TestRecordModelServingRevisionIgnoresForeignOwnedHistory(t *testing.T) {
 			}},
 		},
 		Revision: 99,
-		Data:     runtime.RawExtension{Raw: []byte(`{"spec":{"schedulerName":"foreign"}}`)},
+		Data:     runtime.RawExtension{Raw: lifecycleRevisionData("foreign")},
 	}
 	client := kubefake.NewSimpleClientset(foreign)
 
@@ -187,7 +209,7 @@ func TestRecordModelServingRevisionDoesNotReuseUnownedCollision(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			ms := lifecycleTestModelServing()
-			data := []byte(`{"spec":{"schedulerName":"desired"}}`)
+			data := lifecycleRevisionData("desired")
 			initialCollisionCount := int32(0)
 			unowned := revisionForLifecycleTest(
 				ms,
@@ -223,8 +245,8 @@ func TestRecordModelServingRevisionDoesNotReuseUnownedCollision(t *testing.T) {
 func TestRecordModelServingRevisionBreaksRevisionTiesByCreationTime(t *testing.T) {
 	ctx := context.Background()
 	ms := lifecycleTestModelServing()
-	desiredData := []byte(`{"spec":{"schedulerName":"desired"}}`)
-	older := revisionForLifecycleTest(ms, "z-older", []byte(`{"spec":{"schedulerName":"old"}}`), 5)
+	desiredData := lifecycleRevisionData("desired")
+	older := revisionForLifecycleTest(ms, "z-older", lifecycleRevisionData("old"), 5)
 	older.CreationTimestamp = metav1.NewTime(time.Unix(100, 0))
 	newer := revisionForLifecycleTest(ms, "a-newer", desiredData, 5)
 	newer.CreationTimestamp = metav1.NewTime(time.Unix(200, 0))
@@ -353,6 +375,13 @@ func lifecycleTestModelServing() *workloadv1alpha1.ModelServing {
 			UID:       "test-uid",
 		},
 	}
+}
+
+func lifecycleRevisionData(schedulerName string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"spec":{"schedulerName":%q,"plugins":[],"template":{"roles":[{"name":"role","entryTemplate":{},"workerReplicas":0}]}}}`,
+		schedulerName,
+	))
 }
 
 func revisionForLifecycleTest(

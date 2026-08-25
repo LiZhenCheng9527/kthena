@@ -47,6 +47,9 @@ func RecordModelServingRevision(
 	if len(data) == 0 {
 		return nil, nil, fmt.Errorf("revision data is empty")
 	}
+	if _, err := decodeRevisionPatch(data); err != nil {
+		return nil, nil, fmt.Errorf("invalid revision data: %w", err)
+	}
 
 	selector := labels.SelectorFromSet(map[string]string{
 		ControllerRevisionLabelKey: ms.Name,

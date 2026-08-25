@@ -26,6 +26,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -328,6 +329,7 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 		revisionTestRole("prefill", "prefill:current"),
 		revisionTestRole("removed", "removed:current"),
 	)
+	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
 	current.Spec.Replicas = ptr.To[int32](4)
 	current.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
 	current.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](20)
@@ -351,10 +353,12 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	}
 	revision := &appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-revision",
+			Name:      "test-revision",
+			Namespace: current.Namespace,
 			Annotations: map[string]string{
 				ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1,
 			},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(current)},
 		},
 		Data: runtime.RawExtension{Raw: data},
 	}
@@ -411,6 +415,45 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	}
 	if got := current.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image; got != "decode:current" {
 		t.Errorf("ApplyRevision mutated input image to %q", got)
+	}
+}
+
+func TestApplyRevisionRejectsRevisionNotControlledByModelServing(t *testing.T) {
+	ms := revisionTestModelServing(revisionTestRole("role", "current"))
+	ms.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	data, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatalf("BuildRevisionData() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		ownerUID   string
+		includeRef bool
+	}{
+		{name: "no owner"},
+		{name: "different owner", ownerUID: "other-uid", includeRef: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			revision := &appsv1.ControllerRevision{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-revision",
+					Namespace:   ms.Namespace,
+					Annotations: map[string]string{ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1},
+				},
+				Data: runtime.RawExtension{Raw: data},
+			}
+			if tt.includeRef {
+				owner := newModelServingOwnerRef(ms)
+				owner.UID = types.UID(tt.ownerUID)
+				revision.OwnerReferences = []metav1.OwnerReference{owner}
+			}
+
+			if _, err := ApplyRevision(ms, revision); err == nil {
+				t.Fatal("ApplyRevision() error = nil")
+			}
+		})
 	}
 }
 

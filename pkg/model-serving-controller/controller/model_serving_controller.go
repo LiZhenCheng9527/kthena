@@ -1662,6 +1662,15 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 }
 
 func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, errPod *corev1.Pod) error {
+	// None: leave a restarted, still-alive pod to the kubelet (do not delete it),
+	// but mark it unavailable. A terminal PodFailed pod falls through to deletion.
+	if ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy && utils.ContainerRestarted(errPod) && !utils.IsPodFailed(errPod) {
+		if err := c.markPodUnavailable(ms, servingGroupName, errPod); err != nil {
+			klog.Warningf("mark pod %s unavailable: %v", errPod.Name, err)
+		}
+		c.enqueueModelServing(ms)
+		return nil
+	}
 	// pod is already in the grace period and does not need to be processed for the time being.
 	key := getPodGracePeriodKey(errPod)
 	now := time.Now()
@@ -1670,18 +1679,30 @@ func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServin
 		klog.V(4).Infof("Pod %v already in grace period", key)
 		return nil
 	}
+	if err := c.markPodUnavailable(ms, servingGroupName, errPod); err != nil {
+		return err
+	}
+	// Wait for the grace period before processing
+	go c.handlePodAfterGraceTime(ms, errPod)
+	// ServingGroup status may change, needs reconcile
+	c.enqueueModelServing(ms)
+	return nil
+}
+
+// markPodUnavailable removes the pod from the running set and transitions its
+// role/serving group out of Running so AvailableReplicas stops counting it. It
+// does not delete the pod.
+func (c *ModelServingController) markPodUnavailable(ms *workloadv1alpha1.ModelServing, servingGroupName string, errPod *corev1.Pod) error {
 	c.store.DeleteRunningPodFromServingGroup(types.NamespacedName{
 		Namespace: ms.Namespace,
 		Name:      ms.Name,
 	}, servingGroupName, errPod.Name)
 
-	// Update role status back to Creating when pod fails
 	roleName := utils.GetRoleName(errPod)
 	roleID := utils.GetRoleID(errPod)
+	// Update role status back to Creating when pod fails
 	if roleStatus := c.store.GetRoleStatus(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID); roleStatus == datastore.RoleRunning {
-		err := c.store.UpdateRoleStatus(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID, datastore.RoleCreating)
-		klog.V(4).Infof("Setting role %s/%s status to Creating when pod fails", ms.GetName(), roleID)
-		if err != nil {
+		if err := c.store.UpdateRoleStatus(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID, datastore.RoleCreating); err != nil {
 			klog.Warningf("failed to update role %s/%s status to Creating: %v", roleName, roleID, err)
 		} else {
 			klog.V(2).Infof("update role %s/%s to Creating when pod fails", roleName, roleID)
@@ -1693,17 +1714,11 @@ func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServin
 
 	// If the ServingGroup status is already running, the status needs to be updated
 	if groupStatus := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName); groupStatus == datastore.ServingGroupRunning {
-		err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupCreating)
-		klog.V(4).Infof("Setting ServingGroup %s/%s status to Creating when pod fails", ms.GetName(), servingGroupName)
-		if err != nil {
+		if err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupCreating); err != nil {
 			return fmt.Errorf("update ServingGroup status failed, err:%v", err)
 		}
 		klog.V(2).Infof("update ServingGroup %s to processing when pod fails", servingGroupName)
 	}
-	// Wait for the grace period before processing
-	go c.handlePodAfterGraceTime(ms, errPod)
-	// ServingGroup status may change, needs reconcile
-	c.enqueueModelServing(ms)
 	return nil
 }
 
@@ -1775,6 +1790,12 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 			}
 		}
 		c.DeleteRole(context.Background(), ms, servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod))
+	case workloadv1alpha1.NoneRestartPolicy:
+		// None: re-enqueue to refill the single missing pod (not the whole role/group).
+		if err := c.markPodUnavailable(ms, servingGroupName, pod); err != nil {
+			klog.Warningf("mark pod %s unavailable: %v", pod.Name, err)
+		}
+		c.enqueueModelServing(ms)
 	}
 	return nil
 }

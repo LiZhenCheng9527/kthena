@@ -48,6 +48,15 @@ versions.
 Some metrics appear only after the corresponding feature or request path has
 been exercised.
 
+### Grafana dashboards
+
+Import [`examples/observability/kthena-router-overview-dashboard.json`](https://github.com/volcano-sh/kthena/blob/main/examples/observability/kthena-router-overview-dashboard.json) into Grafana and select the Prometheus data source that scrapes the Router. The dashboard provides the primary operational view of request traffic, errors, latency, prefill and decode phases, token throughput, concurrency, queues, rate limits, and routing failures.
+
+The backend-load panel displays active upstream requests. It is not a saturation
+percentage because the Router does not know each backend's capacity. Combine it with runtime-specific capacity or utilization metrics when diagnosing backend saturation.
+
+The cache-aware score-plugin dashboard remains a separate specialist view at [`examples/observability/kthena-router-score-plugins-dashboard.json`](https://github.com/volcano-sh/kthena/blob/main/examples/observability/kthena-router-score-plugins-dashboard.json).
+
 ### Requests, traffic, and rate limiting
 
 | Metric | Type | Labels | Description |

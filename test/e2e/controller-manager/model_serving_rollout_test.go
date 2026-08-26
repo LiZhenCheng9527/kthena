@@ -144,6 +144,18 @@ func TestModelServingRollingUpdateMaxSurge(t *testing.T) {
 	initialRevision := initial.Status.CurrentRevision
 	require.NotEmpty(t, initialRevision)
 
+	selector := modelServingLabelSelector(modelServing.Name)
+	initialPods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	require.NoError(t, err)
+	podWatcher, err := kubeClient.CoreV1().Pods(testNamespace).Watch(ctx, metav1.ListOptions{
+		LabelSelector:   selector,
+		ResourceVersion: initialPods.ResourceVersion,
+	})
+	require.NoError(t, err)
+	defer podWatcher.Stop()
+
 	updated := initial.DeepCopy()
 	updated.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updated, metav1.UpdateOptions{})
@@ -151,22 +163,69 @@ func TestModelServingRollingUpdateMaxSurge(t *testing.T) {
 
 	// Verify that one additional Running ServingGroup becomes available while
 	// old and new revisions coexist. Ordinals do not identify surge capacity:
-	// binpack scale-down may leave any ordinal in the final replica set.
-	require.Eventually(t, func() bool {
-		states, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
-		if err != nil || len(states) > int(replicas+1) {
-			return false
+	// binpack scale-down may leave any ordinal in the final replica set. Use a
+	// watch started before the update because the new group becoming Ready
+	// immediately triggers deletion of an old group, making this window too
+	// short to observe reliably with periodic List calls.
+	podsByName := make(map[string]*corev1.Pod, len(initialPods.Items))
+	for i := range initialPods.Items {
+		pod := initialPods.Items[i].DeepCopy()
+		podsByName[pod.Name] = pod
+	}
+
+	surgeObserved := false
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	for !surgeObserved {
+		select {
+		case <-timer.C:
+			require.FailNow(t, "expected maxSurge capacity while old and new ServingGroups coexist")
+		case event, ok := <-podWatcher.ResultChan():
+			require.True(t, ok, "Pod watch closed before maxSurge capacity was observed")
+			require.NotEqual(t, watch.Error, event.Type, "Pod watch failed: %v", event.Object)
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			switch event.Type {
+			case watch.Added, watch.Modified:
+				podsByName[pod.Name] = pod.DeepCopy()
+			case watch.Deleted:
+				delete(podsByName, pod.Name)
+			default:
+				continue
+			}
+
+			states := make(map[string]servingGroupState)
+			newRevisionReady := false
+			for _, currentPod := range podsByName {
+				if currentPod.DeletionTimestamp != nil || currentPod.Status.Phase == corev1.PodSucceeded || currentPod.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				groupName := currentPod.Labels[workload.GroupNameLabelKey]
+				revision := currentPod.Labels[workload.RevisionLabelKey]
+				if groupName == "" || revision == "" || len(currentPod.Spec.Containers) == 0 {
+					continue
+				}
+				states[groupName] = servingGroupState{
+					GroupName: groupName,
+					Revision:  revision,
+					Image:     currentPod.Spec.Containers[0].Image,
+				}
+				if revision != initialRevision && currentPod.Spec.Containers[0].Image == nginxAlpineImage && controllerutils.IsPodRunningAndReady(currentPod) {
+					newRevisionReady = true
+				}
+			}
+
+			require.LessOrEqual(t, len(states), int(replicas+1), "maxSurge capacity exceeded")
+			hasOld, hasNew := false, false
+			for _, state := range states {
+				hasOld = hasOld || state.Revision == initialRevision
+				hasNew = hasNew || (state.Revision != initialRevision && state.Image == nginxAlpineImage)
+			}
+			surgeObserved = len(states) == int(replicas+1) && hasOld && hasNew && newRevisionReady
 		}
-		if len(states) != int(replicas+1) {
-			return false
-		}
-		hasOld, hasNew := false, false
-		for _, state := range states {
-			hasOld = hasOld || state.Revision == initialRevision
-			hasNew = hasNew || (state.Revision != initialRevision && state.Image == nginxAlpineImage)
-		}
-		return hasOld && hasNew
-	}, 2*time.Minute, time.Second, "expected maxSurge capacity while old and new ServingGroups coexist")
+	}
 
 	finalMS := waitForRollingUpdateConverged(t, ctx, kthenaClient, kubeClient, modelServing.Name, replicas, initialRevision, nginxAlpineImage)
 	assert.Equal(t, replicas, finalMS.Status.Replicas)

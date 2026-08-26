@@ -430,6 +430,18 @@ func SetCondition(ms *workloadv1alpha1.ModelServing, progressingGroups, updatedG
 // SetConditionWithRolloutState updates the mutually exclusive availability and
 // progress conditions using the controller's ordinal-aware rollout predicate.
 func SetConditionWithRolloutState(ms *workloadv1alpha1.ModelServing, progressingGroups, updatedGroups, currentGroups []int, rolloutActive bool) bool {
+	return SetConditionWithRolloutAndProgressState(
+		ms, progressingGroups, updatedGroups, currentGroups, rolloutActive, len(progressingGroups) > 0,
+	)
+}
+
+// SetConditionWithRolloutAndProgressState distinguishes a template rollout
+// from other reconciliation work such as initial creation or replica scaling.
+func SetConditionWithRolloutAndProgressState(
+	ms *workloadv1alpha1.ModelServing,
+	progressingGroups, updatedGroups, currentGroups []int,
+	rolloutActive, progressActive bool,
+) bool {
 	var newCond metav1.Condition
 	found := false
 	shouldUpdate := false
@@ -440,7 +452,7 @@ func SetConditionWithRolloutState(ms *workloadv1alpha1.ModelServing, progressing
 			message = SomeGroupsAreProgressing + ": " + fmt.Sprintf("%v", progressingGroups) + ", " + message
 		}
 		newCond = newCondition(workloadv1alpha1.ModelServingUpdateInProgress, message)
-	} else if len(progressingGroups) == 0 {
+	} else if !progressActive {
 		newCond = newCondition(workloadv1alpha1.ModelServingAvailable, AllGroupsIsReady)
 	} else {
 		message := SomeGroupsAreProgressing + ": " + fmt.Sprintf("%v", progressingGroups)

@@ -4144,11 +4144,79 @@ func TestUpdateModelServingStatusCountsAllServingGroups(t *testing.T) {
 	assert.Equal(t, int32(3), updated.Status.Replicas)
 	assert.Equal(t, int32(3), updated.Status.AvailableReplicas)
 	assert.Equal(t, int32(3), updated.Status.UpdatedReplicas)
-	assert.Equal(t, int32(0), updated.Status.CurrentReplicas)
-	assert.Equal(t, "old-revision", updated.Status.CurrentRevision)
+	assert.Equal(t, int32(3), updated.Status.CurrentReplicas)
+	assert.Equal(t, "new-revision", updated.Status.CurrentRevision)
 	assert.Equal(t, "new-revision", updated.Status.UpdateRevision)
 	require.NotEmpty(t, updated.Status.Conditions)
-	assert.Equal(t, string(workloadv1alpha1.ModelServingUpdateInProgress), updated.Status.Conditions[len(updated.Status.Conditions)-1].Type)
+	assert.Equal(t, string(workloadv1alpha1.ModelServingProgressing), updated.Status.Conditions[len(updated.Status.Conditions)-1].Type)
+}
+
+func TestUpdateModelServingStatusDistinguishesScalingFromRollingUpdate(t *testing.T) {
+	tests := []struct {
+		name           string
+		replicas       int32
+		groupRevisions []string
+		newRevision    string
+		wantCondition  workloadv1alpha1.ModelServingConditionType
+	}{
+		{
+			name:           "pure scale up is progressing",
+			replicas:       2,
+			groupRevisions: []string{"current"},
+			newRevision:    "current",
+			wantCondition:  workloadv1alpha1.ModelServingProgressing,
+		},
+		{
+			name:           "pure scale down is progressing",
+			replicas:       1,
+			groupRevisions: []string{"current", "current"},
+			newRevision:    "current",
+			wantCondition:  workloadv1alpha1.ModelServingProgressing,
+		},
+		{
+			name:           "revision rollout is update in progress",
+			replicas:       2,
+			groupRevisions: []string{"old", "current"},
+			newRevision:    "current",
+			wantCondition:  workloadv1alpha1.ModelServingUpdateInProgress,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kubeClient := kubefake.NewSimpleClientset()
+			kthenaClient := kthenafake.NewSimpleClientset()
+			controller, err := NewModelServingController(kubeClient, kthenaClient, nil, apiextfake.NewSimpleClientset())
+			require.NoError(t, err)
+
+			ms := &workloadv1alpha1.ModelServing{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "condition-state"},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: ptr.To(tt.replicas),
+					Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+						Name: "decode", Replicas: ptr.To[int32](1),
+					}}},
+				},
+			}
+			_, err = kthenaClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Create(context.Background(), ms, metav1.CreateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, controller.modelServingsInformer.GetIndexer().Add(ms))
+
+			key := utils.GetNamespaceName(ms)
+			for ordinal, revision := range tt.groupRevisions {
+				controller.store.AddServingGroup(key, ordinal, revision)
+				require.NoError(t, controller.store.UpdateServingGroupStatus(
+					key, utils.GenerateServingGroupName(ms.Name, ordinal), datastore.ServingGroupRunning,
+				))
+			}
+
+			require.NoError(t, controller.UpdateModelServingStatus(ms, tt.newRevision))
+			updated, err := kthenaClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(context.Background(), ms.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotEmpty(t, updated.Status.Conditions)
+			assert.Equal(t, string(tt.wantCondition), updated.Status.Conditions[len(updated.Status.Conditions)-1].Type)
+		})
+	}
 }
 
 func TestUpdateModelServingStatusRevisionFields(t *testing.T) {

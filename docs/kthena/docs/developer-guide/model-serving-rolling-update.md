@@ -29,21 +29,21 @@ spec:
       partition: 0
 ```
 
-    With `replicas: 4` and `maxSurge: 1`, the controller temporarily changes the expected ServingGroup count from four to five while an updateable outdated ServingGroup exists. Normal replica synchronization creates or removes the required capacity; rolling-update reconciliation only selects outdated groups within the availability budget.
+With `replicas: 4` and `maxSurge: 1`, the controller temporarily changes the expected ServingGroup count from four to five while an updateable outdated ServingGroup exists. Normal replica synchronization creates or removes the required capacity; rolling-update reconciliation only selects outdated groups within the availability budget.
 
-    The controller always enforces these bounds:
+The controller always enforces these bounds:
 
-    $$
-    N_{live} \leq replicas + maxSurge
-    $$
+$$
+N_{live} \leq replicas + maxSurge
+$$
 
-    $$
-    N_{available} \geq replicas - maxUnavailable
-    $$
+$$
+N_{available} \geq replicas - maxUnavailable
+$$
 
-    An unready additional ServingGroup counts toward the replica ceiling but does not contribute to availability. If it cannot be scheduled, the rollout waits without deleting available capacity. No rollout lifecycle label or status journal is required because the expected count is derived from the observed revisions on every reconciliation.
+An unready additional ServingGroup counts toward the replica ceiling but does not contribute to availability. If it cannot be scheduled, the rollout waits without deleting available capacity. No rollout lifecycle label or status journal is required because the expected count is derived from the observed revisions on every reconciliation.
 
-    Ordinal values do not identify surge capacity. Binpack scale-down can leave sparse ordinals or an ordinal greater than `replicas`, and that ServingGroup remains a normal replica. When the update finishes, the expected count returns to `replicas` and the regular ModelServing binpack scale-down policy selects excess groups using readiness and deletion cost. Changing `replicas` or `maxSurge` during rollout therefore changes only the target count; it does not force deletion of high ordinals. Partition protection remains ordinal-based and independent of the current replica count.
+Ordinal values do not identify surge capacity. Binpack scale-down can leave sparse ordinals or an ordinal greater than `replicas`, and that ServingGroup remains a normal replica. When the update finishes, the expected count returns to `replicas` and the regular ModelServing binpack scale-down policy selects excess groups using readiness and deletion cost. Changing `replicas` or `maxSurge` during rollout therefore changes only the target count; it does not force deletion of high ordinals. Partition protection remains ordinal-based and independent of the current replica count.
 
 In the following we'll show how rolling update processes for a `ModelServing` with four replicas. Three Replica status are simulated here:
 

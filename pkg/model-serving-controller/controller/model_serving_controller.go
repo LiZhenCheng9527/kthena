@@ -2266,7 +2266,7 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 		// Track revision counts to determine the most common non-updated revision (CurrentRevision)
 		revisionCount := make(map[string]int)
 		referencedRevisions := make([]string, 0, len(groups))
-		rolloutActive := false
+		rolloutActive := hasUpdateableOutdatedServingGroup(groups, revision, partition)
 		for index := range groups {
 			group := groups[index]
 			_, ordinal := utils.GetParentNameAndOrdinal(group.Name)
@@ -2303,17 +2303,14 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 				currentGroups = append(currentGroups, ordinal)
 				// Count revisions for non-updated groups to find the most common one
 				revisionCount[group.Revision]++
-				if index >= partition {
-					rolloutActive = true
-				}
 			}
 		}
-		if len(groups) != replicas || available != replicas {
-			rolloutActive = true
-		}
+		progressActive := len(progressingGroups) > 0 || len(groups) != replicas || available != replicas
 
 		copy := latestMS.DeepCopy()
-		shouldUpdate := utils.SetConditionWithRolloutState(copy, progressingGroups, updatedGroups, currentGroups, rolloutActive)
+		shouldUpdate := utils.SetConditionWithRolloutAndProgressState(
+			copy, progressingGroups, updatedGroups, currentGroups, rolloutActive, progressActive,
+		)
 
 		// Update revision fields following StatefulSet's logic:
 		// 1. UpdateRevision is always the new revision being applied

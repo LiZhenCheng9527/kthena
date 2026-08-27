@@ -1808,9 +1808,15 @@ func (c *ModelServingController) checkServingGroupReady(ms *workloadv1alpha1.Mod
 		if err != nil {
 			return false, err
 		}
-		if len(roleList) != int(*role.Replicas) {
+
+		replicas := 1
+		if role.Replicas != nil {
+			replicas = int(*role.Replicas)
+		}
+
+		if len(roleList) != replicas {
 			klog.V(4).Infof("checkServingGroupReady: role %s in group %s not ready: replica count mismatch (%d/%d)",
-				role.Name, servingGroupName, len(roleList), int(*role.Replicas))
+				role.Name, servingGroupName, len(roleList), replicas)
 			return false, nil
 		}
 		for _, r := range roleList {
@@ -1885,7 +1891,7 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	}
 
 	if targetRole == nil {
-		klog.Warningf("role %s not found in ModelServing spec", roleName)
+		klog.Warningf("role %s not found in ModelServing spec or ControllerRevision", roleName)
 		return false, nil
 	}
 

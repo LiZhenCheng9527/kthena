@@ -1372,7 +1372,7 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 //  4. For RoleRollingUpdate, update outdated roles using each Role's maxUnavailable budget.
 func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
 	servingGroupList, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
-	if err != nil {
+	if err != nil && !errors.Is(err, datastore.ErrServingGroupNotFound) {
 		return fmt.Errorf("cannot get ServingGroupList from store, err:%v", err)
 	}
 

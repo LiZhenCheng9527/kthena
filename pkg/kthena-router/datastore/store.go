@@ -1090,7 +1090,11 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 			ms.addPod(podName)
 			// Categorize the pod for PDGroup scheduling
 			klog.V(4).Infof("Categorizing pod %s for PDGroup scheduling, model server %s", podName, modelServerName)
-			ms.categorizePodForPDGroup(podName, pod.Labels)
+			if oldPod, exists := s.pods.Load(podName); exists {
+				ms.updatePodPDGroup(podName, oldPod.(*PodInfo).GetPodLabels(), pod.Labels)
+			} else {
+				ms.categorizePodForPDGroup(podName, pod.Labels)
+			}
 		}
 	}
 

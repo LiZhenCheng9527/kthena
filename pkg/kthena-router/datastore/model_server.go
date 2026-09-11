@@ -75,8 +75,15 @@ func (m *modelServer) deletePod(podName types.NamespacedName) {
 
 // categorizePodForPDGroup categorizes a pod based on PDGroup labels and adds it to appropriate categories
 func (m *modelServer) categorizePodForPDGroup(podName types.NamespacedName, podLabels map[string]string) {
+	m.updatePodPDGroup(podName, nil, podLabels)
+}
+
+// updatePodPDGroup replaces the classification without exposing an intermediate absence to readers.
+func (m *modelServer) updatePodPDGroup(podName types.NamespacedName, oldLabels, podLabels map[string]string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
+
+	m.removePodFromPDGroupsLocked(podName, oldLabels)
 
 	pdGroupValue := m.getPDGroupName(podLabels)
 	if pdGroupValue == "" {
@@ -117,6 +124,11 @@ func (m *modelServer) removePodFromPDGroups(podName types.NamespacedName, labels
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	m.removePodFromPDGroupsLocked(podName, labels)
+}
+
+// removePodFromPDGroupsLocked requires m.mutex to be held for writing.
+func (m *modelServer) removePodFromPDGroupsLocked(podName types.NamespacedName, labels map[string]string) {
 	pdGroupName := m.getPDGroupName(labels)
 	if pdGroupName == "" {
 		return

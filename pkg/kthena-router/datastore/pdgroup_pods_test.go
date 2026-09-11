@@ -17,7 +17,12 @@ limitations under the License.
 package datastore
 
 import (
+	"strconv"
+	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -282,5 +287,120 @@ func TestPDGroupPodRemoval(t *testing.T) {
 
 	if len(decodePods) != 0 {
 		t.Errorf("Expected 0 decode pods after deletion, got %d", len(decodePods))
+	}
+}
+
+func TestPDGroupPodLabelUpdate(t *testing.T) {
+	tests := []struct {
+		name    string
+		oldRole string
+		group   string
+		role    string
+		decode  int
+		prefill int
+	}{
+		{"move decode group", "decode", "group-b", "decode", 1, 0},
+		{"move prefill group", "prefill", "group-b", "prefill", 0, 1},
+		{"prefill to decode", "prefill", "group-a", "decode", 1, 0},
+		{"decode to prefill", "decode", "group-a", "prefill", 0, 1},
+		{"remove group", "decode", "", "decode", 0, 0},
+		{"remove role", "prefill", "group-a", "", 0, 0},
+		{"unchanged labels", "decode", "group-a", "decode", 1, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New().(*store)
+			ms := newTestModelServerWithPDGroup("test-model", "default")
+			msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+			require.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+			pod := newTestPod("changing", "default", map[string]string{
+				"app": ms.Name, "pd-group": "group-a", "role": tt.oldRole,
+			})
+			podName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+			peer := newTestPod("peer", "default", map[string]string{
+				"app": ms.Name, "pd-group": "group-a", "role": "prefill",
+			})
+			require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+			require.NoError(t, s.AddOrUpdatePod(peer, []*aiv1alpha1.ModelServer{ms}))
+			oldInfo := s.GetPodInfo(podName)
+			updated := pod.DeepCopy()
+			updated.Labels["pd-group"] = tt.group
+			updated.Labels["role"] = tt.role
+			if tt.group == "" {
+				delete(updated.Labels, "pd-group")
+			}
+			if tt.role == "" {
+				delete(updated.Labels, "role")
+			}
+			require.NoError(t, s.AddOrUpdatePod(updated, []*aiv1alpha1.ModelServer{ms}))
+			assert.Same(t, oldInfo, s.GetPodInfo(podName), "updates must preserve PodInfo")
+			decode, err := s.GetDecodePods(msName)
+			require.NoError(t, err)
+			assert.Len(t, decode, tt.decode)
+			prefill, err := s.GetPrefillPods(msName)
+			require.NoError(t, err)
+			assert.Len(t, prefill, tt.prefill+1, "the unrelated prefill peer must remain")
+			value, ok := s.modelServer.Load(msName)
+			require.True(t, ok)
+			msInfo := value.(*modelServer)
+			assert.Len(t, msInfo.getPods(), 2, "the ModelServer selector still matches both pods")
+			require.NoError(t, s.DeletePod(podName))
+			require.NoError(t, s.DeletePod(types.NamespacedName{Namespace: peer.Namespace, Name: peer.Name}))
+			assert.Empty(t, msInfo.pdGroups, "deleting the pods must leave no stale group")
+		})
+	}
+}
+
+// A status-only update must not hide a healthy Pod from concurrent PD scheduling.
+func TestPDGroupConcurrentPodUpdate(t *testing.T) {
+	for _, role := range []string{"decode", "prefill"} {
+		t.Run(role, func(t *testing.T) {
+			s := New()
+			ms := newTestModelServerWithPDGroup("test-model", "default")
+			msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+			require.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+			var updated *corev1.Pod
+			for _, podRole := range []string{"decode", "prefill"} {
+				pod := newTestPod(podRole, "default", map[string]string{
+					"app": ms.Name, "pd-group": "group-a", "role": podRole,
+				})
+				require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+				if podRole == role {
+					updated = pod
+				}
+			}
+			start := make(chan struct{})
+			errs := make(chan error, 1)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for i := 0; i < 10000; i++ {
+					pod := updated.DeepCopy()
+					pod.ResourceVersion = strconv.Itoa(i + 1)
+					if err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}()
+			defer wg.Wait()
+			close(start)
+			for i := 0; i < 10000; i++ {
+				decode, err := s.GetDecodePods(msName)
+				require.NoError(t, err)
+				require.Len(t, decode, 1, "a status-only update must preserve the decode candidate")
+				prefill, err := s.GetPrefillPodsForDecodeGroup(msName, decode[0].GetPodNamespacedName())
+				require.NoError(t, err)
+				require.Len(t, prefill, 1, "a status-only update must preserve the prefill candidate")
+			}
+			wg.Wait()
+			select {
+			case err := <-errs:
+				require.NoError(t, err)
+			default:
+			}
+		})
 	}
 }

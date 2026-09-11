@@ -7707,11 +7707,6 @@ func TestManageRollingUpdateIncludesSurgeStatusInMaxScaleDown(t *testing.T) {
 	}
 }
 
-// TestManageRollingUpdateTreatsServingGroupNotFoundAsEmpty reproduces
-// https://github.com/volcano-sh/kthena/issues/1755: a ModelServing with no
-// entry yet in the store's outer ServingGroup map (e.g. replicas: 0 on a
-// freshly started controller) must not fail manageRollingUpdate, since
-// ErrServingGroupNotFound simply means there is nothing to roll.
 func TestManageRollingUpdateTreatsServingGroupNotFoundAsEmpty(t *testing.T) {
 	controller, err := NewModelServingController(
 		kubefake.NewSimpleClientset(),

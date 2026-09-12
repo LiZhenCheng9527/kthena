@@ -1549,8 +1549,6 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		// starve authenticated users (lower value = higher priority).
 		pri = math.MaxFloat64
 	}
-	// The queue only calls Cancel when it shuts down, so this tells a queue close
-	// apart from a client cancellation on the same reqCtx.
 	var queueClosed atomic.Bool
 	queueReq := &datastore.Request{
 		UserID:      userId,

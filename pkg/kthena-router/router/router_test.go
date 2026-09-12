@@ -2837,8 +2837,6 @@ func (s *blockingEnqueueStore) Enqueue(req *datastore.Request) error {
 	return nil
 }
 
-// queueClosingStore accepts Enqueue and then cancels the request the way the
-// fairness queue does on shutdown (ModelRoute deletion or router shutdown).
 type queueClosingStore struct {
 	datastore.Store
 }

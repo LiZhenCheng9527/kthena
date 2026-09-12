@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1548,6 +1549,9 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		// starve authenticated users (lower value = higher priority).
 		pri = math.MaxFloat64
 	}
+	// The queue only calls Cancel when it shuts down, so this tells a queue close
+	// apart from a client cancellation on the same reqCtx.
+	var queueClosed atomic.Bool
 	queueReq := &datastore.Request{
 		UserID:      userId,
 		ModelName:   modelName,
@@ -1556,7 +1560,7 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		RequestTime: time.Now(),
 		NotifyChan:  make(chan struct{}),
 		CancelCh:    reqCtx.Done(),
-		Cancel:      cancel,
+		Cancel:      func() { queueClosed.Store(true); cancel() },
 	}
 
 	if err := r.store.Enqueue(queueReq); err != nil {
@@ -1602,6 +1606,12 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 			}
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, "Request processing timed out in queue")
 			return fmt.Errorf("request processing timed out in queue")
+		}
+		if queueClosed.Load() {
+			klog.V(2).Infof("%s request rejected because the queue closed: reqID=%s sessionID=%s user=%s model=%s",
+				logPrefix, requestID, sessionID, userId, modelName)
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, "Request queue closed while waiting")
+			return fmt.Errorf("request queue closed while waiting")
 		}
 		klog.V(4).Infof("%s request cancelled (client disconnected): reqID=%s sessionID=%s user=%s model=%s",
 			logPrefix, requestID, sessionID, userId, modelName)

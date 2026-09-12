@@ -2722,6 +2722,15 @@ func TestHandleFairnessScheduling(t *testing.T) {
 			wantHTTPStatus:  http.StatusServiceUnavailable,
 		},
 		{
+			name:            "queue closed while waiting returns 503 distinct from client disconnect",
+			fairnessTimeout: 10 * time.Second,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &queueClosingStore{Store: real} },
+			wantErr:         true,
+			wantErrMsg:      "queue closed",
+			wantHTTPStatus:  http.StatusServiceUnavailable,
+		},
+		{
 			name:            "enqueue failure",
 			fairnessTimeout: 5 * time.Second,
 			setUserID:       true,
@@ -2825,6 +2834,22 @@ type blockingEnqueueStore struct {
 
 func (s *blockingEnqueueStore) Enqueue(req *datastore.Request) error {
 	// Accept the request but never signal NotifyChan — simulates a full queue.
+	return nil
+}
+
+// queueClosingStore accepts Enqueue and then cancels the request the way the
+// fairness queue does on shutdown (ModelRoute deletion or router shutdown).
+type queueClosingStore struct {
+	datastore.Store
+}
+
+func (s *queueClosingStore) Enqueue(req *datastore.Request) error {
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		if req.Cancel != nil {
+			req.Cancel()
+		}
+	}()
 	return nil
 }
 

@@ -15,6 +15,10 @@ Notes:
 
 ## Installation
 
+:::note ModelBooster examples
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. The ModelBooster examples on this page are retained for existing users. For new deployments, configure the runtime sidecar in your ModelServing Pod template as shown below. The runtime itself is not deprecated; see the [deployment guidance](./model-deployment.md#modelbooster-deprecation).
+:::
+
 - Runtime does not support separate installation. It will be automatically deployed alongside the inference container as a sidecar when you are using `ModelBooster` to deploy an LLM.
 - When deploying via the ModelBooster CR (one-stop deployment), no additional configuration is needed; ModelServing will automatically enable the runtime feature.
 - For standalone deployment using ModelServing YAML, you can add the following configuration to start Runtime as sidecar container:
@@ -187,4 +191,3 @@ Notes:
    - S3/OBS:
      - `ACCESS_KEY`, `SECRET_KEY`: access credentials (recommended to store in a Secret and load via `envFrom.secretRef.name`)
      - `ENDPOINT`: object storage service endpoint (e.g., `https://s3.us-east-1.amazonaws.com` or `https://obs.test.com`)
-

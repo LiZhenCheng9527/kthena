@@ -2842,12 +2842,9 @@ type queueClosingStore struct {
 }
 
 func (s *queueClosingStore) Enqueue(req *datastore.Request) error {
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		if req.Cancel != nil {
-			req.Cancel()
-		}
-	}()
+	if req.Cancel != nil {
+		req.Cancel()
+	}
 	return nil
 }
 

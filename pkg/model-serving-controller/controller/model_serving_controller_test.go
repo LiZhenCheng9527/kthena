@@ -7707,6 +7707,32 @@ func TestManageRollingUpdateIncludesSurgeStatusInMaxScaleDown(t *testing.T) {
 	}
 }
 
+func TestManageRollingUpdateTreatsServingGroupNotFoundAsEmpty(t *testing.T) {
+	controller, err := NewModelServingController(
+		kubefake.NewSimpleClientset(),
+		kthenafake.NewSimpleClientset(),
+		nil,
+		apiextfake.NewSimpleClientset(),
+	)
+	require.NoError(t, err)
+
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "empty-rollout", Namespace: "default"},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas: ptr.To[int32](0),
+			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+				Type: workloadv1alpha1.ServingGroupRollingUpdate,
+			},
+		},
+	}
+
+	key := utils.GetNamespaceName(ms)
+	_, err = controller.store.GetServingGroupByModelServing(key)
+	require.ErrorIs(t, err, datastore.ErrServingGroupNotFound)
+
+	assert.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new"))
+}
+
 func TestHasUpdateableOutdatedServingGroup(t *testing.T) {
 	tests := []struct {
 		name      string

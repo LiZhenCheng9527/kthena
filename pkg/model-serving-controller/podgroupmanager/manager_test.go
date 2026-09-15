@@ -18,6 +18,7 @@ package podgroupmanager
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -38,6 +39,12 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
+
+// The volcano.sh/apis fake clientset does not support WatchList, which client-go enables by default.
+func TestMain(m *testing.M) {
+	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
+	os.Exit(m.Run())
+}
 
 func TestCalculateRequirements(t *testing.T) {
 	// Helper function to create a pod template

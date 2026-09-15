@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -29,6 +30,12 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	testhelper "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils/test"
 )
+
+// The volcano.sh/apis fake clientset does not support WatchList, which client-go enables by default.
+func TestMain(m *testing.M) {
+	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
+	os.Exit(m.Run())
+}
 
 type testControllerHarness struct {
 	t             *testing.T

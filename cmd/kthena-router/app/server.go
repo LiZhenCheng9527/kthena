@@ -31,14 +31,14 @@ import (
 
 const defaultDrainTimeout = 5 * time.Minute
 
-// Resource sources the router can read ModelRoute, ModelServer and
+// Configuration sources the router can read ModelRoute, ModelServer and
 // ExternalModelProvider objects from.
 const (
-	// ResourceSourceKubernetes watches the Kubernetes API server.
-	ResourceSourceKubernetes = "kubernetes"
-	// ResourceSourceFile reads manifests from a local directory, allowing the
+	// ConfigSourceKubernetes watches the Kubernetes API server.
+	ConfigSourceKubernetes = "kubernetes"
+	// ConfigSourceFile reads manifests from a local directory, allowing the
 	// router to run without an API server.
-	ResourceSourceFile = "file"
+	ConfigSourceFile = "file"
 )
 
 type Server struct {
@@ -56,14 +56,14 @@ type Server struct {
 	ExposeMetricsOnRouterPort          bool
 	KubeAPIQPS                         float32
 	KubeAPIBurst                       int
-	// ResourceSource selects where ModelRoute, ModelServer and
+	// ConfigSource selects where ModelRoute, ModelServer and
 	// ExternalModelProvider objects are read from. Defaults to
-	// ResourceSourceKubernetes.
-	ResourceSource string
-	// ResourceDir holds the manifests when ResourceSource is ResourceSourceFile.
-	ResourceDir string
-	// ResourceSyncPeriod is how often ResourceDir is re-read.
-	ResourceSyncPeriod time.Duration
+	// ConfigSourceKubernetes.
+	ConfigSource string
+	// ConfigDir holds the manifests when ConfigSource is ConfigSourceFile.
+	ConfigDir string
+	// ConfigSyncPeriod is how often ConfigDir is re-read.
+	ConfigSyncPeriod time.Duration
 	// RouterConfigFile is the scheduler and authentication configuration. It
 	// defaults to DefaultRouterConfigFile.
 	RouterConfigFile string
@@ -85,7 +85,7 @@ func NewServer(port string, enableTLS bool, cert, key string, enableGatewayAPI b
 		ExposeMetricsOnRouterPort:          exposeMetricsOnRouterPort,
 		KubeAPIQPS:                         kubeAPIQPS,
 		KubeAPIBurst:                       kubeAPIBurst,
-		ResourceSource:                     ResourceSourceKubernetes,
+		ConfigSource:                       ConfigSourceKubernetes,
 		drainTimeout:                       parseDrainTimeout(),
 	}
 }
@@ -121,7 +121,7 @@ func (s *Server) Run(ctx context.Context) {
 	// must be run before the controller, because it will register callbacks
 	r := NewRouter(store, s.RouterConfigFile)
 	// start the configured resource source
-	if s.ResourceSource == ResourceSourceFile {
+	if s.ConfigSource == ConfigSourceFile {
 		s.controllers = s.startFileSource(store, ctx.Done())
 	} else {
 		s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst)
@@ -146,21 +146,21 @@ func (s *Server) HasSynced() bool {
 	return s.controllers.HasSynced() && s.store.HasSynced()
 }
 
-// startFileSource loads resources from ResourceDir and keeps the store in sync
+// startFileSource loads resources from ConfigDir and keeps the store in sync
 // with it, replacing the API server backed controllers.
 func (s *Server) startFileSource(store datastore.Store, stop <-chan struct{}) Controller {
-	source, err := filesource.New(s.ResourceDir, s.ResourceSyncPeriod, store)
+	source, err := filesource.New(s.ConfigDir, s.ConfigSyncPeriod, store)
 	if err != nil {
 		klog.Fatalf("Failed to create file resource source: %v", err)
 	}
-	klog.Infof("Reading resources from directory %s", s.ResourceDir)
+	klog.Infof("Reading resources from directory %s", s.ConfigDir)
 	go func() {
 		if err := source.Run(stop); err != nil {
 			klog.Fatalf("Error running file resource source: %v", err)
 		}
 	}()
 	if !cache.WaitForCacheSync(stop, source.HasSynced) {
-		klog.Fatalf("Failed to load resources from %s", s.ResourceDir)
+		klog.Fatalf("Failed to load resources from %s", s.ConfigDir)
 	}
 	return source
 }

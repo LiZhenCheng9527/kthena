@@ -4,7 +4,7 @@
 
 By default Kthena Router watches ModelRoute, ModelServer and
 ExternalModelProvider objects on the Kubernetes API server. With
-`--resource-source=file` the router instead reads the very same manifests from a
+`--config-source=file` the router instead reads the very same manifests from a
 local directory, which lets it run without a cluster, for example for local
 development, benchmarking or a container-only deployment.
 
@@ -15,16 +15,16 @@ apply with `kubectl`, so a configuration can be moved between both modes.
 
 ```bash
 kthena-router \
-  --resource-source=file \
-  --resource-dir=/etc/kthena/resources \
-  --resource-sync-period=10s
+  --config-source=file \
+  --config-dir=/etc/kthena/resources \
+  --config-sync-period=10s
 ```
 
-| Flag                     | Default                 | Description                                                    |
-| ------------------------ | ----------------------- | -------------------------------------------------------------- |
-| `--resource-source`      | `kubernetes`            | Where resources are read from. One of `kubernetes` or `file`.  |
-| `--resource-dir`         | `/etc/kthena/resources` | Directory holding the manifests when `--resource-source=file`. |
-| `--resource-sync-period` | `10s`                   | How often the directory is re-read.                            |
+| Flag                   | Default                 | Description                                                   |
+| ---------------------- | ----------------------- | ------------------------------------------------------------- |
+| `--config-source`      | `kubernetes`            | Where resources are read from. One of `kubernetes` or `file`. |
+| `--config-dir`         | `/etc/kthena/resources` | Directory holding the manifests when `--config-source=file`.  |
+| `--config-sync-period` | `10s`                   | How often the directory is re-read.                           |
 
 The router reads every `.yaml`, `.yml` and `.json` file directly inside the
 directory; sub-directories are ignored. A file may contain several documents
@@ -107,7 +107,7 @@ spec:
 
 ## Updating resources
 
-The directory is re-read every `--resource-sync-period`. Added, changed and
+The directory is re-read every `--config-sync-period`. Added, changed and
 removed manifests are applied to the running router, so no restart is needed. A
 manifest that fails to parse is reported in the router log and the last valid
 snapshot keeps serving traffic.

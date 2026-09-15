@@ -287,6 +287,13 @@ func ValidateModelServer(modelServer *networkingv1alpha1.ModelServer) (bool, str
 	endpointsField := specField.Child("endpoints")
 	hasEndpoints := len(modelServer.Spec.Endpoints) > 0
 
+	// `workloadPort` is not required at the CRD level so that static endpoints
+	// can carry their own ports, but pods matched by a selector have no other
+	// port source.
+	if !hasEndpoints && modelServer.Spec.WorkloadPort.Port == 0 {
+		allErrs = append(allErrs, field.Required(specField.Child("workloadPort", "port"), "workloadPort.port must be specified when endpoints are not used"))
+	}
+
 	if modelServer.Spec.WorkloadSelector == nil {
 		if !hasEndpoints {
 			allErrs = append(allErrs, field.Required(workloadSelectorField, "one of workloadSelector and endpoints must be specified"))

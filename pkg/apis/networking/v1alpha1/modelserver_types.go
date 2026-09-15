@@ -33,9 +33,11 @@ type ModelServerSpec struct {
 	InferenceEngine InferenceEngine `json:"inferenceEngine"`
 	// WorkloadSelector is used to match the model serving instances.
 	// Currently, they must be pods within the same namespace as modelServer object.
-	// Exactly one of `workloadSelector` and `endpoints` must be specified, except that
-	// `workloadSelector.pdGroup` may be combined with `endpoints` to group static
-	// endpoints into prefill and decode roles.
+	// `workloadSelector.matchLabels` and `endpoints` are mutually exclusive ways of
+	// declaring the serving instances, so exactly one of them must be used.
+	// `workloadSelector.pdGroup` does not select instances; it only assigns them
+	// prefill and decode roles, and therefore is the sole `workloadSelector` field
+	// that may also be combined with `endpoints`.
 	//
 	// +optional
 	WorkloadSelector *WorkloadSelector `json:"workloadSelector,omitempty"`
@@ -44,7 +46,8 @@ type ModelServerSpec struct {
 	// deployments where the serving instances are not discoverable as pods of the
 	// cluster the router runs in, for example when the router reads its
 	// configuration from local files instead of the Kubernetes API server.
-	// Exactly one of `workloadSelector` and `endpoints` must be specified.
+	// `endpoints` and `workloadSelector.matchLabels` are mutually exclusive;
+	// exactly one of them must be specified.
 	//
 	// +optional
 	// +listType=map
@@ -53,6 +56,8 @@ type ModelServerSpec struct {
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
 	// WorkloadPort defines the port and protocol configuration for the model server.
+	// It may be omitted only when every entry in `endpoints` declares its own
+	// `port`; endpoints without an explicit `port` fall back to `workloadPort.port`.
 	// +optional
 	WorkloadPort WorkloadPort `json:"workloadPort,omitempty"`
 
@@ -126,8 +131,10 @@ type Endpoint struct {
 	// +kubebuilder:validation:Maximum=65535
 	Port *int32 `json:"port,omitempty"`
 
-	// Labels are attached to the endpoint and matched by `workloadSelector.pdGroup`
-	// to assign the endpoint a prefill or decode role.
+	// Labels are attached to the endpoint. They do not select serving instances;
+	// they are only matched against `workloadSelector.pdGroup` to assign the
+	// endpoint a prefill or decode role, `pdGroup` being the sole
+	// `workloadSelector` field that may be combined with `endpoints`.
 	//
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`

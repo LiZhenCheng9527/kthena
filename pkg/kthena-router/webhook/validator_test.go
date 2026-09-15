@@ -731,6 +731,29 @@ func TestValidateModelServer(t *testing.T) {
 			expectValid: true,
 		},
 		{
+			name: "invalid model server - workload selector without workload port",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app": "test-server",
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadPort.port: Required value: workloadPort.port must be specified when endpoints are not used",
+		},
+		{
 			name: "invalid model server - empty workload selector",
 			modelServer: &networkingv1alpha1.ModelServer{
 				TypeMeta: metav1.TypeMeta{

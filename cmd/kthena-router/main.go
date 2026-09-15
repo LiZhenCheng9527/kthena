@@ -55,9 +55,9 @@ func main() {
 		exposeMetricsOnRouterPort          bool
 		kubeAPIQPS                         float32
 		kubeAPIBurst                       int
-		resourceSource                     string
-		resourceDir                        string
-		resourceSyncPeriod                 time.Duration
+		configSource                       string
+		configDir                          string
+		configSyncPeriod                   time.Duration
 		routerConfigFile                   string
 	)
 
@@ -86,9 +86,9 @@ func main() {
 	pflag.BoolVar(&exposeMetricsOnRouterPort, "expose-metrics-on-router-port", false, "Also expose /metrics on the inference listener for compatibility (not recommended for public listeners)")
 	pflag.Float32Var(&kubeAPIQPS, "kube-api-qps", 0, "QPS to use while talking with kubernetes apiserver. If 0, use default value.")
 	pflag.IntVar(&kubeAPIBurst, "kube-api-burst", 0, "Burst to use while talking with kubernetes apiserver. If 0, use default value.")
-	pflag.StringVar(&resourceSource, "resource-source", app.ResourceSourceKubernetes, "Where ModelRoute, ModelServer and ExternalModelProvider objects are read from. One of \"kubernetes\" or \"file\".")
-	pflag.StringVar(&resourceDir, "resource-dir", "/etc/kthena/resources", "Directory holding the resource manifests when --resource-source=file.")
-	pflag.DurationVar(&resourceSyncPeriod, "resource-sync-period", 10*time.Second, "How often the resource directory is re-read when --resource-source=file.")
+	pflag.StringVar(&configSource, "config-source", app.ConfigSourceKubernetes, "Where ModelRoute, ModelServer and ExternalModelProvider objects are read from. One of \"kubernetes\" or \"file\".")
+	pflag.StringVar(&configDir, "config-dir", "/etc/kthena/resources", "Directory holding the resource manifests when --config-source=file.")
+	pflag.DurationVar(&configSyncPeriod, "config-sync-period", 10*time.Second, "How often the resource directory is re-read when --config-source=file.")
 	pflag.StringVar(&routerConfigFile, "router-config", app.DefaultRouterConfigFile, "Path to the router scheduler and authentication configuration file.")
 	defer klog.Flush()
 	pflag.Parse()
@@ -97,20 +97,20 @@ func main() {
 		klog.Fatal("tls-cert and tls-key must be specified together")
 	}
 
-	switch resourceSource {
-	case app.ResourceSourceKubernetes:
-	case app.ResourceSourceFile:
+	switch configSource {
+	case app.ConfigSourceKubernetes:
+	case app.ConfigSourceFile:
 		// Without an API server the router can neither serve admission requests
 		// nor reconcile Gateway API objects.
 		if enableGatewayAPI {
-			klog.Fatal("--enable-gateway-api is not supported with --resource-source=file")
+			klog.Fatal("--enable-gateway-api is not supported with --config-source=file")
 		}
 		if enableWebhook {
-			klog.Info("Webhook server is disabled because --resource-source=file")
+			klog.Info("Webhook server is disabled because --config-source=file")
 			enableWebhook = false
 		}
 	default:
-		klog.Fatalf("invalid --resource-source: %q, must be %q or %q", resourceSource, app.ResourceSourceKubernetes, app.ResourceSourceFile)
+		klog.Fatalf("invalid --config-source: %q, must be %q or %q", configSource, app.ConfigSourceKubernetes, app.ConfigSourceFile)
 	}
 
 	if enableGatewayAPIInferenceExtension && !enableGatewayAPI {
@@ -150,9 +150,9 @@ func main() {
 	}
 
 	server := app.NewServer(routerPort, tlsCert != "" && tlsKey != "", tlsCert, tlsKey, enableGatewayAPI, enableGatewayAPIInferenceExtension, debugPort, metricsPort, exposeMetricsOnRouterPort, kubeAPIQPS, kubeAPIBurst)
-	server.ResourceSource = resourceSource
-	server.ResourceDir = resourceDir
-	server.ResourceSyncPeriod = resourceSyncPeriod
+	server.ConfigSource = configSource
+	server.ConfigDir = configDir
+	server.ConfigSyncPeriod = configSyncPeriod
 	server.RouterConfigFile = routerConfigFile
 	server.Run(ctx)
 }

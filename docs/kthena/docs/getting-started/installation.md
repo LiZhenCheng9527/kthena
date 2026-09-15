@@ -12,7 +12,7 @@ Before installing Kthena, ensure you have the following:
 
 ### Required Prerequisites
 
-- **Kubernetes cluster** (version 1.20 or later)
+- **Kubernetes cluster** (version 1.28 or later)
 - **kubectl** configured to access your cluster
 - **Helm** (version 3.0 or later)
 - Cluster admin permissions

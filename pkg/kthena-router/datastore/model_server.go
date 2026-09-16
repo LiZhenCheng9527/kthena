@@ -87,7 +87,11 @@ func (m *modelServer) updatePodPDGroup(podName types.NamespacedName, oldLabels, 
 	defer m.mutex.Unlock()
 
 	m.removePodFromPDGroupsLocked(podName, oldLabels)
+	m.categorizePodForPDGroupLocked(podName, podLabels)
+}
 
+// categorizePodForPDGroupLocked requires m.mutex to be held for writing.
+func (m *modelServer) categorizePodForPDGroupLocked(podName types.NamespacedName, podLabels map[string]string) {
 	pdGroupValue := m.getPDGroupName(podLabels)
 	if pdGroupValue == "" {
 		return

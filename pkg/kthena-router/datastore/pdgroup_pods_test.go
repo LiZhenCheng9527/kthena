@@ -487,3 +487,141 @@ func TestPDGroupConcurrentPodUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestPDGroupModelServerConfigUpdate(t *testing.T) {
+	tests := []struct {
+		name              string
+		initiallyDisabled bool
+		update            func(*aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup
+		decode            []string
+		prefill           []string
+		peer              []string
+	}{
+		{
+			name: "change group key",
+			update: func(pd *aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup {
+				pd.GroupKey = "next-group"
+				return pd
+			},
+			decode: []string{"decode"}, prefill: []string{"prefill-a", "prefill-b"}, peer: []string{"prefill-b"},
+		},
+		{
+			name: "change decode selector",
+			update: func(pd *aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup {
+				pd.DecodeLabels = map[string]string{"role": "other-decode"}
+				return pd
+			},
+			prefill: []string{"prefill-a", "prefill-b"},
+		},
+		{
+			name: "change prefill selector",
+			update: func(pd *aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup {
+				pd.PrefillLabels = map[string]string{"role": "other-prefill"}
+				return pd
+			},
+			decode: []string{"decode"},
+		},
+		{
+			name:   "disable PD",
+			update: func(_ *aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup { return nil },
+		},
+		{
+			name: "enable PD", initiallyDisabled: true,
+			update: func(pd *aiv1alpha1.PDGroup) *aiv1alpha1.PDGroup { return pd },
+			decode: []string{"decode"}, prefill: []string{"prefill-a", "prefill-b"}, peer: []string{"prefill-a"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New().(*store)
+			ms := newTestModelServerWithPDGroup("test-model", "default")
+			updated := ms.DeepCopy()
+			updated.Spec.WorkloadSelector.PDGroup = tt.update(updated.Spec.WorkloadSelector.PDGroup)
+			if tt.initiallyDisabled {
+				ms.Spec.WorkloadSelector.PDGroup = nil
+			}
+			msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+			require.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+			var pods []*corev1.Pod
+			var infos []*PodInfo
+			// Switching the group key must move decode's peer from prefill-a to
+			// prefill-b, without any Pod label updates or new PodInfo objects.
+			for _, p := range []struct{ name, role, group, nextGroup string }{
+				{"decode", "decode", "group-a", "group-b"},
+				{"prefill-a", "prefill", "group-a", "group-c"},
+				{"prefill-b", "prefill", "group-b", "group-b"},
+			} {
+				pod := newTestPod(p.name, "default", map[string]string{
+					"app": ms.Name, "role": p.role, "pd-group": p.group, "next-group": p.nextGroup,
+				})
+				require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+				pods = append(pods, pod)
+				infos = append(infos, s.GetPodInfo(types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}))
+			}
+			require.NoError(t, s.AddOrUpdateModelServer(updated, nil))
+			names := func(pods []*PodInfo) []string {
+				var result []string
+				for _, pod := range pods {
+					result = append(result, pod.GetPodNamespacedName().Name)
+				}
+				return result
+			}
+			decode, err := s.GetDecodePods(msName)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.decode, names(decode))
+			prefill, err := s.GetPrefillPods(msName)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.prefill, names(prefill))
+			peer, err := s.GetPrefillPodsForDecodeGroup(msName, infos[0].GetPodNamespacedName())
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.peer, names(peer))
+			for i, pod := range pods {
+				assert.Same(t, infos[i], s.GetPodInfo(infos[i].GetPodNamespacedName()))
+				// A later Pod event and deletion must not leave buckets indexed
+				// with the previous configuration's group key.
+				require.NoError(t, s.AddOrUpdatePod(pod.DeepCopy(), []*aiv1alpha1.ModelServer{updated}))
+				require.NoError(t, s.DeletePod(infos[i].GetPodNamespacedName()))
+			}
+			value, ok := s.modelServer.Load(msName)
+			require.True(t, ok)
+			assert.Empty(t, value.(*modelServer).pdGroups)
+			assert.Empty(t, value.(*modelServer).decodePodGroups)
+		})
+	}
+}
+
+// Both configurations have a valid pair. Rebuilding must not expose an empty index.
+func TestPDGroupConcurrentModelServerConfigUpdate(t *testing.T) {
+	s := New()
+	ms := newTestModelServerWithPDGroup("test-model", "default")
+	msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+	require.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+	for _, role := range []string{"decode", "prefill"} {
+		pod := newTestPod(role, "default", map[string]string{
+			"app": ms.Name, "role": role, "pd-group": "group-a", "next-group": "group-b",
+		})
+		require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+	}
+	updated := ms.DeepCopy()
+	updated.Spec.WorkloadSelector.PDGroup.GroupKey = "next-group"
+	configs := []*aiv1alpha1.ModelServer{ms, updated}
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < 1000; i++ {
+			if err := s.AddOrUpdateModelServer(configs[i%2], nil); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	defer func() { require.NoError(t, <-done) }()
+	for i := 0; i < 1000; i++ {
+		decode, err := s.GetDecodePods(msName)
+		require.NoError(t, err)
+		require.Len(t, decode, 1)
+		prefill, err := s.GetPrefillPodsForDecodeGroup(msName, decode[0].GetPodNamespacedName())
+		require.NoError(t, err)
+		require.Len(t, prefill, 1, "both complete configurations have a matching prefill")
+	}
+}

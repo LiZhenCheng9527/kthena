@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -905,10 +906,21 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 		// Existing object — concurrent readers may access modelServer and pods,
 		// so we must hold the lock to prevent data races.
 		modelServerObj.mutex.Lock()
+		selectorChanged := !reflect.DeepEqual(modelServerObj.modelServer.Spec.WorkloadSelector, ms.Spec.WorkloadSelector)
 		modelServerObj.modelServer = ms
 		if len(pods) != 0 {
 			// do not operate s.pods here, which are done within pod handler
 			modelServerObj.pods = pods
+		}
+		if selectorChanged {
+			// Publish the new configuration and both PD indexes together.
+			clear(modelServerObj.pdGroups)
+			clear(modelServerObj.decodePodGroups)
+			for podName := range modelServerObj.pods {
+				if value, ok := s.pods.Load(podName); ok {
+					modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
+				}
+			}
 		}
 		modelServerObj.mutex.Unlock()
 	}

@@ -421,7 +421,8 @@ type store struct {
 	httpRoutes     map[string]*gatewayv1.HTTPRoute // key: namespace/name, value: *gatewayv1.HTTPRoute
 	gatewayRoutes  map[string]sets.Set[string]     // key: gateway key (namespace/name), value: set of HTTPRoute keys
 	// New fields for callback management
-	callbacks map[string][]CallbackFunc
+	callbacksMu sync.RWMutex
+	callbacks   map[string][]CallbackFunc
 
 	// initialSynced is used to indicate whether all the resources has been processed and storred into this store.
 	initialSynced *atomic.Bool
@@ -1835,20 +1836,19 @@ func updateHistogramMetrics(podinfo *PodInfo, histogramMetrics map[string]*dto.H
 }
 
 // RegisterCallback registers a callback function for a specific resource
-// Note this can only be called during bootstrapping.
 func (s *store) RegisterCallback(kind string, callback CallbackFunc) {
-	if _, exists := s.callbacks[kind]; !exists {
-		s.callbacks[kind] = make([]CallbackFunc, 0)
-	}
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.callbacks[kind] = append(s.callbacks[kind], callback)
 }
 
 // triggerCallbacks executes all registered callbacks for a specific event type
 func (s *store) triggerCallbacks(kind string, data EventData) {
-	if callbacks, exists := s.callbacks[kind]; exists {
-		for _, callback := range callbacks {
-			go callback(data)
-		}
+	s.callbacksMu.RLock()
+	callbacks := s.callbacks[kind]
+	s.callbacksMu.RUnlock()
+	for _, callback := range callbacks {
+		go callback(data)
 	}
 }
 

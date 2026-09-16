@@ -144,18 +144,23 @@ func (l *accessLoggerImpl) formatJSON(entry *AccessLogEntry) (string, error) {
 	return string(data), nil
 }
 
-// writeTextField appends " key=value" to line, skipping empty values. Values
-// carrying a space, quote or line break are quoted so one entry stays one
-// parseable line.
+// writeTextField appends " key=value" to line, skipping empty values. A value
+// holding a space, a quote or any control character is quoted, so one entry
+// stays one parseable line and escape sequences cannot reach a terminal.
 func writeTextField(line *strings.Builder, key, value string) {
 	if value == "" {
 		return
 	}
-	if strings.ContainsAny(value, " \"\n\r\t") {
+	if needsQuoting(value) {
 		fmt.Fprintf(line, " %s=%q", key, value)
 		return
 	}
 	fmt.Fprintf(line, " %s=%s", key, value)
+}
+
+func needsQuoting(value string) bool {
+	return strings.ContainsAny(value, " \"") ||
+		strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
 // formatText formats the entry as structured text

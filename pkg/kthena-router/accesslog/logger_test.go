@@ -224,6 +224,21 @@ func TestAccessLogEntry_ToTextQuotesUnsafeValues(t *testing.T) {
 			expected: `error="pod_discovery:no available pods"`,
 		},
 		{
+			name:     "model name with an ANSI escape",
+			entry:    &AccessLogEntry{ModelName: "a\x1b[31mred"},
+			expected: `model_name="a\x1b[31mred"`,
+		},
+		{
+			name:     "model name with a form feed",
+			entry:    &AccessLogEntry{ModelName: "a\fb"},
+			expected: `model_name="a\fb"`,
+		},
+		{
+			name:     "model name with a NUL",
+			entry:    &AccessLogEntry{ModelName: "a\x00b"},
+			expected: `model_name="a\x00b"`,
+		},
+		{
 			name:     "path with a quote",
 			entry:    &AccessLogEntry{Method: "POST", Path: `/v1/"x`, Protocol: "HTTP/1.1"},
 			expected: `"POST /v1/\"x HTTP/1.1"`,

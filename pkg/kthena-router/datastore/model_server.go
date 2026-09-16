@@ -34,13 +34,16 @@ type modelServer struct {
 	// Key: PD group value (the actual value of the group key label)
 	// Value: PDGroupPods containing categorized decode/prefill pods
 	pdGroups map[string]*PDGroupPods
+	// Reverse index updated with pdGroups under mutex, independent of PodInfo labels.
+	decodePodGroups map[types.NamespacedName]string
 }
 
 func newModelServer(ms *aiv1alpha1.ModelServer) *modelServer {
 	return &modelServer{
-		modelServer: ms,
-		pods:        sets.New[types.NamespacedName](),
-		pdGroups:    make(map[string]*PDGroupPods),
+		modelServer:     ms,
+		pods:            sets.New[types.NamespacedName](),
+		pdGroups:        make(map[string]*PDGroupPods),
+		decodePodGroups: make(map[types.NamespacedName]string),
 	}
 }
 
@@ -99,6 +102,7 @@ func (m *modelServer) updatePodPDGroup(podName types.NamespacedName, oldLabels, 
 	isDecodePod := matchesLabels(podLabels, pdGroup.DecodeLabels)
 	if isDecodePod {
 		pdGroupPods.AddDecodePod(podName)
+		m.decodePodGroups[podName] = pdGroupValue
 		return
 	}
 
@@ -129,6 +133,7 @@ func (m *modelServer) removePodFromPDGroups(podName types.NamespacedName, labels
 
 // removePodFromPDGroupsLocked requires m.mutex to be held for writing.
 func (m *modelServer) removePodFromPDGroupsLocked(podName types.NamespacedName, labels map[string]string) {
+	delete(m.decodePodGroups, podName)
 	pdGroupName := m.getPDGroupName(labels)
 	if pdGroupName == "" {
 		return
@@ -177,9 +182,9 @@ func (m *modelServer) getPrefillPodsForDecodeGroup(pod *PodInfo) []types.Namespa
 		return nil
 	}
 
-	pdGroup := m.modelServer.Spec.WorkloadSelector.PDGroup
-	pdGroupValue, hasPDGroupKey := pod.GetPodLabels()[pdGroup.GroupKey]
-	if !hasPDGroupKey {
+	// Use the same classification snapshot as pdGroups; PodInfo labels may lag behind it.
+	pdGroupValue, ok := m.decodePodGroups[pod.GetPodNamespacedName()]
+	if !ok {
 		return nil
 	}
 

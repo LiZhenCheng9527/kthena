@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -347,6 +348,14 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 			prefill, err := s.GetPrefillPods(msName)
 			require.NoError(t, err)
 			assert.Len(t, prefill, tt.prefill+1, "the unrelated prefill peer must remain")
+			matching, err := s.GetPrefillPodsForDecodeGroup(msName, podName)
+			require.NoError(t, err)
+			if tt.decode == 1 && tt.group == "group-a" {
+				require.Len(t, matching, 1)
+				assert.Equal(t, peer.Name, matching[0].GetPodNamespacedName().Name)
+			} else {
+				assert.Empty(t, matching, "only a classified decode Pod can select its group's prefill peer")
+			}
 			value, ok := s.modelServer.Load(msName)
 			require.True(t, ok)
 			msInfo := value.(*modelServer)
@@ -359,6 +368,70 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 			assert.Empty(t, msInfo.pdGroups, "deleting the pods must leave no stale group")
 		})
 	}
+}
+
+func TestPDGroupLookupDuringPodLabelUpdate(t *testing.T) {
+	s := New().(*store)
+	ms := newTestModelServerWithPDGroup("test-model", "default")
+	second := ms.DeepCopy()
+	second.Name = "second-model"
+	servers := []*aiv1alpha1.ModelServer{ms, second}
+	for _, server := range servers {
+		require.NoError(t, s.AddOrUpdateModelServer(server, nil))
+	}
+	msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+	pod := newTestPod("decode", "default", map[string]string{
+		"app": ms.Name, "pd-group": "group-a", "role": "decode",
+	})
+	podName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	require.NoError(t, s.AddOrUpdatePod(pod, servers))
+	for _, group := range []string{"group-a", "group-b"} {
+		prefill := newTestPod("prefill-"+group, "default", map[string]string{
+			"app": ms.Name, "pd-group": group, "role": "prefill",
+		})
+		require.NoError(t, s.AddOrUpdatePod(prefill, servers))
+	}
+	value, ok := s.modelServer.Load(msName)
+	require.True(t, ok)
+	msInfo := value.(*modelServer)
+	value, ok = s.modelServer.Load(types.NamespacedName{Namespace: second.Namespace, Name: second.Name})
+	require.True(t, ok)
+	secondInfo := value.(*modelServer)
+
+	// Both ModelServers match this Pod. Hold a reader lock on the second one so
+	// AddOrUpdatePod pauses after updating the first index, before updating PodInfo.
+	secondInfo.mutex.RLock()
+	release := sync.OnceFunc(secondInfo.mutex.RUnlock)
+	done := make(chan error, 1)
+	defer func() {
+		release()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			t.Error("Pod update did not complete after releasing the second ModelServer")
+		}
+	}()
+	updated := pod.DeepCopy()
+	updated.Labels["pd-group"] = "group-b"
+	go func() { done <- s.AddOrUpdatePod(updated, servers) }()
+	require.Eventually(t, func() bool {
+		msInfo.mutex.RLock()
+		defer msInfo.mutex.RUnlock()
+		return len(msInfo.pdGroups["group-b"].GetDecodePods()) == 1
+	}, time.Second, time.Millisecond)
+
+	decode, err := s.GetDecodePods(msName)
+	require.NoError(t, err)
+	require.NotEmpty(t, decode)
+	require.Equal(t, "group-a", decode[0].GetPodLabels()["pd-group"], "PodInfo update is still blocked")
+
+	// The index already places decode in B; looking up its peer must use that
+	// same classification, even though its PodInfo still has the old A label.
+	prefill, err := s.GetPrefillPodsForDecodeGroup(msName, podName)
+	require.NoError(t, err)
+	require.Len(t, prefill, 1)
+	assert.Equal(t, "prefill-group-b", prefill[0].GetPodNamespacedName().Name)
 }
 
 // A status-only update must not hide a healthy Pod from concurrent PD scheduling.

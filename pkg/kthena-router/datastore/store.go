@@ -913,9 +913,10 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 			modelServerObj.pods = pods
 		}
 		if selectorChanged {
-			// Publish the new configuration and both PD indexes together.
+			// Publish the new configuration and classification indexes together.
 			clear(modelServerObj.pdGroups)
 			clear(modelServerObj.decodePodGroups)
+			clear(modelServerObj.prefillPodGroups)
 			for podName := range modelServerObj.pods {
 				if value, ok := s.pods.Load(podName); ok {
 					modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
@@ -1102,11 +1103,7 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 			ms.addPod(podName)
 			// Categorize the pod for PDGroup scheduling
 			klog.V(4).Infof("Categorizing pod %s for PDGroup scheduling, model server %s", podName, modelServerName)
-			if oldPod, exists := s.pods.Load(podName); exists {
-				ms.updatePodPDGroup(podName, oldPod.(*PodInfo).GetPodLabels(), pod.Labels)
-			} else {
-				ms.categorizePodForPDGroup(podName, pod.Labels)
-			}
+			ms.categorizePodForPDGroup(podName, pod.Labels)
 		}
 	}
 
@@ -1115,13 +1112,12 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		oldPodInfo := value.(*PodInfo)
 		oldModelServers := oldPodInfo.GetModelServers()
 		// Handle the case where the pod no longer belongs to some model servers
-		oldPodLabels := oldPodInfo.GetPodLabels()
 		for msName := range oldModelServers.Difference(newModelServers) {
 			if value, ok := s.modelServer.Load(msName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, oldPodLabels)
+				ms.removePodFromPDGroups(podName)
 			}
 		}
 
@@ -1184,13 +1180,12 @@ func (s *store) DeletePod(podName types.NamespacedName) error {
 	if value, ok := s.pods.Load(podName); ok {
 		pod := value.(*PodInfo)
 		modelServers := pod.GetModelServers()
-		podLabels := pod.GetPodLabels()
 		for modelServerName := range modelServers {
 			if value, ok := s.modelServer.Load(modelServerName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, podLabels)
+				ms.removePodFromPDGroups(podName)
 			} else {
 				klog.V(4).Infof("model server %s not found for pod %s, maybe already deleted", modelServerName, podName)
 			}

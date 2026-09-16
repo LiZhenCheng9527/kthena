@@ -34,16 +34,18 @@ type modelServer struct {
 	// Key: PD group value (the actual value of the group key label)
 	// Value: PDGroupPods containing categorized decode/prefill pods
 	pdGroups map[string]*PDGroupPods
-	// Reverse index updated with pdGroups under mutex, independent of PodInfo labels.
-	decodePodGroups map[types.NamespacedName]string
+	// Reverse indexes updated with pdGroups under mutex, independent of PodInfo labels.
+	decodePodGroups  map[types.NamespacedName]string
+	prefillPodGroups map[types.NamespacedName]string
 }
 
 func newModelServer(ms *aiv1alpha1.ModelServer) *modelServer {
 	return &modelServer{
-		modelServer:     ms,
-		pods:            sets.New[types.NamespacedName](),
-		pdGroups:        make(map[string]*PDGroupPods),
-		decodePodGroups: make(map[types.NamespacedName]string),
+		modelServer:      ms,
+		pods:             sets.New[types.NamespacedName](),
+		pdGroups:         make(map[string]*PDGroupPods),
+		decodePodGroups:  make(map[types.NamespacedName]string),
+		prefillPodGroups: make(map[types.NamespacedName]string),
 	}
 }
 
@@ -76,17 +78,12 @@ func (m *modelServer) deletePod(podName types.NamespacedName) {
 	m.pods.Delete(podName)
 }
 
-// categorizePodForPDGroup categorizes a pod based on PDGroup labels and adds it to appropriate categories
+// categorizePodForPDGroup replaces classification without exposing an intermediate absence to readers.
 func (m *modelServer) categorizePodForPDGroup(podName types.NamespacedName, podLabels map[string]string) {
-	m.updatePodPDGroup(podName, nil, podLabels)
-}
-
-// updatePodPDGroup replaces the classification without exposing an intermediate absence to readers.
-func (m *modelServer) updatePodPDGroup(podName types.NamespacedName, oldLabels, podLabels map[string]string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.removePodFromPDGroupsLocked(podName, oldLabels)
+	m.removePodFromPDGroupsLocked(podName)
 	m.categorizePodForPDGroupLocked(podName, podLabels)
 }
 
@@ -96,25 +93,25 @@ func (m *modelServer) categorizePodForPDGroupLocked(podName types.NamespacedName
 	if pdGroupValue == "" {
 		return
 	}
+	pdGroup := m.modelServer.Spec.WorkloadSelector.PDGroup
+	isDecodePod := matchesLabels(podLabels, pdGroup.DecodeLabels)
+	if !isDecodePod && !matchesLabels(podLabels, pdGroup.PrefillLabels) {
+		return
+	}
 	// Get or create PDGroupPods for this group value
 	if _, exists := m.pdGroups[pdGroupValue]; !exists {
 		m.pdGroups[pdGroupValue] = NewPDGroupPods()
 	}
 	pdGroupPods := m.pdGroups[pdGroupValue]
-	pdGroup := m.modelServer.Spec.WorkloadSelector.PDGroup
 	// Check if pod matches decode labels
-	isDecodePod := matchesLabels(podLabels, pdGroup.DecodeLabels)
 	if isDecodePod {
 		pdGroupPods.AddDecodePod(podName)
 		m.decodePodGroups[podName] = pdGroupValue
 		return
 	}
 
-	// Check if pod matches prefill labels
-	isPrefillPod := matchesLabels(podLabels, pdGroup.PrefillLabels)
-	if isPrefillPod {
-		pdGroupPods.AddPrefillPod(podName)
-	}
+	pdGroupPods.AddPrefillPod(podName)
+	m.prefillPodGroups[podName] = pdGroupValue
 }
 
 // getPDGroupName returns the PD group name for a given pod
@@ -128,21 +125,24 @@ func (m *modelServer) getPDGroupName(podLabels map[string]string) string {
 }
 
 // removePodFromPDGroups removes a pod from all PDGroup categorizations
-func (m *modelServer) removePodFromPDGroups(podName types.NamespacedName, labels map[string]string) {
+func (m *modelServer) removePodFromPDGroups(podName types.NamespacedName) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.removePodFromPDGroupsLocked(podName, labels)
+	m.removePodFromPDGroupsLocked(podName)
 }
 
 // removePodFromPDGroupsLocked requires m.mutex to be held for writing.
-func (m *modelServer) removePodFromPDGroupsLocked(podName types.NamespacedName, labels map[string]string) {
-	delete(m.decodePodGroups, podName)
-	pdGroupName := m.getPDGroupName(labels)
-	if pdGroupName == "" {
+func (m *modelServer) removePodFromPDGroupsLocked(podName types.NamespacedName) {
+	pdGroupName, ok := m.decodePodGroups[podName]
+	if !ok {
+		pdGroupName, ok = m.prefillPodGroups[podName]
+	}
+	if !ok {
 		return
 	}
-
+	delete(m.decodePodGroups, podName)
+	delete(m.prefillPodGroups, podName)
 	if pdGroup, ok := m.pdGroups[pdGroupName]; ok {
 		pdGroup.RemovePod(podName)
 		// Clean up empty PDGroupPods

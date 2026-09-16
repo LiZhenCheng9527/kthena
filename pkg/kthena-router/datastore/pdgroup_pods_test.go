@@ -310,6 +310,7 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 		{"decode to prefill", "decode", "group-a", "prefill", 0, 1},
 		{"remove group", "decode", "", "decode", 0, 0},
 		{"remove role", "prefill", "group-a", "", 0, 0},
+		{"change group and remove role", "decode", "group-b", "", 0, 0},
 		{"unchanged labels", "decode", "group-a", "decode", 1, 0},
 	}
 	for _, tt := range tests {
@@ -330,7 +331,7 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 			require.NoError(t, s.AddOrUpdatePod(peer, []*aiv1alpha1.ModelServer{ms}))
 			oldInfo := s.GetPodInfo(podName)
 
-			// Update a copy so the datastore can use the stored labels to remove the old classification.
+			// Update a copy so PodInfo keeps its previous labels until the store handles the event.
 			updated := pod.DeepCopy()
 			updated.Labels["pd-group"] = tt.group
 			updated.Labels["role"] = tt.role
@@ -361,8 +362,7 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 			msInfo := value.(*modelServer)
 			assert.Len(t, msInfo.getPods(), 2, "the ModelServer selector still matches both pods")
 
-			// Deletion uses the latest labels, so leftover membership in a previous group
-			// would survive cleanup and keep the group map nonempty.
+			// Removing both Pods must also clean up every group they occupied.
 			require.NoError(t, s.DeletePod(podName))
 			require.NoError(t, s.DeletePod(types.NamespacedName{Namespace: peer.Namespace, Name: peer.Name}))
 			assert.Empty(t, msInfo.pdGroups, "deleting the pods must leave no stale group")
@@ -432,6 +432,50 @@ func TestPDGroupLookupDuringPodLabelUpdate(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, prefill, 1)
 	assert.Equal(t, "prefill-group-b", prefill[0].GetPodNamespacedName().Name)
+}
+
+func TestPDGroupAppendThenLabelUpdateCleansAllGroups(t *testing.T) {
+	for _, role := range []string{"decode", "prefill"} {
+		t.Run(role, func(t *testing.T) {
+			s := New().(*store)
+			ms := newTestModelServerWithPDGroup("test-model", "default")
+			second := ms.DeepCopy()
+			second.Name = "second-model"
+			servers := []*aiv1alpha1.ModelServer{ms, second}
+			msName := types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}
+			secondName := types.NamespacedName{Namespace: second.Namespace, Name: second.Name}
+			for _, server := range servers {
+				require.NoError(t, s.AddOrUpdateModelServer(server, nil))
+			}
+			pod := newTestPod("moving", "default", map[string]string{
+				"app": ms.Name, "role": role, "pd-group": "group-a",
+			})
+			podName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+			require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+			latest := pod.DeepCopy()
+			latest.Labels["pd-group"] = "group-b"
+			// Append classifies the new binding using B without replacing PodInfo's A labels.
+			require.NoError(t, s.AppendModelServerToPod(latest, []*aiv1alpha1.ModelServer{second}))
+			require.Equal(t, "group-a", s.GetPodInfo(podName).GetPodLabels()["pd-group"])
+			updated := latest.DeepCopy()
+			updated.Labels["pd-group"] = "group-c"
+			require.NoError(t, s.AddOrUpdatePod(updated, servers))
+			for _, name := range []types.NamespacedName{msName, secondName} {
+				value, ok := s.modelServer.Load(name)
+				require.True(t, ok)
+				msInfo := value.(*modelServer)
+				assert.Len(t, msInfo.pdGroups, 1, "only the current group may retain the Pod")
+				assert.Contains(t, msInfo.pdGroups, "group-c")
+			}
+			require.NoError(t, s.DeletePod(podName))
+			for _, name := range []types.NamespacedName{msName, secondName} {
+				value, ok := s.modelServer.Load(name)
+				require.True(t, ok)
+				assert.Empty(t, value.(*modelServer).pdGroups)
+				assert.Empty(t, value.(*modelServer).decodePodGroups)
+			}
+		})
+	}
 }
 
 // A status-only update must not hide a healthy Pod from concurrent PD scheduling.

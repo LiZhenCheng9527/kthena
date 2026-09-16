@@ -290,7 +290,11 @@ func TestPDGroupPodRemoval(t *testing.T) {
 	}
 }
 
+// Label updates must replace a Pod's PD classification while it still matches the ModelServer.
 func TestPDGroupPodLabelUpdate(t *testing.T) {
+	// The changing Pod starts in group-a with oldRole; group and role are its new labels.
+	// Empty values remove the corresponding label. decode and prefill count only the
+	// changing Pod, excluding the unchanged prefill peer added in every case.
 	tests := []struct {
 		name    string
 		oldRole string
@@ -317,12 +321,15 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 				"app": ms.Name, "pd-group": "group-a", "role": tt.oldRole,
 			})
 			podName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+			// Keep a peer in the original group to check that reclassification preserves other Pods.
 			peer := newTestPod("peer", "default", map[string]string{
 				"app": ms.Name, "pd-group": "group-a", "role": "prefill",
 			})
 			require.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
 			require.NoError(t, s.AddOrUpdatePod(peer, []*aiv1alpha1.ModelServer{ms}))
 			oldInfo := s.GetPodInfo(podName)
+
+			// Update a copy so the datastore can use the stored labels to remove the old classification.
 			updated := pod.DeepCopy()
 			updated.Labels["pd-group"] = tt.group
 			updated.Labels["role"] = tt.role
@@ -344,6 +351,9 @@ func TestPDGroupPodLabelUpdate(t *testing.T) {
 			require.True(t, ok)
 			msInfo := value.(*modelServer)
 			assert.Len(t, msInfo.getPods(), 2, "the ModelServer selector still matches both pods")
+
+			// Deletion uses the latest labels, so leftover membership in a previous group
+			// would survive cleanup and keep the group map nonempty.
 			require.NoError(t, s.DeletePod(podName))
 			require.NoError(t, s.DeletePod(types.NamespacedName{Namespace: peer.Namespace, Name: peer.Name}))
 			assert.Empty(t, msInfo.pdGroups, "deleting the pods must leave no stale group")

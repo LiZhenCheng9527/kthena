@@ -32,6 +32,7 @@ import (
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/debug"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/router"
@@ -43,11 +44,11 @@ const (
 	DefaultRouterConfigFile = "/etc/config/routerConfiguration.yaml"
 )
 
-func NewRouter(store datastore.Store, configFile string) *router.Router {
+func NewRouter(store datastore.Store, configFile string, transportRegistry *common.TransportRegistry) *router.Router {
 	if configFile == "" {
 		configFile = DefaultRouterConfigFile
 	}
-	return router.NewRouter(store, configFile)
+	return router.NewRouter(store, configFile, transportRegistry)
 }
 
 // Starts router

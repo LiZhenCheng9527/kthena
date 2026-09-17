@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/filesource"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
@@ -118,13 +119,17 @@ func (s *Server) Run(ctx context.Context) {
 	store := datastore.New(storeOpts...)
 	s.store = store
 
+	// Per-ModelServer upstream transport registry, shared between the router
+	// (hot-path lookups) and the ModelServer controller (lifecycle writes).
+	transportRegistry := common.NewTransportRegistry()
+
 	// must be run before the controller, because it will register callbacks
-	r := NewRouter(store, s.RouterConfigFile)
+	r := NewRouter(store, s.RouterConfigFile, transportRegistry)
 	// start the configured resource source
 	if s.ConfigSource == ConfigSourceFile {
 		s.controllers = s.startFileSource(store, ctx.Done())
 	} else {
-		s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst)
+		s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst, transportRegistry)
 	}
 
 	// Start store's periodic update loop after controllers have synced

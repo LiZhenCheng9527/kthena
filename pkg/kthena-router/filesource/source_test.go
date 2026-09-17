@@ -72,7 +72,7 @@ spec:
 func newTestSource(t *testing.T, dir string) (*Source, datastore.Store) {
 	t.Helper()
 	store := datastore.New(datastore.WithPodRuntimeInspector(fakePodRuntimeInspector{}))
-	source, err := New(dir, time.Second, store)
+	source, err := NewSource(dir, time.Second, store, nil)
 	require.NoError(t, err)
 	return source, store
 }
@@ -236,7 +236,7 @@ stringData:
 
 func TestNewRejectsMissingDirectory(t *testing.T) {
 	store := datastore.New()
-	_, err := New(filepath.Join(t.TempDir(), "missing"), time.Second, store)
+	_, err := NewSource(filepath.Join(t.TempDir(), "missing"), time.Second, store, nil)
 	assert.Error(t, err)
 }
 

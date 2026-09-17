@@ -192,6 +192,14 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 		return err
 	}
 
+	// Refresh the per-ModelServer upstream transport to match the current
+	// connectionPool config. Update is a no-op when the config is unchanged.
+	var cp *aiv1alpha1.ConnectionPool
+	if ms.Spec.TrafficPolicy != nil {
+		cp = ms.Spec.TrafficPolicy.ConnectionPool
+	}
+	c.transportRegistry.Update(utils.GetNamespaceName(ms), cp)
+
 	if len(ms.Spec.Endpoints) > 0 {
 		return SyncStaticEndpoints(c.store, ms)
 	}
@@ -219,14 +227,6 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 	}
 
 	_ = c.store.AddOrUpdateModelServer(ms, pods)
-
-	// Refresh the per-ModelServer upstream transport to match the current
-	// connectionPool config. Update is a no-op when the config is unchanged.
-	var cp *aiv1alpha1.ConnectionPool
-	if ms.Spec.TrafficPolicy != nil {
-		cp = ms.Spec.TrafficPolicy.ConnectionPool
-	}
-	c.transportRegistry.Update(utils.GetNamespaceName(ms), cp)
 
 	// Bind every ready pod selected by this ModelServer. Pods that already have
 	// an entry in the store get the binding appended so their runtime metrics and

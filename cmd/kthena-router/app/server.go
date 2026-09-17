@@ -127,7 +127,7 @@ func (s *Server) Run(ctx context.Context) {
 	r := NewRouter(store, s.RouterConfigFile, transportRegistry)
 	// start the configured resource source
 	if s.ConfigSource == ConfigSourceFile {
-		s.controllers = s.startFileSource(store, ctx.Done())
+		s.controllers = s.startFileSource(store, transportRegistry, ctx.Done())
 	} else {
 		s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst, transportRegistry)
 	}
@@ -153,8 +153,8 @@ func (s *Server) HasSynced() bool {
 
 // startFileSource loads resources from ConfigDir and keeps the store in sync
 // with it, replacing the API server backed controllers.
-func (s *Server) startFileSource(store datastore.Store, stop <-chan struct{}) Controller {
-	source, err := filesource.New(s.ConfigDir, s.ConfigSyncPeriod, store)
+func (s *Server) startFileSource(store datastore.Store, transportRegistry *common.TransportRegistry, stop <-chan struct{}) Controller {
+	source, err := filesource.NewSource(s.ConfigDir, s.ConfigSyncPeriod, store, transportRegistry)
 	if err != nil {
 		klog.Fatalf("Failed to create file resource source: %v", err)
 	}

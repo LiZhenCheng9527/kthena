@@ -44,6 +44,7 @@ import (
 	"k8s.io/klog/v2"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/controller"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
@@ -59,7 +60,11 @@ const defaultSyncPeriod = 10 * time.Second
 
 // resources holds one parsed snapshot of the resource directory.
 type resources struct {
-	modelRoutes  map[string]*aiv1alpha1.ModelRoute
+	// modelRoutes is keyed by "namespace/name" of the ModelRoute, matching the
+	// key format of the datastore ModelRoute APIs.
+	modelRoutes map[string]*aiv1alpha1.ModelRoute
+	// modelServers, providers and secrets are keyed by the namespaced name of
+	// the resource; the value is the parsed and validated manifest.
 	modelServers map[types.NamespacedName]*aiv1alpha1.ModelServer
 	providers    map[types.NamespacedName]*aiv1alpha1.ExternalModelProvider
 	secrets      map[types.NamespacedName]*corev1.Secret
@@ -80,6 +85,9 @@ type Source struct {
 	dir    string
 	period time.Duration
 	store  datastore.Store
+	// transports holds the per-ModelServer upstream transports, kept in sync
+	// with the trafficPolicy.connectionPool of the loaded ModelServers.
+	transports *common.TransportRegistry
 
 	synced atomic.Bool
 	// digest of the last successfully applied snapshot, used to skip re-parsing
@@ -89,9 +97,9 @@ type Source struct {
 	applied *resources
 }
 
-// New creates a Source reading manifests from dir. A non-positive period falls
-// back to the default sync period.
-func New(dir string, period time.Duration, store datastore.Store) (*Source, error) {
+// NewSource creates a Source reading manifests from dir. A non-positive period
+// falls back to the default sync period.
+func NewSource(dir string, period time.Duration, store datastore.Store, transports *common.TransportRegistry) (*Source, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read resource directory %s: %w", dir, err)
@@ -103,10 +111,11 @@ func New(dir string, period time.Duration, store datastore.Store) (*Source, erro
 		period = defaultSyncPeriod
 	}
 	return &Source{
-		dir:     dir,
-		period:  period,
-		store:   store,
-		applied: newResources(),
+		dir:        dir,
+		period:     period,
+		store:      store,
+		transports: transports,
+		applied:    newResources(),
 	}, nil
 }
 
@@ -369,6 +378,15 @@ func (s *Source) apply(next *resources) {
 		if err := controller.SyncStaticEndpoints(s.store, ms); err != nil {
 			klog.Errorf("failed to store model server %s: %v", name, err)
 		}
+		if s.transports != nil {
+			// Keep the upstream transport in sync with the connectionPool config,
+			// mirroring the API server backed ModelServer controller.
+			var cp *aiv1alpha1.ConnectionPool
+			if ms.Spec.TrafficPolicy != nil {
+				cp = ms.Spec.TrafficPolicy.ConnectionPool
+			}
+			s.transports.Update(name, cp)
+		}
 	}
 	for name := range s.applied.modelServers {
 		if _, ok := next.modelServers[name]; ok {
@@ -376,6 +394,9 @@ func (s *Source) apply(next *resources) {
 		}
 		if err := s.store.DeleteModelServer(name); err != nil {
 			klog.Errorf("failed to delete model server %s: %v", name, err)
+		}
+		if s.transports != nil {
+			s.transports.Delete(name)
 		}
 	}
 }

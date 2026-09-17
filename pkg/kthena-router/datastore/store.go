@@ -899,7 +899,7 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 	if value, ok := s.modelServer.Load(name); !ok {
 		modelServerObj = newModelServer(ms)
 		// New object — no concurrent access yet, safe to write without lock
-		if len(pods) != 0 {
+		if pods != nil {
 			modelServerObj.pods = pods
 		}
 	} else {
@@ -909,8 +909,11 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 		modelServerObj.mutex.Lock()
 		selectorChanged := !reflect.DeepEqual(modelServerObj.modelServer.Spec.WorkloadSelector, ms.Spec.WorkloadSelector)
 		modelServerObj.modelServer = ms
-		if len(pods) != 0 {
-			// do not operate s.pods here, which are done within pod handler
+		if pods != nil {
+			// A non-nil set is an explicit replacement, so an empty set clears the
+			// previous pods instead of being ignored; callers pass nil to leave the
+			// pod set untouched. Do not operate s.pods here, which are done within
+			// pod handler.
 			modelServerObj.pods = pods
 		}
 		if selectorChanged {

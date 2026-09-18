@@ -30,6 +30,10 @@ spec:
               value: {{ .port | quote }}
             - name: MAX_TOKENIZERS
               value: {{ .maxTokenizers | quote }}
+            {{- with .models }}
+            - name: MODEL_TOKENIZERS
+              value: {{ toJson . | quote }}
+            {{- end }}
             {{- with .extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

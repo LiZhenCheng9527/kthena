@@ -184,7 +184,7 @@ docker-build-runtime: generate
 
 .PHONY: docker-build-tokenizer
 docker-build-tokenizer:
-	$(CONTAINER_TOOL) build -t ${IMG_TOKENIZER} --target tokenizer -f python/Dockerfile.tokenizer python
+	$(CONTAINER_TOOL) build -t ${IMG_TOKENIZER} -f docker/Dockerfile.kthena-tokenizer .
 
 .PHONY: docker-build-e2e-external-provider-mock
 docker-build-e2e-external-provider-mock:

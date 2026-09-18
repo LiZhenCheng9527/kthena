@@ -102,7 +102,9 @@ kthenaRouter:
     inferenceExtension: false
   # tokenizerService deploys the dedicated tokenizer service used by the
   # kvcache-aware plugin to tokenize prompts without loading the inference engines.
-  # It wraps `vllm render` and dynamically loads a tokenizer per ModelServer model.
+  # A Go control plane watches ModelServers and supervises one `vllm launch render`
+  # subprocess per served model with a configured tokenizer source, so
+  # tokenization and chat-template rendering match the inference engine.
   tokenizerService:
     # enabled controls whether the tokenizer service is deployed (default: false)
     enabled: false
@@ -118,6 +120,11 @@ kthenaRouter:
       tag: latest
       # pullPolicy is the image pull policy for the tokenizer service.
       pullPolicy: IfNotPresent
+    # models maps a served model name (ModelServer.spec.model) to its tokenizer
+    # source: a Hugging Face repository id or a mounted local path. Served names
+    # are engine-side aliases, so the source must be configured explicitly;
+    # unmapped models fall back to engine-side tokenization.
+    models: {}
     # maxTokenizers limits the number of concurrently loaded model tokenizers
     maxTokenizers: 8
     # extraEnv is appended to the tokenizer container, e.g. HF_TOKEN or HF_ENDPOINT

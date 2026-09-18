@@ -24,6 +24,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -50,7 +51,9 @@ type TokenizerServiceConfig struct {
 	FallbackToEngine bool
 }
 
-// Remote tokenization is always attempted when an engine port exists.
+// TokenizerManagerConfig configures how prompts are tokenized: via the
+// backend engines' /tokenize endpoints and, optionally, via the dedicated
+// tokenizer service.
 type TokenizerManagerConfig struct {
 	EndpointPorts map[string]int
 	// Service optionally routes tokenization to a dedicated tokenizer service.
@@ -62,23 +65,31 @@ type TokenizerManager struct {
 	// client owns the connection pool shared by the short-lived tokenizer
 	// wrappers created for individual scheduling requests.
 	client *retryablehttp.Client
+
+	// mu guards serviceTokenizers. Service-backed tokenizers are created once
+	// per model and then reused for every prompt.
+	mu                sync.Mutex
+	serviceTokenizers map[string]Tokenizer
 }
 
 func NewTokenizerManager(config TokenizerManagerConfig) *TokenizerManager {
 	return &TokenizerManager{
-		config: config,
-		client: newRetryableHTTPClient(),
+		config:            config,
+		client:            newRetryableHTTPClient(),
+		serviceTokenizers: make(map[string]Tokenizer),
 	}
 }
 
-// GetTokenizer creates a tokenizer by randomly selecting from the provided pods
-func (m *TokenizerManager) GetTokenizer(model string, pods []*datastore.PodInfo) Tokenizer {
-	return m.createTokenizerFromPods(model, pods)
-}
+// serviceTokenizerFor returns the cached tokenizer backed by the dedicated
+// tokenizer service for the model, creating it on first use. The service
+// exposes the vLLM-compatible /tokenize API.
+func (m *TokenizerManager) serviceTokenizerFor(model string) Tokenizer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if tok, ok := m.serviceTokenizers[model]; ok {
+		return tok
+	}
 
-// createServiceTokenizer creates a tokenizer backed by the dedicated tokenizer
-// service. The service exposes the vLLM-compatible /tokenize API.
-func (m *TokenizerManager) createServiceTokenizer(model string) Tokenizer {
 	config := RemoteTokenizerConfig{
 		Engine:             EngineVLLM,
 		Endpoint:           m.config.Service.Endpoint,
@@ -87,6 +98,8 @@ func (m *TokenizerManager) createServiceTokenizer(model string) Tokenizer {
 		ReturnTokenStrings: false,
 	}
 
+	// newHTTPClient (remote_client.go) wraps the shared retryable client with
+	// the per-endpoint base URL.
 	client := newHTTPClient(m.config.Service.Endpoint, m.client)
 	tok, err := newRemoteTokenizer(config, client, false)
 	if err != nil {
@@ -94,10 +107,14 @@ func (m *TokenizerManager) createServiceTokenizer(model string) Tokenizer {
 			model, m.config.Service.Endpoint, err)
 		return nil
 	}
+	m.serviceTokenizers[model] = tok
 	return tok
 }
 
-func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datastore.PodInfo) Tokenizer {
+// newEngineTokenizer creates a tokenizer backed by the /tokenize endpoint of a
+// randomly selected backend inference engine pod, as opposed to the dedicated
+// tokenizer service.
+func (m *TokenizerManager) newEngineTokenizer(model string, pods []*datastore.PodInfo) Tokenizer {
 	if len(pods) == 0 {
 		klog.Warningf("No pods provided for model %s", model)
 		return nil
@@ -186,7 +203,7 @@ func (m *TokenizerManager) TokenizePrompt(
 	pods []*datastore.PodInfo,
 ) ([]uint32, error) {
 	if m.config.Service.Enabled {
-		if tokenizer := m.createServiceTokenizer(model); tokenizer != nil {
+		if tokenizer := m.serviceTokenizerFor(model); tokenizer != nil {
 			tokens, err := m.tokenizeWith(tokenizer, prompt)
 			if err == nil {
 				return tokens, nil
@@ -200,7 +217,7 @@ func (m *TokenizerManager) TokenizePrompt(
 		}
 	}
 
-	tokenizer := m.GetTokenizer(model, pods)
+	tokenizer := m.newEngineTokenizer(model, pods)
 	if tokenizer == nil {
 		return nil, fmt.Errorf("no tokenizer available for model %s", model)
 	}

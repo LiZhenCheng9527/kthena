@@ -17,6 +17,8 @@ limitations under the License.
 package webhook
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,9 +28,31 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/convert"
 )
+
+func TestModelBoosterGeneratedPodTemplates(t *testing.T) {
+	for _, fixture := range []string{"ModelBooster-vllm.yaml", "ModelBooster-vllm-disaggregated.yaml"} {
+		t.Run(fixture, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "e2e", "controller-manager", "testdata", fixture))
+			require.NoError(t, err)
+			var model workloadv1alpha1.ModelBooster
+			require.NoError(t, yaml.Unmarshal(data, &model))
+			ms, err := convert.BuildModelServing(&model)
+			require.NoError(t, err)
+			for _, role := range ms.Spec.Template.Roles {
+				if role.WorkerReplicas == 0 {
+					assert.Nil(t, role.WorkerTemplate, "role %s must omit its unused worker template", role.Name)
+				}
+			}
+			allowed, reason := NewModelServingValidator().validateModelServing(ms)
+			assert.True(t, allowed, reason)
+		})
+	}
+}
 
 func TestValidatePodTemplates(t *testing.T) {
 	tests := []struct {

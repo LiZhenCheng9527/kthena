@@ -670,7 +670,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		return fmt.Errorf("can't schedule to target pod: %v", err)
 	}
 
-	r.finalizeSessionSticky(c, ctx, pods, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK, modelServerName.Name)
+	r.finalizeSessionSticky(c, ctx, stickySpec, sessionKey, stickyStoreKey, stickyBinding, stickyBindingOK, modelServerName.Name)
 
 	// Set complete request routing information in access log
 	modelServerFullName := ""
@@ -768,7 +768,6 @@ func (r *Router) lookupSessionStickyBinding(c *gin.Context, modelServer *v1alpha
 func (r *Router) finalizeSessionSticky(
 	c *gin.Context,
 	ctx *framework.Context,
-	pods []*datastore.PodInfo,
 	stickySpec *v1alpha1.SessionSticky,
 	sessionKey, stickyStoreKey string,
 	prev sessionsticky.Binding,
@@ -797,20 +796,8 @@ func (r *Router) finalizeSessionSticky(
 	}
 
 	ttl := sessionsticky.TTL(stickySpec)
-	out, err := r.sessionStickyStore.Commit(reqCtx, stickyStoreKey, selected, ttl)
-	if err != nil {
+	if _, err := r.sessionStickyStore.Commit(reqCtx, stickyStoreKey, selected, ttl); err != nil {
 		klog.Errorf("session sticky commit: %v", err)
-		return
-	}
-	if !out.Valid() || out.Equal(selected) {
-		return
-	}
-	// Another replica won the binding; honor its pod if still in the candidate list.
-	for _, p := range pods {
-		if p.Pod != nil && p.Pod.Name == out.Pod {
-			ctx.BestPods = []*datastore.PodInfo{p}
-			return
-		}
 	}
 }
 

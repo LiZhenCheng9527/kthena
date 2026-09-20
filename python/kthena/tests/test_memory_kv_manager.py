@@ -14,6 +14,8 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
+
 import pytest
 
 from kthena.runtime.kv_cache_manager import compute_standardized_hash
@@ -37,6 +39,7 @@ def _make_manager(endpoints):
     response = MagicMock()
     response.raise_for_status = MagicMock()
     client.post = AsyncMock(return_value=response)
+    client.aclose = AsyncMock()
     return MemoryKVCacheManager(registry=registry, client=client), client
 
 
@@ -58,6 +61,7 @@ async def test_add_blocks_pushes_standardized_hashes_to_all_routers():
 
     ok = await manager.add_blocks("qwen", engine_hashes, "pod-1.default", token_ids)
     assert ok
+    await manager.flush()
 
     payloads = _pushed_payloads(client)
     assert len(payloads) == 2
@@ -77,6 +81,7 @@ async def test_add_blocks_pushes_standardized_hashes_to_all_routers():
 
     # engine -> std mapping is retained for later removals
     assert manager.hash_mapping == {111: expected_std[0], 222: expected_std[1]}
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -84,10 +89,12 @@ async def test_remove_blocks_uses_engine_hash_mapping():
     manager, client = _make_manager(["http://router-a:9080"])
     token_ids = list(range(16))
     await manager.add_blocks("qwen", [111], "pod-1.default", token_ids)
+    await manager.flush()
     client.post.reset_mock()
 
     removed = await manager.remove_blocks("qwen", [111, 999], "pod-1.default")
     assert removed == 1
+    await manager.flush()
 
     payloads = _pushed_payloads(client)
     assert len(payloads) == 1
@@ -95,6 +102,41 @@ async def test_remove_blocks_uses_engine_hash_mapping():
     assert event["type"] == KV_EVENT_REMOVED
     assert event["block_hashes"] == [compute_standardized_hash(token_ids)]
     assert 111 not in manager.hash_mapping
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_std_hash_survives_until_last_engine_hash_removed():
+    """Blocks with identical token content but different prefixes have
+    distinct engine hashes mapping to one standardized hash; the standardized
+    hash must only be removed with its last engine-hash reference."""
+    manager, client = _make_manager(["http://router-a:9080"])
+    token_ids = list(range(16)) * 2  # both blocks share the same content
+    std_hash = compute_standardized_hash(list(range(16)))
+
+    await manager.add_blocks("qwen", [111, 222], "pod-1.default", token_ids)
+    await manager.flush()
+    client.post.reset_mock()
+
+    # Removing one reference keeps the block indexed and pushes nothing.
+    removed = await manager.remove_blocks("qwen", [111], "pod-1.default")
+    assert removed == 1
+    await manager.flush()
+    client.post.assert_not_awaited()
+    assert std_hash in manager._blocks["qwen"]
+
+    # Removing the last reference drops the block and announces it.
+    removed = await manager.remove_blocks("qwen", [222], "pod-1.default")
+    assert removed == 1
+    await manager.flush()
+
+    payloads = _pushed_payloads(client)
+    assert len(payloads) == 1
+    event = payloads[0][1]["events"][0]
+    assert event["type"] == KV_EVENT_REMOVED
+    assert event["block_hashes"] == [std_hash]
+    assert std_hash not in manager._blocks["qwen"]
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -102,21 +144,26 @@ async def test_remove_blocks_without_mapping_pushes_nothing():
     manager, client = _make_manager(["http://router-a:9080"])
     removed = await manager.remove_blocks("qwen", [12345], "pod-1.default")
     assert removed == 0
+    await manager.flush()
     client.post.assert_not_awaited()
+    await manager.close()
 
 
 @pytest.mark.asyncio
 async def test_clear_all_blocks_pushes_cleared_event():
     manager, client = _make_manager(["http://router-a:9080"])
     await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
+    await manager.flush()
     client.post.reset_mock()
 
     cleared = await manager.clear_all_blocks("qwen", "pod-1.default")
     assert cleared == 1
+    await manager.flush()
 
     payloads = _pushed_payloads(client)
     assert payloads[0][1]["events"][0]["type"] == KV_EVENT_CLEARED
     assert manager.hash_mapping == {}
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -124,6 +171,7 @@ async def test_push_snapshot_sends_full_index_to_single_router():
     manager, client = _make_manager(["http://router-a:9080"])
     token_ids = list(range(32))
     await manager.add_blocks("qwen", [111, 222], "pod-1.default", token_ids)
+    await manager.flush()
     client.post.reset_mock()
 
     await manager.push_snapshot("http://router-new:9080", "pod-1.default")
@@ -142,6 +190,7 @@ async def test_push_snapshot_sends_full_index_to_single_router():
     # router's engine-restart freshness filter keeps working.
     stored = manager._blocks["qwen"]
     assert event["timestamps"] == [stored[h] for h in event["block_hashes"]]
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -149,6 +198,7 @@ async def test_push_snapshot_represents_cleared_model_as_empty():
     manager, client = _make_manager(["http://router-a:9080"])
     await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
     await manager.clear_all_blocks("qwen", "pod-1.default")
+    await manager.flush()
     client.post.reset_mock()
 
     await manager.push_snapshot("http://router-new:9080", "pod-1.default")
@@ -158,6 +208,7 @@ async def test_push_snapshot_represents_cleared_model_as_empty():
     event = payloads[0][1]["events"][0]
     assert event["type"] == KV_EVENT_SNAPSHOT
     assert event["block_hashes"] == []
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -166,22 +217,53 @@ async def test_failed_push_marks_endpoint_dirty_until_snapshot_succeeds():
     client.post.side_effect = RuntimeError("connection refused")
 
     await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
+    await manager.flush()
     assert manager.is_dirty("http://router-a:9080")
 
     # A successful snapshot reconciles the endpoint and clears dirty state.
     client.post.side_effect = None
     await manager.push_snapshot("http://router-a:9080", "pod-1.default")
     assert not manager.is_dirty("http://router-a:9080")
+    await manager.close()
 
 
 @pytest.mark.asyncio
 async def test_failed_snapshot_keeps_endpoint_dirty():
     manager, client = _make_manager(["http://router-a:9080"])
     await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
+    await manager.flush()
     client.post.side_effect = RuntimeError("connection refused")
 
     await manager.push_snapshot("http://router-a:9080", "pod-1.default")
     assert manager.is_dirty("http://router-a:9080")
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_overflow_marks_endpoint_dirty_and_drops_deltas(monkeypatch):
+    """A router that cannot keep up must not stall event processing or grow
+    memory without bound: its queue is bounded, overflowing deltas are dropped,
+    and the endpoint is marked dirty for snapshot recovery."""
+    monkeypatch.setattr(
+        "kthena.runtime.memory_kv_manager.ENDPOINT_QUEUE_MAXSIZE", 1)
+    manager, client = _make_manager(["http://router-a:9080"])
+
+    # The router hangs on every push, so queued deltas are never drained.
+    stall = asyncio.Event()
+
+    async def hanging_post(*args, **kwargs):
+        await stall.wait()
+
+    client.post = hanging_post
+
+    for i in range(3):
+        ok = await manager.add_blocks(
+            "qwen", [100 + i], "pod-1.default", list(range(16)))
+        assert ok  # event processing itself is never blocked
+
+    assert manager.is_dirty("http://router-a:9080")
+    stall.set()
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -189,7 +271,9 @@ async def test_no_registered_routers_skips_push():
     manager, client = _make_manager([])
     ok = await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
     assert ok
+    await manager.flush()
     client.post.assert_not_awaited()
+    await manager.close()
 
 
 @pytest.mark.asyncio

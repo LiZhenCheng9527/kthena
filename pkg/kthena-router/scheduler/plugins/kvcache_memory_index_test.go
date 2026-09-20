@@ -327,6 +327,48 @@ func TestKVBlockMemoryIndex_GCStaleEntries(t *testing.T) {
 	}
 }
 
+// TestKVBlockMemoryIndex_GCRemovesEmptyParentEntries guards against leaked
+// empty owner/model maps: with repeated pod replacement every historical pod
+// would otherwise leave an empty reverse-index entry behind forever.
+func TestKVBlockMemoryIndex_GCRemovesEmptyParentEntries(t *testing.T) {
+	idx := NewKVBlockMemoryIndex()
+	stale := time.Now().Add(-25 * time.Hour).Unix()
+
+	for _, payload := range []KVEventPayload{
+		{
+			PodIdentifier: "pod-1.default",
+			ModelName:     "qwen",
+			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: stale}},
+		},
+		{
+			PodIdentifier: "pod-2.default",
+			ModelName:     "qwen",
+			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{2, 3}, Timestamp: stale}},
+		},
+		{
+			PodIdentifier: "pod-3.default",
+			ModelName:     "llama",
+			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{9}, Timestamp: stale}},
+		},
+	} {
+		p := payload
+		if err := idx.Apply(&p); err != nil {
+			t.Fatalf("Apply() failed: %v", err)
+		}
+	}
+
+	idx.gcStaleEntries(kvCacheFieldFreshDuration)
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if len(idx.blocks) != 0 {
+		t.Errorf("expected forward index to be empty after GC expired everything, got %v", idx.blocks)
+	}
+	if len(idx.ownerBlocks) != 0 {
+		t.Errorf("expected reverse index to be empty after GC expired everything, got %v", idx.ownerBlocks)
+	}
+}
+
 func TestKVCacheAware_QueryMemoryForBlocks(t *testing.T) {
 	idx := NewKVBlockMemoryIndex()
 	now := time.Now().Unix()

@@ -19,6 +19,7 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -172,7 +173,8 @@ func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64,
 
 func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64) {
 	modelBlocks := idx.blocks[model]
-	owned := idx.ownerBlocks[ownerModelKey{owner: owner, model: model}]
+	key := ownerModelKey{owner: owner, model: model}
+	owned := idx.ownerBlocks[key]
 	for _, hash := range hashes {
 		if owners, ok := modelBlocks[hash]; ok {
 			delete(owners, owner)
@@ -181,6 +183,12 @@ func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64
 			}
 		}
 		delete(owned, hash)
+	}
+	if len(owned) == 0 {
+		delete(idx.ownerBlocks, key)
+	}
+	if len(modelBlocks) == 0 {
+		delete(idx.blocks, model)
 	}
 }
 
@@ -196,6 +204,9 @@ func (idx *KVBlockMemoryIndex) clearLocked(model, owner string) {
 		}
 	}
 	delete(idx.ownerBlocks, key)
+	if len(modelBlocks) == 0 {
+		delete(idx.blocks, model)
+	}
 }
 
 // GetBlockOwners returns, for each requested block hash that is present, the
@@ -260,12 +271,22 @@ func (idx *KVBlockMemoryIndex) gcStaleEntries(freshDuration time.Duration) {
 			for owner, ts := range owners {
 				if ts < cutoff {
 					delete(owners, owner)
-					delete(idx.ownerBlocks[ownerModelKey{owner: owner, model: model}], hash)
+					key := ownerModelKey{owner: owner, model: model}
+					owned := idx.ownerBlocks[key]
+					delete(owned, hash)
+					// Remove emptied parent entries so replaced pods do not
+					// leave empty maps behind indefinitely.
+					if len(owned) == 0 {
+						delete(idx.ownerBlocks, key)
+					}
 				}
 			}
 			if len(owners) == 0 {
 				delete(modelBlocks, hash)
 			}
+		}
+		if len(modelBlocks) == 0 {
+			delete(idx.blocks, model)
 		}
 	}
 }
@@ -303,7 +324,9 @@ func kvEventsHandler(index *KVBlockMemoryIndex) gin.HandlerFunc {
 }
 
 // startKVEventsServer starts the HTTP listener that receives pushed KV events
-// from runtime sidecars when the plugin runs in memory index mode.
+// from runtime sidecars when the plugin runs in memory index mode. The listener
+// is bound synchronously so a startup failure (e.g. the port is already in use)
+// fails the router instead of leaving it running without an index feed.
 func startKVEventsServer(port int, index *KVBlockMemoryIndex) {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
@@ -313,9 +336,13 @@ func startKVEventsServer(port int, index *KVBlockMemoryIndex) {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: engine.Handler(),
 	}
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		klog.Fatalf("KVCacheAware: cannot listen on KV events port %d: %v", port, err)
+	}
 	go func() {
 		klog.Infof("KVCacheAware: starting KV events server on %s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			klog.Errorf("KVCacheAware: KV events server failed: %v", err)
 		}
 	}()

@@ -33,6 +33,15 @@ KV_EVENT_SNAPSHOT = "snapshot"
 
 PUSH_TIMEOUT_SECONDS = 2.0
 
+# Upper bound of deliveries queued per router endpoint. When a router cannot
+# keep up and its queue overflows, further deltas are dropped and the endpoint
+# is marked dirty so its next registration heartbeat receives a full snapshot.
+ENDPOINT_QUEUE_MAXSIZE = 1024
+
+# Queue item kinds processed by the per-endpoint delivery worker.
+_ITEM_DELTA = "delta"
+_ITEM_SNAPSHOT = "snapshot"
+
 
 class MemoryKVCacheManager:
     """KV cache manager that pushes standardized block hashes directly to
@@ -50,6 +59,15 @@ class MemoryKVCacheManager:
     memory mode this class has to retain that authoritative state (_blocks)
     itself, so it can replay it as a full snapshot to any router that starts
     fresh, restarts, or missed a delta push.
+
+    Delivery is decoupled per endpoint: each registered router has its own
+    bounded queue drained by a dedicated worker task, so one slow or
+    unreachable router delays neither the other routers nor the engine event
+    consumer. Snapshots travel through the same queue and build their payload
+    at delivery time, which keeps them ordered with the deltas around them.
+    On queue overflow the endpoint is marked dirty and deltas are dropped;
+    the next registration heartbeat then pushes a full snapshot, which
+    supersedes everything the endpoint may have missed.
     """
 
     def __init__(self, registry: Optional[RouterRegistry] = None,
@@ -59,28 +77,28 @@ class MemoryKVCacheManager:
         # engine hash -> standardized hash, needed because removal events only
         # carry engine hashes.
         self.hash_mapping: Dict[int, int] = {}
+        # model name -> {std_hash: number of engine hashes currently mapped to
+        # it}. Blocks with identical token content but different prefixes have
+        # distinct engine hashes yet the same standardized hash, so a
+        # standardized hash may only be dropped once its last engine-hash
+        # reference is removed.
+        self._std_refs: Dict[str, Dict[int, int]] = {}
         # model name -> {std_hash: unix seconds when stored}, mirrors what has
         # been pushed so a newly registered router can receive a snapshot.
         # Models stay present (with an empty dict) after being cleared so a
         # snapshot can authoritatively represent an empty cache.
         self._blocks: Dict[str, Dict[int, int]] = {}
-        # Per-endpoint locks serializing snapshot and delta delivery so an
-        # older replace-style snapshot cannot erase a newer delta.
-        self._endpoint_locks: Dict[str, asyncio.Lock] = {}
-        # Endpoints whose last push failed; they receive a fresh snapshot on
-        # their next registration heartbeat instead of staying divergent.
+        # Per-endpoint bounded delivery queues and their worker tasks.
+        self._queues: Dict[str, asyncio.Queue] = {}
+        self._workers: Dict[str, asyncio.Task] = {}
+        # Endpoints whose last push failed or whose queue overflowed; they
+        # receive a fresh snapshot on their next registration heartbeat
+        # instead of staying divergent.
         self._dirty_endpoints: set = set()
 
-    def _endpoint_lock(self, endpoint: str) -> asyncio.Lock:
-        lock = self._endpoint_locks.get(endpoint)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._endpoint_locks[endpoint] = lock
-        return lock
-
     def is_dirty(self, endpoint: str) -> bool:
-        """Whether the last push to this endpoint failed and its index may
-        have diverged, requiring a fresh snapshot."""
+        """Whether this endpoint's index may have diverged (a push failed or
+        deltas were dropped), requiring a fresh snapshot."""
         return endpoint in self._dirty_endpoints
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -90,9 +108,22 @@ class MemoryKVCacheManager:
         return self._client
 
     async def close(self) -> None:
+        for worker in self._workers.values():
+            worker.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers.values(),
+                                 return_exceptions=True)
+        self._workers.clear()
+        self._queues.clear()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def flush(self) -> None:
+        """Wait until every queued delivery has been processed (test helper
+        and shutdown aid)."""
+        if self._queues:
+            await asyncio.gather(*(q.join() for q in self._queues.values()))
 
     async def add_blocks(self, model_name: str, block_hashes: List[int],
                          pod_identifier: str, token_ids: Optional[List[int]] = None) -> bool:
@@ -107,13 +138,20 @@ class MemoryKVCacheManager:
 
         timestamp = int(time.time())
         model_blocks = self._blocks.setdefault(model_name, {})
+        model_refs = self._std_refs.setdefault(model_name, {})
         std_hashes = []
         for engine_hash, std_hash in pairs:
+            previous = self.hash_mapping.get(engine_hash)
+            if previous != std_hash:
+                if previous is not None:
+                    self._release_std_hash(model_name, previous)
+                model_refs[std_hash] = model_refs.get(std_hash, 0) + 1
             self.hash_mapping[engine_hash] = std_hash
             model_blocks[std_hash] = timestamp
-            std_hashes.append(std_hash)
+            if std_hash not in std_hashes:
+                std_hashes.append(std_hash)
 
-        await self._push_to_all(pod_identifier, model_name, [{
+        self._push_to_all(pod_identifier, model_name, [{
             "type": KV_EVENT_STORED,
             "block_hashes": std_hashes,
             "timestamp": timestamp,
@@ -123,30 +161,47 @@ class MemoryKVCacheManager:
             f"Count: {len(std_hashes)}")
         return True
 
+    def _release_std_hash(self, model_name: str, std_hash: int) -> bool:
+        """Drop one engine-hash reference; returns True when it was the last
+        one and the standardized hash left the index."""
+        model_refs = self._std_refs.get(model_name, {})
+        remaining = model_refs.get(std_hash, 0) - 1
+        if remaining > 0:
+            model_refs[std_hash] = remaining
+            return False
+        model_refs.pop(std_hash, None)
+        self._blocks.get(model_name, {}).pop(std_hash, None)
+        return True
+
     async def remove_blocks(self, model_name: str, block_hashes: List[int],
                             pod_identifier: str) -> int:
         if not block_hashes or not model_name or not pod_identifier:
             return 0
 
-        model_blocks = self._blocks.get(model_name, {})
+        removed = 0
         std_hashes = []
         for engine_hash in block_hashes:
             std_hash = self.hash_mapping.pop(engine_hash, None)
             if std_hash is None:
                 continue
-            model_blocks.pop(std_hash, None)
-            std_hashes.append(std_hash)
+            removed += 1
+            # Only announce the removal once the last engine hash referencing
+            # this standardized hash is gone; other cached blocks with the
+            # same token content may still exist.
+            if self._release_std_hash(model_name, std_hash):
+                std_hashes.append(std_hash)
 
-        if not std_hashes:
+        if not removed:
             return 0
 
-        await self._push_to_all(pod_identifier, model_name, [{
-            "type": KV_EVENT_REMOVED,
-            "block_hashes": std_hashes,
-        }])
+        if std_hashes:
+            self._push_to_all(pod_identifier, model_name, [{
+                "type": KV_EVENT_REMOVED,
+                "block_hashes": std_hashes,
+            }])
         logger.info(
             f"Removed {len(std_hashes)} blocks for model {model_name}, pod {pod_identifier}")
-        return len(std_hashes)
+        return removed
 
     async def clear_all_blocks(self, model_name: str, pod_identifier: str) -> int:
         if not model_name or not pod_identifier:
@@ -156,9 +211,10 @@ class MemoryKVCacheManager:
         # Keep the model key so later snapshots can still represent the empty
         # cache for this model and remove stale router entries.
         self._blocks[model_name] = {}
+        self._std_refs.clear()
         self.hash_mapping.clear()
 
-        await self._push_to_all(pod_identifier, model_name, [{
+        self._push_to_all(pod_identifier, model_name, [{
             "type": KV_EVENT_CLEARED,
         }])
         logger.info(
@@ -166,29 +222,112 @@ class MemoryKVCacheManager:
         return cleared
 
     async def push_snapshot(self, endpoint: str, pod_identifier: str) -> None:
-        """Send the full current block index to a single router endpoint.
+        """Queue a full-index snapshot for a single router endpoint.
 
         Called when a router registers for the first time, re-registers after
         its previous registration expired, or heartbeats while marked dirty
-        after a failed push, so it can rebuild its in-memory index.
+        after a failed or dropped push, so it can rebuild its in-memory index.
 
-        The endpoint lock serializes the snapshot with concurrent delta
-        pushes: the snapshot payload is built while holding the lock, so it
-        reflects every mutation whose delta was already delivered and cannot
-        be overtaken by a newer delta it does not contain.
+        The snapshot is delivered by the endpoint's worker in order with the
+        deltas around it, and its payload is built at delivery time, so it
+        reflects every mutation whose delta precedes it and cannot be
+        overtaken by a newer delta it does not contain. Pending deltas are
+        discarded first: the snapshot supersedes them.
         """
+        queue = self._ensure_worker(endpoint)
+        self._drain_queue(queue)
+        queue.put_nowait((_ITEM_SNAPSHOT, pod_identifier, None, None))
+        await queue.join()
+
+    def _push_to_all(self, pod_identifier: str, model_name: str,
+                     events: List[dict]) -> None:
+        """Queue a delta for every registered router endpoint; delivery is
+        asynchronous so a slow router never blocks event processing."""
+        endpoints = self.registry.active_endpoints()
+        self._prune_workers(endpoints)
+        if not endpoints:
+            logger.debug("No routers registered, skipping KV event push")
+            return
+        for endpoint in endpoints:
+            queue = self._ensure_worker(endpoint)
+            try:
+                queue.put_nowait(
+                    (_ITEM_DELTA, pod_identifier, model_name, events))
+            except asyncio.QueueFull:
+                # The router is too slow to keep up; drop the delta and let
+                # its next registration heartbeat recover it with a snapshot.
+                if endpoint not in self._dirty_endpoints:
+                    logger.warning(
+                        f"KV event queue for router {endpoint} is full; "
+                        f"dropping deltas until a snapshot reconciles it")
+                self._dirty_endpoints.add(endpoint)
+
+    def _ensure_worker(self, endpoint: str) -> asyncio.Queue:
+        queue = self._queues.get(endpoint)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=ENDPOINT_QUEUE_MAXSIZE)
+            self._queues[endpoint] = queue
+            self._workers[endpoint] = asyncio.get_running_loop().create_task(
+                self._deliver(endpoint, queue))
+        return queue
+
+    def _prune_workers(self, active_endpoints: List[str]) -> None:
+        """Stop workers of endpoints whose registration expired."""
+        active = set(active_endpoints)
+        for endpoint in list(self._workers):
+            if endpoint not in active:
+                self._workers.pop(endpoint).cancel()
+                queue = self._queues.pop(endpoint)
+                self._drain_queue(queue)
+                self._dirty_endpoints.discard(endpoint)
+
+    @staticmethod
+    def _drain_queue(queue: asyncio.Queue) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                return
+
+    async def _deliver(self, endpoint: str,
+                       queue: asyncio.Queue) -> None:
+        """Per-endpoint worker delivering queued items sequentially."""
+        while True:
+            kind, pod_identifier, model_name, events = await queue.get()
+            try:
+                if kind == _ITEM_SNAPSHOT:
+                    await self._send_snapshot(endpoint, pod_identifier)
+                elif endpoint in self._dirty_endpoints:
+                    # This endpoint already diverged; skip the delta instead
+                    # of burning a timeout on it — the pending snapshot
+                    # supersedes it anyway.
+                    pass
+                else:
+                    await self._send(
+                        endpoint, pod_identifier, model_name, events)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - keep the worker alive
+                self._dirty_endpoints.add(endpoint)
+                logger.warning(
+                    f"Unexpected error delivering KV events to router "
+                    f"{endpoint}: {e}")
+            finally:
+                queue.task_done()
+
+    async def _send_snapshot(self, endpoint: str, pod_identifier: str) -> None:
         ok = True
-        async with self._endpoint_lock(endpoint):
-            for model_name, model_blocks in self._blocks.items():
-                # Preserve original per-block store times; re-stamping them at
-                # snapshot time would defeat the engine-restart freshness filter.
-                hashes = list(model_blocks.keys())
-                if not await self._push_locked(endpoint, pod_identifier, model_name, [{
-                    "type": KV_EVENT_SNAPSHOT,
-                    "block_hashes": hashes,
-                    "timestamps": [model_blocks[h] for h in hashes],
-                }]):
-                    ok = False
+        for model_name, model_blocks in self._blocks.items():
+            # Preserve original per-block store times; re-stamping them at
+            # snapshot time would defeat the engine-restart freshness filter.
+            hashes = list(model_blocks.keys())
+            if not await self._send(endpoint, pod_identifier, model_name, [{
+                "type": KV_EVENT_SNAPSHOT,
+                "block_hashes": hashes,
+                "timestamps": [model_blocks[h] for h in hashes],
+            }]):
+                ok = False
         if ok:
             self._dirty_endpoints.discard(endpoint)
             logger.info(f"Pushed KV snapshot to router endpoint {endpoint}")
@@ -197,25 +336,8 @@ class MemoryKVCacheManager:
                 f"KV snapshot to router endpoint {endpoint} failed; will retry "
                 f"on its next registration heartbeat")
 
-    async def _push_to_all(self, pod_identifier: str, model_name: str,
-                           events: List[dict]) -> None:
-        endpoints = self.registry.active_endpoints()
-        if not endpoints:
-            logger.debug("No routers registered, skipping KV event push")
-            return
-        await asyncio.gather(
-            *(self._push(endpoint, pod_identifier, model_name, events)
-              for endpoint in endpoints),
-        )
-
-    async def _push(self, endpoint: str, pod_identifier: str, model_name: str,
-                    events: List[dict]) -> bool:
-        async with self._endpoint_lock(endpoint):
-            return await self._push_locked(
-                endpoint, pod_identifier, model_name, events)
-
-    async def _push_locked(self, endpoint: str, pod_identifier: str,
-                           model_name: str, events: List[dict]) -> bool:
+    async def _send(self, endpoint: str, pod_identifier: str,
+                    model_name: str, events: List[dict]) -> bool:
         payload = {
             "pod_identifier": pod_identifier,
             "model_name": model_name,

@@ -117,7 +117,7 @@ func TestValidatePodTemplates(t *testing.T) {
 			wantField: "spec.containers[0].resources.requests",
 		},
 		{
-			name: "resources requests are exceeds limits",
+			name: "resources requests exceed limits",
 			mutate: func(template *workloadv1alpha1.PodTemplateSpec) {
 				template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{"cpu": resource.MustParse("100m")},

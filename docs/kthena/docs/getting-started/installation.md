@@ -12,7 +12,7 @@ Before installing Kthena, ensure you have the following:
 
 ### Required Prerequisites
 
-- **Kubernetes cluster** (version 1.20 or later)
+- **Kubernetes cluster** (version 1.28 or later)
 - **kubectl** configured to access your cluster
 - **Helm** (version 3.0 or later)
 - Cluster admin permissions
@@ -99,7 +99,7 @@ helm install kthena oci://ghcr.io/volcano-sh/charts/kthena \
 ```
 
 :::note
-The one-stop `ModelBooster` API cascades into both CRD groups, so it requires **both** subcharts to be installed. With a component-scoped install, use the fine-grained CRDs of that component directly.
+The deprecated `ModelBooster` API requires **both** subcharts. It remains available in v1.1, with removal no earlier than v1.5. For new deployments, use `ModelServing`, `ModelServer`, and `ModelRoute` directly; with a component-scoped install, use that component's CRDs. See the [deprecation details](../user-guide/model-deployment.md#modelbooster-deprecation).
 :::
 
 You can enable the other component later with `helm upgrade --set <subchart>.enabled=true`. Note that Helm does not install files under a chart's `crds/` directory during an upgrade, so apply the newly enabled component's CRDs yourself first:

@@ -60,6 +60,7 @@ A Helm chart for deploying Kthena
 | networking.kthenaRouter.tokenizerService.port | int | `8100` | Port the tokenizer service listens on. |
 | networking.kthenaRouter.tokenizerService.resources | object | `{"limits":{"cpu":"2","memory":"4Gi"},"requests":{"cpu":"500m","memory":"1Gi"}}` | Resources for the tokenizer container. |
 | networking.kthenaRouter.tokenizerService.standalone.replicas | int | `1` | Number of tokenizer service replicas in standalone mode. |
+| networking.kthenaRouter.tolerations | list | `[]` | Tolerations for Kthena Router pods. |
 | networking.kthenaRouter.webhook.enabled | bool | `true` | Enable webhook for Kthena Router. |
 | networking.kthenaRouter.webhook.port | int | `8443` | Container port for Kthena Router webhook. |
 | networking.kthenaRouter.webhook.servicePort | int | `443` | Service port for Kthena Router webhook. |
@@ -76,6 +77,7 @@ A Helm chart for deploying Kthena
 | workload.controllerManager.replicas | int | `1` | Number of Controller Manager instances to run. |
 | workload.controllerManager.runtimeImage.repository | string | `"ghcr.io/volcano-sh/runtime"` | Image repository for the Runtime. |
 | workload.controllerManager.runtimeImage.tag | string | `"latest"` | Image tag for the Runtime. |
+| workload.controllerManager.tolerations | list | `[]` | Tolerations for Controller Manager pods. |
 | workload.controllerManager.webhook.enabled | bool | `true` | Enable webhook for the Controller Manager. |
 | workload.controllerManager.webhook.tls.certSecretName | string | `"kthena-controller-manager-webhook-certs"` | Secret name for storing webhook certificates. |
 | workload.controllerManager.webhook.tls.serviceName | string | `"kthena-controller-manager-webhook"` | Service name for the webhook. |

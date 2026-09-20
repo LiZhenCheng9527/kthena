@@ -76,7 +76,9 @@ The two components talk to Kubernetes, not to each other, so you can mix and mat
 | ---------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------ |
 | Manage model workloads only  | `workload` subchart   | Use `ModelServing` / `AutoscalingPolicy` and expose pods with your own gateway or `Service`.           |
 | Route inference traffic only | `networking` subchart | Point `ModelServer` at any pods — Deployments, StatefulSets, or workloads managed by another operator. |
-| Full platform                | Both subcharts        | Required for the one-stop `ModelBooster` API, which cascades into both CRD groups.                     |
+| Full platform                | Both subcharts        | Manage workloads with `ModelServing` and route traffic with `ModelServer` and `ModelRoute`.          |
+
+> **ModelBooster deprecation:** ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. See the [deployment guidance](docs/kthena/docs/user-guide/model-deployment.md#modelbooster-deprecation). Existing ModelBooster deployments remain supported in v1.1 and require both subcharts.
 
 ```bash
 # Workload controllers only (no router)

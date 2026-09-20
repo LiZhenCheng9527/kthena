@@ -1,4 +1,4 @@
-# Integrate ModelServing with llm-d Router
+# llm-d Router with Kthena
 
 This guide shows how to route requests from
 [llm-d Router](https://github.com/llm-d/llm-d-router) to model servers managed by
@@ -123,7 +123,7 @@ The Gateway API Inference Extension v1 failure modes are `FailOpen` and
 
 Start with a ModelServing workload containing `prefill` and `decode` roles, as
 described in
-[Prefill-Decode Disaggregation with ModelServing](./prefill-decode-disaggregation/modelserving-vllm-pd-disaggregation.md).
+[Prefill-Decode Disaggregation with ModelServing](../user-guide/prefill-decode-disaggregation/modelserving-vllm-pd-disaggregation.md).
 The prefill entry server continues to listen on port 8000. The decode entry Pod
 exposes the llm-d sidecar on port 8000 and moves the model server to port 8200.
 

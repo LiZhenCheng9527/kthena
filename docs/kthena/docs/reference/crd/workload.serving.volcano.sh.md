@@ -405,6 +405,10 @@ _Appears in:_
 
 ModelBackend defines the configuration for a model backend.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 _Appears in:_
@@ -430,6 +434,10 @@ _Underlying type:_ _string_
 
 ModelBackendType defines the type of model backend.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 _Validation:_
 - Enum: [vLLM vLLMDisaggregated]
 
@@ -451,6 +459,10 @@ _Appears in:_
 
 ModelBooster is the Schema for the models API.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 _Appears in:_
@@ -470,6 +482,10 @@ _Appears in:_
 
 ModelBoosterList contains a list of ModelBooster.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 
@@ -486,6 +502,10 @@ ModelBoosterList contains a list of ModelBooster.
 
 
 ModelBoosterSpec defines the desired state of ModelBooster.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 
 
@@ -590,6 +610,10 @@ _Appears in:_
 
 ModelStatus defines the observed state of ModelBooster.
 
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
+
 
 
 _Appears in:_
@@ -607,6 +631,10 @@ _Appears in:_
 
 
 ModelWorker defines the model worker configuration.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 
 
@@ -630,6 +658,10 @@ _Appears in:_
 _Underlying type:_ _string_
 
 ModelWorkerType defines the type of model worker.
+
+Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+Use ModelServing, ModelServer, and ModelRoute instead.
+ModelBooster will be removed no earlier than Kthena v1.5.
 
 _Validation:_
 - Enum: [server prefill decode controller coordinator]
@@ -866,7 +898,8 @@ _Appears in:_
 | `entryTemplate` _[PodTemplateSpec](#podtemplatespec)_ | EntryTemplate defines the template for the entry pod of a role.<br />Required: Currently, a role must have only one entry-pod. |  |  |
 | `workerReplicas` _integer_ | WorkerReplicas defines the number for the worker pod of a role.<br />Required: Need to set the number of worker-pod replicas. |  |  |
 | `workerTemplate` _[PodTemplateSpec](#podtemplatespec)_ | WorkerTemplate defines the template for the worker pod of a role. |  |  |
-| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />The value must not resolve to 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />It may resolve to 0 only when MaxSurge resolves above 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxSurge` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSurge is the maximum number of resources that may be created above<br />the desired replica count during an update. It can be an absolute number<br />(for example, 1) or a percentage (for example, 25%). A percentage is<br />calculated from ModelServing replicas for ServingGroupRollingUpdate and<br />from the corresponding Role's replicas for RoleRollingUpdate, then rounded<br />up. It defaults to 0. |  | XIntOrString: \{\} <br /> |
 | `partition` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | Partition protects the first N existing replicas in ascending ordinal order<br />from updates. The remaining replicas are eligible for rolling update.<br />For a contiguous ordinal set, this is equivalent to protecting [0, Partition).<br />Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).<br />Absolute number is calculated from percentage by rounding up.<br />The default value is 0. |  | XIntOrString: \{\} <br /> |
 
 
@@ -941,7 +974,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />The value must not resolve to 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of resources that may be<br />unavailable during an update. It can be an absolute number (for example,<br />5) or a percentage (for example, 10%). A percentage is calculated from<br />ModelServing replicas for ServingGroupRollingUpdate and from the<br />corresponding Role's replicas for RoleRollingUpdate, then rounded down.<br />It may resolve to 0 only when MaxSurge resolves above 0. Defaults to 1. | 1 | XIntOrString: \{\} <br /> |
+| `maxSurge` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MaxSurge is the maximum number of resources that may be created above<br />the desired replica count during an update. It can be an absolute number<br />(for example, 1) or a percentage (for example, 25%). A percentage is<br />calculated from ModelServing replicas for ServingGroupRollingUpdate and<br />from the corresponding Role's replicas for RoleRollingUpdate, then rounded<br />up. It defaults to 0. |  | XIntOrString: \{\} <br /> |
 | `partition` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | Partition protects the first N existing replicas in ascending ordinal order<br />from updates. The remaining replicas are eligible for rolling update.<br />For a contiguous ordinal set, this is equivalent to protecting [0, Partition).<br />Value can be an absolute number (ex: 5) or a percentage of total replicas (ex: 10%).<br />Absolute number is calculated from percentage by rounding up.<br />The default value is 0. |  | XIntOrString: \{\} <br /> |
 
 
@@ -960,7 +994,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `type` _[RolloutStrategyType](#rolloutstrategytype)_ | Type selects the granularity of rolling updates. Supported values are<br />ServingGroupRollingUpdate and RoleRollingUpdate. It defaults to<br />ServingGroupRollingUpdate.<br />ServingGroupRollingUpdate uses rolloutStrategy.rollingUpdateConfiguration;<br />rolling update settings on individual Roles do not take effect.<br />RoleRollingUpdate uses the rolling update configuration on each Role;<br />rolloutStrategy.rollingUpdateConfiguration must not be set.<br />Kthena performs RoleRollingUpdate across all ServingGroups at the same time.<br />Therefore, we recommend using it only in scenarios with a single ServingGroup. | ServingGroupRollingUpdate | Enum: [ServingGroupRollingUpdate RoleRollingUpdate] <br /> |
-| `rollingUpdateConfiguration` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdateConfiguration configures ServingGroupRollingUpdate.<br />It must not be set when type is RoleRollingUpdate; configure maxUnavailable<br />and partition on each Role instead. |  |  |
+| `rollingUpdateConfiguration` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdateConfiguration configures ServingGroupRollingUpdate.<br />It must not be set when type is RoleRollingUpdate; configure maxUnavailable<br />maxSurge, and partition on each Role instead. |  |  |
 
 
 #### RolloutStrategyType

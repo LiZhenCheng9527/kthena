@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -421,7 +422,8 @@ type store struct {
 	httpRoutes     map[string]*gatewayv1.HTTPRoute // key: namespace/name, value: *gatewayv1.HTTPRoute
 	gatewayRoutes  map[string]sets.Set[string]     // key: gateway key (namespace/name), value: set of HTTPRoute keys
 	// New fields for callback management
-	callbacks map[string][]CallbackFunc
+	callbacksMu sync.RWMutex
+	callbacks   map[string][]CallbackFunc
 
 	// initialSynced is used to indicate whether all the resources has been processed and storred into this store.
 	initialSynced *atomic.Bool
@@ -905,10 +907,22 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 		// Existing object — concurrent readers may access modelServer and pods,
 		// so we must hold the lock to prevent data races.
 		modelServerObj.mutex.Lock()
+		selectorChanged := !reflect.DeepEqual(modelServerObj.modelServer.Spec.WorkloadSelector, ms.Spec.WorkloadSelector)
 		modelServerObj.modelServer = ms
 		if len(pods) != 0 {
 			// do not operate s.pods here, which are done within pod handler
 			modelServerObj.pods = pods
+		}
+		if selectorChanged {
+			// Publish the new configuration and classification indexes together.
+			clear(modelServerObj.pdGroups)
+			clear(modelServerObj.decodePodGroups)
+			clear(modelServerObj.prefillPodGroups)
+			for podName := range modelServerObj.pods {
+				if value, ok := s.pods.Load(podName); ok {
+					modelServerObj.categorizePodForPDGroupLocked(podName, value.(*PodInfo).GetPodLabels())
+				}
+			}
 		}
 		modelServerObj.mutex.Unlock()
 	}
@@ -1099,13 +1113,12 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		oldPodInfo := value.(*PodInfo)
 		oldModelServers := oldPodInfo.GetModelServers()
 		// Handle the case where the pod no longer belongs to some model servers
-		oldPodLabels := oldPodInfo.GetPodLabels()
 		for msName := range oldModelServers.Difference(newModelServers) {
 			if value, ok := s.modelServer.Load(msName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, oldPodLabels)
+				ms.removePodFromPDGroups(podName)
 			}
 		}
 
@@ -1168,13 +1181,12 @@ func (s *store) DeletePod(podName types.NamespacedName) error {
 	if value, ok := s.pods.Load(podName); ok {
 		pod := value.(*PodInfo)
 		modelServers := pod.GetModelServers()
-		podLabels := pod.GetPodLabels()
 		for modelServerName := range modelServers {
 			if value, ok := s.modelServer.Load(modelServerName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
 				// Remove from PDGroup categorizations
-				ms.removePodFromPDGroups(podName, podLabels)
+				ms.removePodFromPDGroups(podName)
 			} else {
 				klog.V(4).Infof("model server %s not found for pod %s, maybe already deleted", modelServerName, podName)
 			}
@@ -1835,20 +1847,19 @@ func updateHistogramMetrics(podinfo *PodInfo, histogramMetrics map[string]*dto.H
 }
 
 // RegisterCallback registers a callback function for a specific resource
-// Note this can only be called during bootstrapping.
 func (s *store) RegisterCallback(kind string, callback CallbackFunc) {
-	if _, exists := s.callbacks[kind]; !exists {
-		s.callbacks[kind] = make([]CallbackFunc, 0)
-	}
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.callbacks[kind] = append(s.callbacks[kind], callback)
 }
 
 // triggerCallbacks executes all registered callbacks for a specific event type
 func (s *store) triggerCallbacks(kind string, data EventData) {
-	if callbacks, exists := s.callbacks[kind]; exists {
-		for _, callback := range callbacks {
-			go callback(data)
-		}
+	s.callbacksMu.RLock()
+	callbacks := s.callbacks[kind]
+	s.callbacksMu.RUnlock()
+	for _, callback := range callbacks {
+		go callback(data)
 	}
 }
 

@@ -315,6 +315,8 @@ func (v *KthenaRouterValidator) validateModelServer(modelServer *networkingv1alp
 		}
 	}
 
+	allErrs = append(allErrs, validateConnectionPool(specField, modelServer)...)
+
 	if len(allErrs) > 0 {
 		var messages []string
 		for _, err := range allErrs {
@@ -323,6 +325,46 @@ func (v *KthenaRouterValidator) validateModelServer(modelServer *networkingv1alp
 		return false, fmt.Sprintf("validation failed: %s", strings.Join(messages, ""))
 	}
 	return true, ""
+}
+
+// validateConnectionPool validates the trafficPolicy.connectionPool fields.
+// Negative limits and non-positive idle timeouts are rejected rather than
+// silently replaced with defaults.
+func validateConnectionPool(specField *field.Path, modelServer *networkingv1alpha1.ModelServer) field.ErrorList {
+	var allErrs field.ErrorList
+	if modelServer.Spec.TrafficPolicy == nil || modelServer.Spec.TrafficPolicy.ConnectionPool == nil {
+		return allErrs
+	}
+	cp := modelServer.Spec.TrafficPolicy.ConnectionPool
+	cpField := specField.Child("trafficPolicy").Child("connectionPool")
+
+	if cp.MaxIdleConnections != nil && *cp.MaxIdleConnections < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxIdleConnections"), *cp.MaxIdleConnections, "must be non-negative"))
+	}
+	if cp.MaxIdleConnectionsPerHost != nil && *cp.MaxIdleConnectionsPerHost < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxIdleConnectionsPerHost"), *cp.MaxIdleConnectionsPerHost, "must be non-negative"))
+	}
+	if cp.MaxConnectionsPerHost != nil && *cp.MaxConnectionsPerHost < 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("maxConnectionsPerHost"), *cp.MaxConnectionsPerHost, "must be non-negative"))
+	}
+	if cp.IdleTimeout != nil && cp.IdleTimeout.Duration <= 0 {
+		allErrs = append(allErrs, field.Invalid(cpField.Child("idleTimeout"), cp.IdleTimeout.Duration, "must be a positive duration"))
+	}
+
+	// SGLang runs prefill and decode concurrently, holding connections to two
+	// pods at once. A capped maxConnectionsPerHost can deadlock two concurrent
+	// requests. Only applies when the SGLang connector is selected (engine is
+	// SGLang and no kvConnector is explicitly set); an explicit connector uses
+	// serial prefill-decode. Other pool fields only affect reuse, so stay allowed.
+	if cp.MaxConnectionsPerHost != nil && *cp.MaxConnectionsPerHost > 0 {
+		usesSGLangConnector := modelServer.Spec.InferenceEngine == networkingv1alpha1.SGLang &&
+			(modelServer.Spec.KVConnector == nil || modelServer.Spec.KVConnector.Type == "")
+		if usesSGLangConnector {
+			allErrs = append(allErrs, field.Invalid(cpField.Child("maxConnectionsPerHost"), *cp.MaxConnectionsPerHost,
+				"not supported for SGLang: concurrent prefill-decode requires unlimited per-host connections to avoid deadlock"))
+		}
+	}
+	return allErrs
 }
 
 func (v *KthenaRouterValidator) validateExternalModelProvider(provider *networkingv1alpha1.ExternalModelProvider) (bool, string) {

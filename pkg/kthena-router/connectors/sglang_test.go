@@ -17,12 +17,14 @@ limitations under the License.
 package connectors
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -98,11 +100,11 @@ func TestSGLangConnectorRetryIsolation(t *testing.T) {
 	decodeAddr := decodeServer.Listener.Addr().String()
 
 	// First call simulates the initial PD attempt.
-	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, nil); err != nil {
+	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, 0, nil); err != nil {
 		t.Fatalf("first Proxy call failed: %v", err)
 	}
 	// The second call simulates another attempt on the same connector.
-	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, nil); err != nil {
+	if _, err := connector.Proxy(makeCtx(), reqBody, prefillAddr, decodeAddr, 0, nil); err != nil {
 		t.Fatalf("second Proxy call failed: %v", err)
 	}
 
@@ -125,6 +127,61 @@ func TestSGLangConnectorRetryIsolation(t *testing.T) {
 	}
 	if prefillRooms[0] == prefillRooms[1] {
 		t.Errorf("retry reused bootstrap room %d", prefillRooms[0])
+	}
+}
+
+func TestSGLangConnectorPrefillTimeoutCancelsDecode(t *testing.T) {
+	releasePrefill := make(chan struct{})
+	prefillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-releasePrefill:
+		}
+	}))
+	defer func() {
+		close(releasePrefill)
+		prefillServer.Close()
+	}()
+
+	decodeCancelled := make(chan struct{})
+	decodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(decodeCancelled)
+	}))
+	defer decodeServer.Close()
+
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(requestCtx, http.MethodPost, "/v1/chat/completions", nil)
+	c, _ := gin.CreateTestContext(CreateTestResponseRecorder())
+	c.Request = req
+
+	reqBody := map[string]interface{}{
+		"model":      "test-model",
+		"stream":     true,
+		"max_tokens": 100,
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+
+	connector := NewSGLangConnector()
+	start := time.Now()
+	_, err := connector.Proxy(c, reqBody, prefillServer.Listener.Addr().String(), decodeServer.Listener.Addr().String(), 100*time.Millisecond, nil)
+	if err == nil {
+		t.Fatal("Proxy() succeeded after prefill timed out")
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("Proxy() took %v after prefill timed out", elapsed)
+	}
+
+	select {
+	case <-decodeCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("decode request was not cancelled after prefill timed out")
 	}
 }
 
@@ -151,7 +208,7 @@ func TestSGLangConnectorReqBodyNotMutated(t *testing.T) {
 		keysBefore[k] = struct{}{}
 	}
 
-	_, _ = connector.Proxy(c, reqBody, "127.0.0.1:1", "127.0.0.1:2", nil)
+	_, _ = connector.Proxy(c, reqBody, "127.0.0.1:1", "127.0.0.1:2", 0, nil)
 
 	for k := range reqBody {
 		if _, existed := keysBefore[k]; !existed {

@@ -25,14 +25,28 @@ MAX_ROUTER_TTL_SECONDS = 3600
 
 
 def validate_router_endpoint(endpoint: str) -> bool:
-    """Only plain http/https URLs with a host are accepted as push targets."""
+    """Only plain http/https base URLs (scheme + host[:port]) are accepted.
+
+    The endpoint is later concatenated with KV_EVENTS_PATH, so URLs carrying a
+    path, query, fragment, or userinfo would produce wrong push targets and
+    widen the abuse surface of the registration endpoint.
+    """
     if not endpoint:
         return False
     try:
         parsed = urlparse(endpoint)
     except ValueError:
         return False
-    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    return (
+        parsed.scheme in ("http", "https")
+        and bool(parsed.hostname)
+        and parsed.path in ("", "/")
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 @dataclass
@@ -69,6 +83,7 @@ class RouterRegistry:
             raise ValueError("router_id must not be empty")
         if not validate_router_endpoint(endpoint):
             raise ValueError(f"invalid router endpoint: {endpoint!r}")
+        endpoint = endpoint.rstrip("/")
 
         ttl = min(max(int(ttl_seconds), 1), MAX_ROUTER_TTL_SECONDS)
         now = time.monotonic()
@@ -81,7 +96,7 @@ class RouterRegistry:
         )
         self._routers[router_id] = RouterRegistration(
             router_id=router_id,
-            endpoint=endpoint.rstrip("/"),
+            endpoint=endpoint,
             expires_at=now + ttl,
             generation=generation,
         )

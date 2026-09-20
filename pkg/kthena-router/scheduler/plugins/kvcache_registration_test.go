@@ -62,6 +62,37 @@ func TestRouterSelfEndpoint(t *testing.T) {
 	}
 }
 
+func TestRouterInstanceID(t *testing.T) {
+	tests := []struct {
+		name      string
+		podName   string
+		namespace string
+		want      string
+	}{
+		{
+			name:      "namespace-qualified pod name",
+			podName:   "kthena-router-0",
+			namespace: "kthena-system",
+			want:      "kthena-system/kthena-router-0",
+		},
+		{
+			name:    "pod name only",
+			podName: "kthena-router-0",
+			want:    "kthena-router-0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("POD_NAME", tt.podName)
+			t.Setenv("POD_NAMESPACE", tt.namespace)
+			if got := routerInstanceID(); got != tt.want {
+				t.Errorf("routerInstanceID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewProcessGeneration(t *testing.T) {
 	g1 := newProcessGeneration()
 	g2 := newProcessGeneration()

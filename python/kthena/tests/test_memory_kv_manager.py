@@ -324,3 +324,23 @@ def test_router_registry_rejects_invalid_input():
         registry.register("router-a", "ftp://10.0.0.5:9080")
     with pytest.raises(ValueError):
         registry.register("router-a", "not-a-url")
+    # Only base URLs are accepted: the endpoint is concatenated with
+    # KV_EVENTS_PATH, so paths, queries, fragments, and userinfo are rejected.
+    with pytest.raises(ValueError):
+        registry.register("router-a", "http://10.0.0.5:9080/some/path")
+    with pytest.raises(ValueError):
+        registry.register("router-a", "http://10.0.0.5:9080?x=1")
+    with pytest.raises(ValueError):
+        registry.register("router-a", "http://10.0.0.5:9080#frag")
+    with pytest.raises(ValueError):
+        registry.register("router-a", "http://user:pass@10.0.0.5:9080")
+
+
+def test_router_registry_normalizes_trailing_slash():
+    registry = RouterRegistry()
+    assert registry.register("router-a", "http://10.0.0.5:9080/")
+    # A heartbeat with (or without) a trailing slash is the same endpoint and
+    # must not be treated as a change that schedules another snapshot.
+    assert not registry.register("router-a", "http://10.0.0.5:9080")
+    assert not registry.register("router-a", "http://10.0.0.5:9080/")
+    assert registry.active_endpoints() == ["http://10.0.0.5:9080"]

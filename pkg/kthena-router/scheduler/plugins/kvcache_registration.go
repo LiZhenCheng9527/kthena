@@ -112,16 +112,22 @@ func routerSelfEndpoint(eventsPort int) (string, error) {
 	return "http://" + net.JoinHostPort(podIP, strconv.Itoa(eventsPort)), nil
 }
 
-// routerInstanceID identifies this router replica in sidecar registries.
+// routerInstanceID identifies this router replica in sidecar registries. Pod
+// names are only unique within a namespace, so the namespace is included to
+// keep routers from different namespaces from overwriting each other.
 func routerInstanceID() string {
-	if name := os.Getenv("POD_NAME"); name != "" {
-		return name
+	name := os.Getenv("POD_NAME")
+	if name == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return "kthena-router"
+		}
+		name = hostname
 	}
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "kthena-router"
+	if namespace := os.Getenv("POD_NAMESPACE"); namespace != "" {
+		return namespace + "/" + name
 	}
-	return hostname
+	return name
 }
 
 // run registers with all known pods immediately and then on every tick until

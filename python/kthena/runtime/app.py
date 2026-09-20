@@ -272,6 +272,9 @@ async def register_router(request: Request, background_tasks: BackgroundTasks) -
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object")
 
     router_id = body.get("router_id")
     endpoint = body.get("endpoint")

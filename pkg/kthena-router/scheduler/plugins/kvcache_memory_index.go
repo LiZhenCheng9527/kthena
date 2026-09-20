@@ -305,9 +305,14 @@ func (idx *KVBlockMemoryIndex) runGC(ctx context.Context, interval, freshDuratio
 	}
 }
 
+// kvEventsMaxBodyBytes caps the request body accepted on the KV events
+// endpoint so oversized payloads cannot exhaust router memory.
+const kvEventsMaxBodyBytes = 4 << 20 // 4 MiB
+
 // kvEventsHandler handles POST /kvcache/events pushed by runtime sidecars.
 func kvEventsHandler(index *KVBlockMemoryIndex) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, kvEventsMaxBodyBytes)
 		var payload KVEventPayload
 		if err := c.ShouldBindJSON(&payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload: " + err.Error()})
@@ -335,6 +340,12 @@ func startKVEventsServer(port int, index *KVBlockMemoryIndex) {
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: engine.Handler(),
+		// Basic hardening against slow or stalled clients holding
+		// connections open on this cluster-reachable endpoint.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {

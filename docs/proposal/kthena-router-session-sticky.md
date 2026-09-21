@@ -57,27 +57,25 @@ Kubernetes Service `sessionAffinity: ClientIP` only keys on **source IP**. Affin
 
 #### Architecture
 
-Session sticky is **not** a scheduler plugin. It only **looks up a binding** before `Schedule`, **pins one Pod after Filter**, then **writes the chosen Pod** after `Schedule`. Filter and Score plugins are unchanged.
+Session sticky is **not** a scheduler plugin. It looks up a binding before `Schedule`, pins after Filter, and commits after `Schedule` without changing `BestPods`.
 
 **Request path**
 
 1. Match `ModelRoute` and select a destination by **rule weights**. Sticky does not rematch or prefer a ModelServer.
 2. If the chosen `ModelServer` has `trafficPolicy.sessionSticky`, take the first non-empty source (`Header` / `Query` / `Cookie` / `JWTClaim`) as the session key. Empty key: skip sticky.
 3. `Get` binding keyed by **ModelServer identity + session key**. If present, pass `StickyPodName = binding.Pod` into `Schedule`.
-4. `Schedule` (aggregated, non-PD): **Filter plugins** run on that ModelServer's candidate list → if `StickyPodName` is still in that list, shrink it to that one Pod → **Score plugins** run on whatever list remains.
+4. `Schedule` (aggregated, non-PD): Filter runs. If `StickyPodName` is still in the list, `BestPods` is that Pod and Score is skipped. Otherwise the pin is cleared and Score runs.
 5. After a Pod is chosen, `Commit` `{ModelServer, Pod}` with the ModelServer TTL (store details below). Then proxy.
 
 **How this interacts with other scheduling factors**
 
 | Case | What happens |
 |------|----------------|
-| Sticky Pod **survives Filter** | Candidate list becomes that one Pod. Score still runs, but cannot pick a different Pod. |
+| Sticky Pod **survives Filter** | `BestPods` is that Pod. Score plugins are skipped. |
 | Sticky Pod **fails Filter** (overloaded, gone, …) | Pin is dropped. Score ranks the remaining Pods as usual. The new winner is committed. |
 | No binding / empty session key | Filter then Score as today. First successful Pod is committed if a key exists. |
 | **PD** (`PDGroup` set) | Sticky is skipped (no pin, no commit). PD Filter/Score is unchanged. |
 | **Multi-target ModelRoute** | Each request still follows weights. Sticky for ModelServer A never forces traffic onto A when the route selected B. |
-
-Pinning is **after Filter, before Score**. Other plugins are not reordered and do not need sticky-specific logic.
 
 #### Session map storage
 
@@ -119,7 +117,7 @@ All replicas in a deployment must use the same backend. Redis mode fails fast at
 
 - **Split brain without Redis**: memory store is per process; multi-replica must use Redis.
 - **Stale Pod**: filter miss clears the pin; commit writes the newly selected Pod.
-- **Concurrent first request**: Redis Lua returns the first writer; the loser adopts that Pod if it is still selectable.
+- **Concurrent first request**: Redis keeps the first writer's binding. This request still uses the scheduler's `BestPods`. Later requests follow the stored binding.
 
 ### Design details
 
@@ -130,7 +128,7 @@ All replicas in a deployment must use the same backend. Redis mode fails fast at
 | Field | Purpose |
 |-------|---------|
 | `sessionAffinitySeconds` | TTL in seconds; optional, default **300**; minimum **1** when set. |
-| `sources` | Ordered list (max **16**) of `SessionKeySource`. **Required and non-empty when `sessionSticky` is non-nil**. |
+| `sources` | Ordered list (max **16**). Evaluated in order; the first non-empty value is the session key. Later sources are ignored. Required and non-empty when `sessionSticky` is set. |
 
 ```go
 type TrafficPolicy struct {

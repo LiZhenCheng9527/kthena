@@ -594,6 +594,93 @@ func TestStoreDeleteModelServer(t *testing.T) {
 	assert.False(t, podExists, "pod should be deleted if no modelServer left")
 }
 
+func TestStoreDeleteModelServerEmitsPodDeleteEvent(t *testing.T) {
+	newMS := func(name string) *aiv1alpha1.ModelServer {
+		return &aiv1alpha1.ModelServer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+		}
+	}
+	podName := types.NamespacedName{Namespace: "default", Name: "pod1"}
+
+	t.Run("pod evicted with its last model server fires the delete event", func(t *testing.T) {
+		s := &store{
+			modelServer: sync.Map{},
+			pods:        sync.Map{},
+			callbacks:   make(map[string][]CallbackFunc),
+		}
+		ms := newMS("model1")
+		msName := utils.GetNamespaceName(ms)
+		modelSrv := newModelServer(ms)
+		modelSrv.addPod(podName)
+		s.modelServer.Store(msName, modelSrv)
+		s.pods.Store(podName, &PodInfo{
+			Pod:         &corev1.Pod{},
+			modelServer: sets.New[types.NamespacedName](msName),
+			models:      sets.New[string](),
+		})
+
+		var mu sync.Mutex
+		var deleted []types.NamespacedName
+		var seenInStore atomic.Bool
+		s.RegisterCallback("Pod", func(data EventData) {
+			if data.EventType != EventDelete {
+				return
+			}
+			if _, ok := s.pods.Load(data.Pod); ok {
+				seenInStore.Store(true)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			deleted = append(deleted, data.Pod)
+		})
+
+		assert.NoError(t, s.DeleteModelServer(msName))
+
+		_, podExists := s.pods.Load(podName)
+		assert.False(t, podExists, "pod should be deleted if no modelServer left")
+		assert.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(deleted) == 1 && deleted[0] == podName
+		}, time.Second, 10*time.Millisecond, "Pod delete event should fire for the evicted pod")
+		assert.False(t, seenInStore.Load(), "pod should already be out of the store when the event is dispatched")
+	})
+
+	t.Run("pod kept by another model server fires no event", func(t *testing.T) {
+		s := &store{
+			modelServer: sync.Map{},
+			pods:        sync.Map{},
+			callbacks:   make(map[string][]CallbackFunc),
+		}
+		deletedMS, keptMS := newMS("model1"), newMS("model2")
+		deletedName, keptName := utils.GetNamespaceName(deletedMS), utils.GetNamespaceName(keptMS)
+		for ms, name := range map[*aiv1alpha1.ModelServer]types.NamespacedName{deletedMS: deletedName, keptMS: keptName} {
+			modelSrv := newModelServer(ms)
+			modelSrv.addPod(podName)
+			s.modelServer.Store(name, modelSrv)
+		}
+		s.pods.Store(podName, &PodInfo{
+			Pod:         &corev1.Pod{},
+			modelServer: sets.New[types.NamespacedName](deletedName, keptName),
+			models:      sets.New[string](),
+		})
+
+		var fired atomic.Bool
+		s.RegisterCallback("Pod", func(data EventData) {
+			if data.EventType == EventDelete {
+				fired.Store(true)
+			}
+		})
+
+		assert.NoError(t, s.DeleteModelServer(deletedName))
+
+		_, podExists := s.pods.Load(podName)
+		assert.True(t, podExists, "pod should stay while another modelServer still selects it")
+		assert.Never(t, fired.Load, 100*time.Millisecond, 10*time.Millisecond,
+			"no Pod delete event should fire while the pod is still in the store")
+	})
+}
+
 func TestStoreGetPodsByModelServer(t *testing.T) {
 	s := &store{
 		modelServer: sync.Map{},

@@ -944,6 +944,11 @@ func (s *store) DeleteModelServer(ms types.NamespacedName) error {
 			podInfo.RemoveModelServer(ms)
 			if podInfo.GetModelServerCount() == 0 {
 				s.pods.Delete(podName)
+				// Dispatched after the removal, as DeletePod does.
+				s.triggerCallbacks("Pod", EventData{
+					EventType: EventDelete,
+					Pod:       podName,
+				})
 			}
 		} else {
 			klog.Warningf("pod %s not found", podName)

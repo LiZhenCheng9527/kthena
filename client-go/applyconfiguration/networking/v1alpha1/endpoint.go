@@ -20,11 +20,23 @@ package v1alpha1
 
 // EndpointApplyConfiguration represents a declarative configuration of the Endpoint type for use
 // with apply.
+//
+// Endpoint describes a single statically configured model serving instance.
 type EndpointApplyConfiguration struct {
-	Name    *string           `json:"name,omitempty"`
-	Address *string           `json:"address,omitempty"`
-	Port    *int32            `json:"port,omitempty"`
-	Labels  map[string]string `json:"labels,omitempty"`
+	// Name uniquely identifies the endpoint within the ModelServer. Together with
+	// the ModelServer name it forms the instance identity in the router, for
+	// example in metrics and debug output.
+	Name *string `json:"name,omitempty"`
+	// Address is the IP address or DNS name of the model serving instance.
+	Address *string `json:"address,omitempty"`
+	// Port is the port the model serving instance listens on. It defaults to
+	// `spec.workloadPort.port` when unset.
+	Port *int32 `json:"port,omitempty"`
+	// Labels are attached to the endpoint. They do not select serving instances;
+	// they are only matched against `workloadSelector.pdGroup` to assign the
+	// endpoint a prefill or decode role, `pdGroup` being the sole
+	// `workloadSelector` field that may be combined with `endpoints`.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // EndpointApplyConfiguration constructs a declarative configuration of the Endpoint type for use with

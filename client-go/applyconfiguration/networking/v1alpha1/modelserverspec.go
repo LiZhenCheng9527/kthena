@@ -24,14 +24,38 @@ import (
 
 // ModelServerSpecApplyConfiguration represents a declarative configuration of the ModelServerSpec type for use
 // with apply.
+//
+// ModelServerSpec defines the desired state of ModelServer.
 type ModelServerSpecApplyConfiguration struct {
-	Model            *string                             `json:"model,omitempty"`
-	InferenceEngine  *networkingv1alpha1.InferenceEngine `json:"inferenceEngine,omitempty"`
+	// The real model that the modelServers are running.
+	// If the `model` in LLM inference request is different from this field, it should be overwritten by this field.
+	// Otherwise, the `model` in LLM inference request will not be mutated.
+	Model *string `json:"model,omitempty"`
+	// The inference engine used to serve the model.
+	InferenceEngine *networkingv1alpha1.InferenceEngine `json:"inferenceEngine,omitempty"`
+	// WorkloadSelector is used to match the model serving instances.
+	// Currently, they must be pods within the same namespace as modelServer object.
+	// `workloadSelector.matchLabels` and `endpoints` are mutually exclusive ways of
+	// declaring the serving instances, so exactly one of them must be used.
+	// `workloadSelector.pdGroup` does not select instances; it only assigns them
+	// prefill and decode roles, and therefore is the sole `workloadSelector` field
+	// that may also be combined with `endpoints`.
 	WorkloadSelector *WorkloadSelectorApplyConfiguration `json:"workloadSelector,omitempty"`
-	Endpoints        []EndpointApplyConfiguration        `json:"endpoints,omitempty"`
-	WorkloadPort     *WorkloadPortApplyConfiguration     `json:"workloadPort,omitempty"`
-	TrafficPolicy    *TrafficPolicyApplyConfiguration    `json:"trafficPolicy,omitempty"`
-	KVConnector      *KVConnectorSpecApplyConfiguration  `json:"kvConnector,omitempty"`
+	// Endpoints is a static list of model serving instances. It is intended for
+	// deployments where the serving instances are not discoverable as pods of the
+	// cluster the router runs in, for example when the router reads its
+	// configuration from local files instead of the Kubernetes API server.
+	// `endpoints` and `workloadSelector.matchLabels` are mutually exclusive;
+	// exactly one of them must be specified.
+	Endpoints []EndpointApplyConfiguration `json:"endpoints,omitempty"`
+	// WorkloadPort defines the port and protocol configuration for the model server.
+	// It may be omitted only when every entry in `endpoints` declares its own
+	// `port`; endpoints without an explicit `port` fall back to `workloadPort.port`.
+	WorkloadPort *WorkloadPortApplyConfiguration `json:"workloadPort,omitempty"`
+	// Traffic Policy for accessing the model server instance.
+	TrafficPolicy *TrafficPolicyApplyConfiguration `json:"trafficPolicy,omitempty"`
+	// KVConnector specifies the KV connector configuration for PD disaggregated routing
+	KVConnector *KVConnectorSpecApplyConfiguration `json:"kvConnector,omitempty"`
 }
 
 // ModelServerSpecApplyConfiguration constructs a declarative configuration of the ModelServerSpec type for use with

@@ -264,8 +264,9 @@ func decodeObject(raw json.RawMessage, typeMeta metav1.TypeMeta, res *resources)
 		if err := unmarshal(raw, obj, &obj.ObjectMeta); err != nil {
 			return err
 		}
-		// The admission webhook is disabled without an API server, so the same
-		// semantic validation runs when the manifests are loaded.
+		// The API server is not involved, so CRD structural defaulting and the
+		// admission webhook validation both run here, in the same order.
+		defaultModelRoute(obj)
 		if ok, reason := webhook.ValidateModelRoute(obj); !ok {
 			return fmt.Errorf("invalid ModelRoute %s/%s: %s", obj.Namespace, obj.Name, reason)
 		}
@@ -275,6 +276,7 @@ func decodeObject(raw json.RawMessage, typeMeta metav1.TypeMeta, res *resources)
 		if err := unmarshal(raw, obj, &obj.ObjectMeta); err != nil {
 			return err
 		}
+		defaultModelServer(obj)
 		if ok, reason := webhook.ValidateModelServer(obj); !ok {
 			return fmt.Errorf("invalid ModelServer %s/%s: %s", obj.Namespace, obj.Name, reason)
 		}
@@ -284,6 +286,7 @@ func decodeObject(raw json.RawMessage, typeMeta metav1.TypeMeta, res *resources)
 		if err := unmarshal(raw, obj, &obj.ObjectMeta); err != nil {
 			return err
 		}
+		defaultExternalModelProvider(obj)
 		if ok, reason := webhook.ValidateExternalModelProvider(obj); !ok {
 			return fmt.Errorf("invalid ExternalModelProvider %s/%s: %s", obj.Namespace, obj.Name, reason)
 		}

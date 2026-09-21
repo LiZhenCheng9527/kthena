@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
 
@@ -206,6 +207,48 @@ spec:
 	// The last good snapshot keeps serving and the invalid server is not stored.
 	assert.NotNil(t, store.GetModelRoute("default/demo"))
 	assert.Nil(t, store.GetModelServer(types.NamespacedName{Namespace: "default", Name: "demo-server"}))
+}
+
+func TestSourceAppliesCRDDefaults(t *testing.T) {
+	dir := t.TempDir()
+	// None of the manifests set the fields carrying `+kubebuilder:default`
+	// markers, so loading from file must fill in the same values the API
+	// server would apply through CRD structural defaulting.
+	writeManifest(t, dir, "resources.yaml", modelRouteManifest+`  rateLimit:
+    inputTokensPerUnit: 100
+---
+`+modelServerManifest+`  kvConnector: {}
+  trafficPolicy:
+    retry:
+      attempts: 2
+---
+apiVersion: networking.serving.volcano.sh/v1alpha1
+kind: ExternalModelProvider
+metadata:
+  name: provider
+spec:
+  baseURL: https://api.example.com
+`)
+
+	source, store := newTestSource(t, dir)
+	require.NoError(t, source.sync())
+
+	route := store.GetModelRoute("default/demo")
+	require.NotNil(t, route)
+	require.NotNil(t, route.Spec.Rules[0].TargetModels[0].Weight)
+	assert.Equal(t, uint32(100), *route.Spec.Rules[0].TargetModels[0].Weight)
+	assert.Equal(t, aiv1alpha1.Second, route.Spec.RateLimit.Unit)
+
+	ms := store.GetModelServer(types.NamespacedName{Namespace: "default", Name: "demo-server"})
+	require.NotNil(t, ms)
+	assert.Equal(t, "http", ms.Spec.WorkloadPort.Protocol)
+	assert.Equal(t, aiv1alpha1.ConnectorTypeHTTP, ms.Spec.KVConnector.Type)
+	require.NotNil(t, ms.Spec.TrafficPolicy.Retry.RetryInterval)
+	assert.Equal(t, 100*time.Millisecond, ms.Spec.TrafficPolicy.Retry.RetryInterval.Duration)
+
+	provider := store.GetExternalModelProvider(types.NamespacedName{Namespace: "default", Name: "provider"})
+	require.NotNil(t, provider)
+	assert.Equal(t, aiv1alpha1.OpenAI, provider.Spec.ProviderType)
 }
 
 func TestSourceConvertsSecretStringData(t *testing.T) {

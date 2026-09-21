@@ -20,9 +20,16 @@ package v1alpha1
 
 // SessionStickyApplyConfiguration represents a declarative configuration of the SessionSticky type for use
 // with apply.
+//
+// SessionSticky configures per-ModelServer session key extraction and binding TTL.
+// The backing store (memory vs Redis) is configured in the router process, not here.
 type SessionStickyApplyConfiguration struct {
-	SessionAffinitySeconds *int32                               `json:"sessionAffinitySeconds,omitempty"`
-	Sources                []SessionKeySourceApplyConfiguration `json:"sources,omitempty"`
+	// SessionAffinitySeconds is binding TTL in seconds.
+	// Once the session has been idle for more than the specified duration, the session becomes invalid.
+	// When unset, the default is 300 (5 minutes).
+	SessionAffinitySeconds *int32 `json:"sessionAffinitySeconds,omitempty"`
+	// Sources are evaluated in order; the first non-empty extracted value is the session key.
+	Sources []SessionKeySourceApplyConfiguration `json:"sources,omitempty"`
 }
 
 // SessionStickyApplyConfiguration constructs a declarative configuration of the SessionSticky type for use with

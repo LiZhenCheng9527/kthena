@@ -24,9 +24,12 @@ import (
 
 // SessionKeySourceApplyConfiguration represents a declarative configuration of the SessionKeySource type for use
 // with apply.
+//
+// SessionKeySource defines one session key extraction rule.
 type SessionKeySourceApplyConfiguration struct {
 	Type *networkingv1alpha1.SessionKeySourceType `json:"type,omitempty"`
-	Name *string                                  `json:"name,omitempty"`
+	// Name is the header name, query key, cookie name, or JWT claim name.
+	Name *string `json:"name,omitempty"`
 }
 
 // SessionKeySourceApplyConfiguration constructs a declarative configuration of the SessionKeySource type for use with

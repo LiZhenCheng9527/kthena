@@ -32,10 +32,10 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -335,21 +335,21 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 		podRuntimeInspector: &fakePodRuntimeInspector{
 			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 				return map[string]float64{
-						utils.KVCacheUsage:      0.8,
-						utils.RequestWaitingNum: 15,
-						utils.RequestRunningNum: 10,
-						utils.TPOT:              120,
-						utils.TTFT:              210,
-					}, map[string]*dto.Histogram{
-						utils.TPOT: {
-							SampleSum:   &sum2,
-							SampleCount: &count2,
-						},
-						utils.TTFT: {
-							SampleSum:   &sum2,
-							SampleCount: &count2,
-						},
-					}
+					utils.KVCacheUsage:      0.8,
+					utils.RequestWaitingNum: 15,
+					utils.RequestRunningNum: 10,
+					utils.TPOT:              120,
+					utils.TTFT:              210,
+				}, map[string]*dto.Histogram{
+					utils.TPOT: {
+						SampleSum:   &sum2,
+						SampleCount: &count2,
+					},
+					utils.TTFT: {
+						SampleSum:   &sum2,
+						SampleCount: &count2,
+					},
+				}
 			},
 		},
 	}
@@ -430,7 +430,7 @@ func TestStoreAddOrUpdatePod(t *testing.T) {
 		podInfo := value.(*PodInfo)
 		for _, ms := range modelServers {
 			msName := utils.GetNamespaceName(ms)
-			assert.True(t, podInfo.modelServer.Contains(msName))
+			assert.True(t, podInfo.modelServer.Has(msName))
 		}
 		assert.Equal(t, podInfo.Pod.Name, pod.Name, "pod should be stored correctly")
 		assert.Equal(t, podInfo.modelServer.Len(), 2, "pod should reference both model servers")
@@ -444,8 +444,8 @@ func TestStoreAddOrUpdatePod(t *testing.T) {
 
 	if value, ok := s.pods.Load(podName); ok {
 		podInfo := value.(*PodInfo)
-		assert.True(t, podInfo.modelServer.Contains(utils.GetNamespaceName(ms1)))
-		assert.False(t, podInfo.modelServer.Contains(utils.GetNamespaceName(ms2)))
+		assert.True(t, podInfo.modelServer.Has(utils.GetNamespaceName(ms1)))
+		assert.False(t, podInfo.modelServer.Has(utils.GetNamespaceName(ms2)))
 	}
 
 	// Check model server references
@@ -487,7 +487,7 @@ func TestStoreDeletePod(t *testing.T) {
 	assert.NoError(t, err)
 	_, exists := s.pods.Load(podName)
 	assert.False(t, exists, "pod should be deleted from store")
-	assert.False(t, ms.pods.Contains(podName), "pod should be removed from modelServer set")
+	assert.False(t, ms.pods.Has(podName), "pod should be removed from modelServer set")
 
 	// Delete non-existent pod
 	err = s.DeletePod(types.NamespacedName{Namespace: "default", Name: "notfound"})
@@ -523,8 +523,8 @@ func TestStoreDeletePod_MultiModelServers(t *testing.T) {
 
 	err := s.DeletePod(podName)
 	assert.NoError(t, err)
-	assert.False(t, ms1.pods.Contains(podName))
-	assert.False(t, ms2.pods.Contains(podName))
+	assert.False(t, ms1.pods.Has(podName))
+	assert.False(t, ms2.pods.Has(podName))
 }
 
 func TestStoreAddOrUpdateModelServer(t *testing.T) {
@@ -545,7 +545,7 @@ func TestStoreAddOrUpdateModelServer(t *testing.T) {
 	if value, ok := s.modelServer.Load(msName); ok {
 		msInfo := value.(*modelServer)
 		assert.NotNil(t, msInfo)
-		assert.True(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod1"}))
+		assert.True(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod1"}))
 	} else {
 		t.Errorf("ModelServer not found in store")
 	}
@@ -557,8 +557,8 @@ func TestStoreAddOrUpdateModelServer(t *testing.T) {
 
 	if value, ok := s.modelServer.Load(msName); ok {
 		msInfo := value.(*modelServer)
-		assert.True(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod2"}))
-		assert.False(t, msInfo.pods.Contains(types.NamespacedName{Namespace: "default", Name: "pod1"}))
+		assert.True(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod2"}))
+		assert.False(t, msInfo.pods.Has(types.NamespacedName{Namespace: "default", Name: "pod1"}))
 	}
 }
 
@@ -589,7 +589,7 @@ func TestStoreDeleteModelServer(t *testing.T) {
 	assert.NoError(t, err)
 	_, exists := s.modelServer.Load(msName)
 	assert.False(t, exists, "modelServer should be deleted")
-	assert.False(t, podInfo.modelServer.Contains(msName), "modelServer ref should be removed from podInfo")
+	assert.False(t, podInfo.modelServer.Has(msName), "modelServer ref should be removed from podInfo")
 	_, podExists := s.pods.Load(podName)
 	assert.False(t, podExists, "pod should be deleted if no modelServer left")
 }
@@ -1806,7 +1806,7 @@ func TestAddOrUpdateModelRoute_UpdatesGatewayRoutes(t *testing.T) {
 	s.routeMutex.RLock()
 	_, exists := s.gatewayModelRoutes["default/gateway-a"]
 	assert.False(t, exists)
-	assert.True(t, s.gatewayModelRoutes["default/gateway-b"].Contains("default/route"))
+	assert.True(t, s.gatewayModelRoutes["default/gateway-b"].Has("default/route"))
 	s.routeMutex.RUnlock()
 }
 
@@ -1992,7 +1992,7 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 
 			models := podInfo.GetModels()
 			for _, m := range tc.wantModels {
-				assert.True(t, models.Contains(m), "model %s lost after pod update", m)
+				assert.True(t, models.Has(m), "model %s lost after pod update", m)
 			}
 			assert.Equal(t, len(tc.wantModels), models.Len(),
 				"model count changed after pod update")
@@ -2098,7 +2098,7 @@ func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 		"TTFT lost during model server reassignment")
 
 	models := podInfo.GetModels()
-	assert.True(t, models.Contains("model-a"), "model lost during model server reassignment")
+	assert.True(t, models.Has("model-a"), "model lost during model server reassignment")
 }
 
 func TestSelectDestination_EmptyTargets(t *testing.T) {

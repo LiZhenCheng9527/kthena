@@ -317,24 +317,47 @@ func (m *RendererManager) setFailed(r *renderer, msg string) {
 	klog.Errorf("Renderer for model %s failed: %s", r.model, msg)
 }
 
-// restartCrashed relaunches ready renderers whose subprocess exited, within
-// the restart budget.
+// restartCrashed relaunches renderers whose subprocess exited — whether they
+// crashed after becoming ready or failed during startup — within the restart
+// budget.
 func (m *RendererManager) restartCrashed() {
 	m.mu.Lock()
 	var toRestart []*renderer
 	for _, r := range m.renderers {
-		if r.status != StatusReady || r.done == nil {
-			continue
-		}
-		select {
-		case <-r.done:
+		switch r.status {
+		case StatusReady:
+			if r.done == nil {
+				continue
+			}
+			select {
+			case <-r.done:
+			default:
+				// Still running.
+				continue
+			}
+		case StatusFailed:
+			// Startup failures (spawn error, crash before healthy, or health
+			// timeout) are retried once the previous subprocess, if any, has
+			// fully exited.
+			if r.done != nil {
+				select {
+				case <-r.done:
+				default:
+					// The old process is still terminating; retry next tick.
+					continue
+				}
+			}
 		default:
 			continue
 		}
 		if r.restarts >= m.config.RendererMaxRestarts {
-			r.status = StatusFailed
-			r.lastErr = "restart budget exhausted"
-			klog.Errorf("Renderer for model %s failed: restart budget exhausted", r.model)
+			// Only log the transition once; already-failed renderers keep
+			// their original error message.
+			if r.status == StatusReady {
+				r.status = StatusFailed
+				r.lastErr = "restart budget exhausted"
+				klog.Errorf("Renderer for model %s failed: restart budget exhausted", r.model)
+			}
 			continue
 		}
 		r.restarts++
@@ -344,7 +367,7 @@ func (m *RendererManager) restartCrashed() {
 	m.mu.Unlock()
 
 	for _, r := range toRestart {
-		klog.Warningf("Renderer for model %s exited, restarting (%d/%d)",
+		klog.Warningf("Restarting renderer for model %s (%d/%d)",
 			r.model, r.restarts, m.config.RendererMaxRestarts)
 		go m.launch(r)
 	}

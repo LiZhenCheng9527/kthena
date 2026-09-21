@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -135,4 +136,48 @@ func TestRendererManagerNotReadyWhileLoading(t *testing.T) {
 	infos := m.Snapshot()
 	require.Len(t, infos, 1)
 	assert.Equal(t, string(StatusLoading), infos[0].Status)
+}
+
+func TestRendererManagerRestartsStartupFailures(t *testing.T) {
+	// A renderer that crashes on its first start is retried and recovers.
+	cfg := testConfig(t, 18340, map[string]string{"served": "some/source"})
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "started-once")
+	script := filepath.Join(dir, "renderer.sh")
+	require.NoError(t, os.WriteFile(script, []byte(fmt.Sprintf(
+		"#!/bin/sh\nif [ ! -f %q ]; then touch %q; exit 1; fi\nexec %q -test.run=TestHelperRenderer -- \"$@\"\n",
+		marker, marker, os.Args[0])), 0o755))
+	cfg.RendererCommand = []string{script}
+	m := NewRendererManager(cfg)
+	defer m.shutdown()
+
+	m.SetModels(map[string]struct{}{"served": {}})
+	waitForStatus(t, m, "served", StatusFailed)
+
+	m.restartCrashed()
+	waitForStatus(t, m, "served", StatusReady)
+	infos := m.Snapshot()
+	require.Len(t, infos, 1)
+	assert.Equal(t, 1, infos[0].Restarts)
+}
+
+func TestRendererManagerStartupRestartBudget(t *testing.T) {
+	// A renderer that always fails to start stops being retried once the
+	// restart budget is exhausted.
+	cfg := testConfig(t, 18350, map[string]string{"served": "some/source"})
+	cfg.RendererCommand = []string{filepath.Join(t.TempDir(), "no-such-renderer")}
+	cfg.RendererMaxRestarts = 2
+	m := NewRendererManager(cfg)
+	defer m.shutdown()
+
+	m.SetModels(map[string]struct{}{"served": {}})
+	waitForStatus(t, m, "served", StatusFailed)
+
+	for i := 0; i < 4; i++ {
+		m.restartCrashed()
+		waitForStatus(t, m, "served", StatusFailed)
+	}
+	infos := m.Snapshot()
+	require.Len(t, infos, 1)
+	assert.Equal(t, 2, infos[0].Restarts)
 }

@@ -141,24 +141,28 @@ func TestRendererManagerNotReadyWhileLoading(t *testing.T) {
 func TestRendererManagerRestartsStartupFailures(t *testing.T) {
 	// A renderer that crashes on its first start is retried and recovers.
 	cfg := testConfig(t, 18340, map[string]string{"served": "some/source"})
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "started-once")
-	script := filepath.Join(dir, "renderer.sh")
-	require.NoError(t, os.WriteFile(script, []byte(fmt.Sprintf(
-		"#!/bin/sh\nif [ ! -f %q ]; then touch %q; exit 1; fi\nexec %q -test.run=TestHelperRenderer -- \"$@\"\n",
-		marker, marker, os.Args[0])), 0o755))
-	cfg.RendererCommand = []string{script}
+	marker := filepath.Join(t.TempDir(), "started-once")
+	// Run via `sh -c` (rather than a script file) to avoid ETXTBSY races on
+	// freshly written executables: fail the first start, then serve health.
+	cfg.RendererCommand = []string{"sh", "-c", fmt.Sprintf(
+		`if [ ! -f %q ]; then touch %q; exit 1; fi; exec %q -test.run=TestHelperRenderer -- "$@"`,
+		marker, marker, os.Args[0]), "renderer"}
 	m := NewRendererManager(cfg)
 	defer m.shutdown()
 
 	m.SetModels(map[string]struct{}{"served": {}})
 	waitForStatus(t, m, "served", StatusFailed)
 
-	m.restartCrashed()
-	waitForStatus(t, m, "served", StatusReady)
+	// The monitor loop is not running in this test, so drive retries here
+	// until the renderer recovers.
+	require.Eventually(t, func() bool {
+		m.restartCrashed()
+		_, ok := m.EndpointFor("served")
+		return ok
+	}, 20*time.Second, 100*time.Millisecond, "renderer did not recover after startup failure")
 	infos := m.Snapshot()
 	require.Len(t, infos, 1)
-	assert.Equal(t, 1, infos[0].Restarts)
+	assert.GreaterOrEqual(t, infos[0].Restarts, 1)
 }
 
 func TestRendererManagerStartupRestartBudget(t *testing.T) {

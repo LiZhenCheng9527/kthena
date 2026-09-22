@@ -335,21 +335,21 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 		podRuntimeInspector: &fakePodRuntimeInspector{
 			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 				return map[string]float64{
-					utils.KVCacheUsage:      0.8,
-					utils.RequestWaitingNum: 15,
-					utils.RequestRunningNum: 10,
-					utils.TPOT:              120,
-					utils.TTFT:              210,
-				}, map[string]*dto.Histogram{
-					utils.TPOT: {
-						SampleSum:   &sum2,
-						SampleCount: &count2,
-					},
-					utils.TTFT: {
-						SampleSum:   &sum2,
-						SampleCount: &count2,
-					},
-				}
+						utils.KVCacheUsage:      0.8,
+						utils.RequestWaitingNum: 15,
+						utils.RequestRunningNum: 10,
+						utils.TPOT:              120,
+						utils.TTFT:              210,
+					}, map[string]*dto.Histogram{
+						utils.TPOT: {
+							SampleSum:   &sum2,
+							SampleCount: &count2,
+						},
+						utils.TTFT: {
+							SampleSum:   &sum2,
+							SampleCount: &count2,
+						},
+					}
 			},
 		},
 	}

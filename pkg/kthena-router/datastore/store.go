@@ -33,11 +33,11 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -1358,7 +1358,7 @@ func (s *store) removeModelRouteFromIndexesLocked(namespacedName string) (string
 
 				if routeSet, exists := s.gatewayModelRoutes[gatewayKey]; exists {
 					routeSet.Delete(namespacedName)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayModelRoutes, gatewayKey)
 					}
 				}
@@ -1918,7 +1918,7 @@ func (p *PodInfo) Contains(model string) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.models != nil && p.models.Contains(model)
+	return p.models != nil && p.models.Has(model)
 }
 
 // UpdateModels updates the models set with a new list of models
@@ -1975,7 +1975,7 @@ func (p *PodInfo) HasModelServer(ms types.NamespacedName) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.modelServer != nil && p.modelServer.Contains(ms)
+	return p.modelServer != nil && p.modelServer.Has(ms)
 }
 
 // GetModelServerCount returns the number of model servers
@@ -2404,7 +2404,7 @@ func (s *store) AddOrUpdateHTTPRoute(httpRoute *gatewayv1.HTTPRoute) error {
 
 				if routeSet, exists := s.gatewayRoutes[gatewayKey]; exists {
 					routeSet.Delete(key)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayRoutes, gatewayKey)
 					}
 				}
@@ -2447,7 +2447,7 @@ func (s *store) DeleteHTTPRoute(key string) error {
 		// Remove from gateway routes mapping
 		for gatewayKey, routeSet := range s.gatewayRoutes {
 			routeSet.Delete(key)
-			if routeSet.IsEmpty() {
+			if routeSet.Len() == 0 {
 				delete(s.gatewayRoutes, gatewayKey)
 			}
 		}

@@ -17,9 +17,9 @@ limitations under the License.
 package controller
 
 import (
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -45,7 +45,7 @@ func SyncStaticEndpoints(store datastore.Store, ms *aiv1alpha1.ModelServer) erro
 	}
 
 	endpointPods := make([]*corev1.Pod, 0, len(ms.Spec.Endpoints))
-	current := sets.NewWithLength[types.NamespacedName](len(ms.Spec.Endpoints))
+	current := make(sets.Set[types.NamespacedName], len(ms.Spec.Endpoints))
 	for _, endpoint := range ms.Spec.Endpoints {
 		pod := utils.EndpointPod(ms, endpoint)
 		endpointPods = append(endpointPods, pod)

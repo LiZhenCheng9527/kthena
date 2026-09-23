@@ -20,8 +20,8 @@ import (
 	"sync"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
-	"istio.io/istio/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type modelServer struct {

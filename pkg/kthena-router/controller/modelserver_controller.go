@@ -21,13 +21,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -202,7 +202,7 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 		return err
 	}
 
-	pods := sets.NewWithLength[types.NamespacedName](len(podList))
+	pods := make(sets.Set[types.NamespacedName], len(podList))
 	for _, pod := range podList {
 		if isPodReady(pod) {
 			pods.Insert(utils.GetNamespaceName(pod))

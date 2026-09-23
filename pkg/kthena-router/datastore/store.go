@@ -33,11 +33,11 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
-	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -222,6 +222,7 @@ type Store interface {
 	DeletePod(podName types.NamespacedName) error
 
 	// New methods for routing functionality
+	// MatchModelTarget matches a ModelRoute and selects a destination by rule weights.
 	MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, error)
 
 	// Model routing methods
@@ -944,6 +945,11 @@ func (s *store) DeleteModelServer(ms types.NamespacedName) error {
 			podInfo.RemoveModelServer(ms)
 			if podInfo.GetModelServerCount() == 0 {
 				s.pods.Delete(podName)
+				// Dispatched after the removal, as DeletePod does.
+				s.triggerCallbacks("Pod", EventData{
+					EventType: EventDelete,
+					Pod:       podName,
+				})
 			}
 		} else {
 			klog.Warningf("pod %s not found", podName)
@@ -1358,7 +1364,7 @@ func (s *store) removeModelRouteFromIndexesLocked(namespacedName string) (string
 
 				if routeSet, exists := s.gatewayModelRoutes[gatewayKey]; exists {
 					routeSet.Delete(namespacedName)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayModelRoutes, gatewayKey)
 					}
 				}
@@ -1414,6 +1420,22 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 }
 
 func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, error) {
+	mr, rule, isLora, err := s.matchModelRoute(model, req, gatewayKey)
+	if err != nil {
+		return ModelTarget{}, false, nil, err
+	}
+	dst, err := s.selectDestination(rule.TargetModels)
+	if err != nil {
+		return ModelTarget{}, false, nil, err
+	}
+	target, err := modelTargetFromDestination(mr.Namespace, dst)
+	if err != nil {
+		return ModelTarget{}, false, nil, err
+	}
+	return target, isLora, mr, nil
+}
+
+func (s *store) matchModelRoute(model string, req *http.Request, gatewayKey string) (*aiv1alpha1.ModelRoute, *aiv1alpha1.Rule, bool, error) {
 	s.routeMutex.RLock()
 	defer s.routeMutex.RUnlock()
 
@@ -1429,7 +1451,7 @@ func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey str
 		// Try to find routes by lora name
 		loraRoutes, ok := s.loraRoutes[model]
 		if !ok {
-			return ModelTarget{}, false, nil, fmt.Errorf("not found route rules for model %s", model)
+			return nil, nil, false, fmt.Errorf("not found route rules for model %s", model)
 		}
 		candidateRoutes = loraRoutes
 		isLora = true
@@ -1458,23 +1480,17 @@ func (s *store) MatchModelTarget(model string, req *http.Request, gatewayKey str
 		if err != nil {
 			continue // Try next ModelRoute
 		}
-
-		dst, err := s.selectDestination(rule.TargetModels)
-		if err != nil {
-			continue // Try next ModelRoute
+		if rule == nil || len(rule.TargetModels) == 0 {
+			continue
 		}
-
-		// Found a matching ModelRoute
-		target, err := modelTargetFromDestination(mr.Namespace, dst)
-		if err != nil {
-			klog.Warningf("failed to resolve target for ModelRoute %s/%s: %v", mr.Namespace, mr.Name, err)
-			continue // Try next ModelRoute
+		if _, err := toWeightedSlice(rule.TargetModels); err != nil {
+			continue
 		}
-		return target, isLora, mr, nil
+		return mr, rule, isLora, nil
 	}
 
 	// No matching ModelRoute found
-	return ModelTarget{}, false, nil, fmt.Errorf("no matching ModelRoute found for model %s", model)
+	return nil, nil, false, fmt.Errorf("no matching ModelRoute found for model %s", model)
 }
 
 func modelTargetFromDestination(namespace string, target *aiv1alpha1.TargetModel) (ModelTarget, error) {
@@ -1918,7 +1934,7 @@ func (p *PodInfo) Contains(model string) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.models != nil && p.models.Contains(model)
+	return p.models != nil && p.models.Has(model)
 }
 
 // UpdateModels updates the models set with a new list of models
@@ -1975,7 +1991,7 @@ func (p *PodInfo) HasModelServer(ms types.NamespacedName) bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.modelServer != nil && p.modelServer.Contains(ms)
+	return p.modelServer != nil && p.modelServer.Has(ms)
 }
 
 // GetModelServerCount returns the number of model servers
@@ -2404,7 +2420,7 @@ func (s *store) AddOrUpdateHTTPRoute(httpRoute *gatewayv1.HTTPRoute) error {
 
 				if routeSet, exists := s.gatewayRoutes[gatewayKey]; exists {
 					routeSet.Delete(key)
-					if routeSet.IsEmpty() {
+					if routeSet.Len() == 0 {
 						delete(s.gatewayRoutes, gatewayKey)
 					}
 				}
@@ -2447,7 +2463,7 @@ func (s *store) DeleteHTTPRoute(key string) error {
 		// Remove from gateway routes mapping
 		for gatewayKey, routeSet := range s.gatewayRoutes {
 			routeSet.Delete(key)
-			if routeSet.IsEmpty() {
+			if routeSet.Len() == 0 {
 				delete(s.gatewayRoutes, gatewayKey)
 			}
 		}

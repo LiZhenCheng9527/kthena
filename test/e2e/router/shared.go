@@ -2077,7 +2077,25 @@ func TestSessionStickyShared(t *testing.T, testCtx *routercontext.RouterTestCont
 		require.NotEmpty(t, deployName, "sticky backend pod %s missing app label", stickyPod)
 		err = testCtx.KubeClient.CoreV1().Pods(testNamespace).Delete(ctx, stickyPod, metav1.DeleteOptions{})
 		require.NoError(t, err, "expected to delete the sticky backend pod %s", stickyPod)
-		utils.WaitForDeploymentReady(t, ctx, testCtx.KubeClient, testNamespace, deployName, 3, defaultScalingTimeout)
+		// Deployment ReadyReplicas can still include the deleted pod until its status catches up.
+		require.Eventually(t, func() bool {
+			pods, err := testCtx.KubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "app=" + deployName,
+			})
+			if err != nil {
+				return false
+			}
+			ready := 0
+			for _, pod := range pods.Items {
+				if pod.Name == stickyPod {
+					return false
+				}
+				if pod.DeletionTimestamp == nil && utils.IsPodReady(pod) {
+					ready++
+				}
+			}
+			return ready >= 3
+		}, defaultScalingTimeout, time.Second, "deleted backend %s should be replaced by three ready pods", stickyPod)
 		newPod := utils.SessionStickySelectedPodAfterChatURLHeaders(t, testCtx.KubeClient, kthenaNamespace, routerConn.URL, created.Spec.ModelName, messages, hdr)
 		require.NotEmpty(t, newPod)
 		require.NotEqual(t, stickyPod, newPod, "after backend loss same session must not route to deleted pod name")

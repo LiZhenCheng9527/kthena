@@ -366,17 +366,20 @@ Always enable `kvcache-aware` together with at least one other score plugin (e.g
 
 **Plugin arguments:**
 
-| Parameter                     | Default | Description                                                                                        |
-| ----------------------------- | ------- | -------------------------------------------------------------------------------------------------- |
-| `blockSizeToHash`             | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching.                   |
-| `maxBlocksToMatch`            | 128     | Maximum number of blocks to process per request. Limits lookups.                                   |
-| `vllmTokenizerPort`           | 8000    | Port used to fetch the tokenizer from vLLM pods.                                                   |
-| `sglangTokenizerPort`         | 30000   | Port used to fetch the tokenizer from SGLang pods.                                                 |
-| `indexMode`                   | `redis` | Coordination backend: `redis` or `memory`.                                                         |
-| `kvEventsPort`                | 9080    | Memory mode only: port the router listens on for KV events pushed by runtime sidecars.             |
-| `runtimePort`                 | 9000    | Memory mode only: runtime sidecar port the router registers with (match the sidecar `--port`).     |
-| `registrationIntervalSeconds` | 30      | Memory mode only: how often the router re-registers (heartbeats) with each sidecar.                |
-| `registrationTTLSeconds`      | 90      | Memory mode only: registration TTL requested from sidecars; must exceed the registration interval. |
+| Parameter                     | Default  | Description                                                                                                                            |
+| ----------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `blockSizeToHash`             | 16       | Number of tokens per block. Must match the vLLM block size for optimal matching.                                                       |
+| `maxBlocksToMatch`            | 128      | Maximum number of blocks to process per request. Limits lookups.                                                                       |
+| `vllmTokenizerPort`           | 8000     | Port used to fetch the tokenizer from vLLM pods.                                                                                       |
+| `sglangTokenizerPort`         | 30000    | Port used to fetch the tokenizer from SGLang pods.                                                                                     |
+| `tokenizerService`            | disabled | Use the dedicated [Tokenizer Service](./tokenizer-service.md) instead of engine pods for prompt tokenization, with automatic fallback. |
+| `indexMode`                   | `redis`  | Coordination backend: `redis` or `memory`.                                                                                             |
+| `kvEventsPort`                | 9080     | Memory mode only: port the router listens on for KV events pushed by runtime sidecars.                                                 |
+| `runtimePort`                 | 9000     | Memory mode only: runtime sidecar port the router registers with (match the sidecar `--port`).                                         |
+| `registrationIntervalSeconds` | 30       | Memory mode only: how often the router re-registers (heartbeats) with each sidecar.                                                    |
+| `registrationTTLSeconds`      | 90       | Memory mode only: registration TTL requested from sidecars; must exceed the registration interval.                                     |
+
+> **Tip:** By default the plugin tokenizes prompts by calling the `/tokenize` endpoint of a backend engine pod, which adds load and latency to GPU pods. Consider enabling the [Tokenizer Service](./tokenizer-service.md) to offload tokenization to a dedicated, GPU-free component.
 
 **Helm values:**
 

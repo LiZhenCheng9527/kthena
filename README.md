@@ -132,7 +132,7 @@ Contributions are welcome! Here's how to get started:
 - **Issues**: Use GitHub Issues for bug reports and feature requests
 - **Pull Requests**: Ensure CI passes and include clear descriptions
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed guidelines.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed guidelines.啊u回复低价啊很多事
 
 ## Meeting
 

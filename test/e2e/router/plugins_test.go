@@ -30,16 +30,34 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestSchedulerPluginKVCacheAwareFixture verifies the Runtime records cache ownership from llm-d-sim events.
-func TestSchedulerPluginKVCacheAwareFixture(t *testing.T) {
-	redisCleanup := ensureRedis(t, testCtx.KubeClient, testNamespace)
+// TestSchedulerPluginKVCacheAware verifies requests prefer the replica with the matching KV cache.
+func TestSchedulerPluginKVCacheAware(t *testing.T) {
+	ctx := context.Background()
+	redisCleanup := ensureRedis(t, testCtx.KubeClient, kthenaNamespace)
 	t.Cleanup(redisCleanup)
 
-	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace)
-	warmedPod := pods[0]
+	pods := setupKVCacheFixture(t, testCtx.KubeClient, testNamespace, kthenaNamespace)
+	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-kvcache.yaml")
 
-	waitForKVCacheOwnership(t, warmedPod, plugincontext.ModelName,
-		"kthena-router-plugin-e2e-fixed-prompt-kvcache")
+	chatURL, metricsURL, restoreCfg := utils.ApplySchedulerConfig(t, testCtx.KubeClient, testCtx.KthenaClient, kthenaNamespace, testNamespace, schedulerOnlyKVCacheAware, kvCacheFixtureDeploymentName, plugincontext.ModelName)
+	t.Cleanup(restoreCfg)
+
+	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
+	prompt := "kthena-router-plugin-e2e-fixed-prompt-kvcache"
+	warmedPod := pods[0]
+	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
+
+	since := metav1.NewTime(time.Now())
+	utils.SendRouterChatRequests(t, chatURL, route.Spec.ModelName, prompt, kvCacheRoutingRequestCount)
+	time.Sleep(2 * time.Second)
+
+	warmedCount := utils.CountSelectedPodInRouterLogs(t, testCtx.KubeClient, kthenaNamespace, warmedPod.Name, since)
+	routed := utils.CountSelectedPodsInRouterLogs(t, testCtx.KubeClient, kthenaNamespace, since, pods)
+	t.Logf("kvcache-aware: warmed pod %s selected %d/%d (of %d log lines)", warmedPod.Name, warmedCount, kvCacheRoutingRequestCount, routed)
+	require.GreaterOrEqual(t, routed, kvCacheRoutingRequestCount/2, "expected access logs for routed requests")
+	require.GreaterOrEqual(t, float64(warmedCount)/float64(routed), 0.9)
+
+	waitForSchedulerPluginInMetrics(t, metricsURL, plugins.KVCacheAwarePluginName, "score")
 }
 
 // TestSchedulerPluginPrefixCache verifies repeated prompts stick to one pod after warmup.

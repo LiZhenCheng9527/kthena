@@ -53,6 +53,7 @@ const (
 	kvCacheOwnershipWaitTimeout    = 90 * time.Second
 	kvCacheMappingPrefix           = "vllm:kv:block"
 	kvCacheOwnershipPrefix         = "matrix:kv:block"
+	kvCacheRoutingRequestCount     = 20
 )
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
@@ -62,11 +63,26 @@ func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string
 	return ready
 }
 
-func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
+func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, redisNamespace string) []corev1.Pod {
 	t.Helper()
 	ctx := context.Background()
 	deployment := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-kvcache.yaml"))
 	deployment.Namespace = namespace
+	redisHostSet := false
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name != "kthena-runtime" {
+			continue
+		}
+		for j := range container.Env {
+			if container.Env[j].Name == "REDIS_HOST" {
+				container.Env[j].Value = fmt.Sprintf("redis-server.%s.svc.cluster.local", redisNamespace)
+				redisHostSet = true
+			}
+		}
+	}
+	require.True(t, redisHostSet, "KV-cache fixture Runtime needs REDIS_HOST")
+
 	_, err := kube.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
 	require.NoError(t, err, "create KV-cache fixture")
 	t.Cleanup(func() {
@@ -79,10 +95,10 @@ func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace stri
 	return pods
 }
 
-func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, model, prompt string) {
+func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model, prompt string) {
 	t.Helper()
 	localPort := utils.AllocateLocalPort(t)
-	pf, err := utils.SetupPortForward(pod.Namespace, "redis-server", localPort, "6379")
+	pf, err := utils.SetupPortForward(redisNamespace, "redis-server", localPort, "6379")
 	require.NoError(t, err, "port-forward to Redis")
 	defer pf.Close()
 
@@ -376,6 +392,20 @@ func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, 
 }
 
 const (
+	schedulerOnlyKVCacheAware = `scheduler:
+  pluginConfig:
+  - name: kvcache-aware
+    args:
+      blockSizeToHash: 8
+      maxBlocksToMatch: 128
+  plugins:
+    Filter:
+      enabled: []
+    Score:
+      enabled:
+        - name: kvcache-aware
+          weight: 1`
+
 	schedulerOnlyPrefixCache = `scheduler:
   pluginConfig:
   - name: prefix-cache

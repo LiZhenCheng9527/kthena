@@ -480,6 +480,83 @@ func TestRunScorePluginsEdgeCases(t *testing.T) {
 	}
 }
 
+// partialScorer returns only the scores it holds, like kvcache-aware does:
+// nil on a cold cache, and only the pods with cache hits otherwise.
+type partialScorer struct {
+	scores map[*datastore.PodInfo]int
+}
+
+func (p *partialScorer) Name() string { return "partial-scorer" }
+
+func (p *partialScorer) Score(_ *framework.Context, _ []*datastore.PodInfo) map[*datastore.PodInfo]int {
+	return p.scores
+}
+
+// TestRunScorePluginsKeepsUnscoredPods checks that a pod no score plugin
+// returns stays a candidate with score 0.
+func TestRunScorePluginsKeepsUnscoredPods(t *testing.T) {
+	podA := createTestPodInfo("pod-a")
+	podB := createTestPodInfo("pod-b")
+	pods := []*datastore.PodInfo{podA, podB}
+
+	tests := []struct {
+		name     string
+		plugins  []*scorePlugin
+		expected map[*datastore.PodInfo]int
+	}{
+		{
+			name:     "no score plugins",
+			plugins:  nil,
+			expected: map[*datastore.PodInfo]int{podA: 0, podB: 0},
+		},
+		{
+			name:     "plugin returns nil",
+			plugins:  []*scorePlugin{{plugin: &partialScorer{}, weight: 1}},
+			expected: map[*datastore.PodInfo]int{podA: 0, podB: 0},
+		},
+		{
+			name: "plugin scores one pod",
+			plugins: []*scorePlugin{{
+				plugin: &partialScorer{scores: map[*datastore.PodInfo]int{podA: 100}},
+				weight: 2,
+			}},
+			expected: map[*datastore.PodInfo]int{podA: 200, podB: 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheduler := &SchedulerImpl{store: datastore.New(), scorePlugins: tt.plugins}
+			ctx := &framework.Context{
+				Prompt:          &common.ChatMessage{},
+				ModelServerName: types.NamespacedName{Namespace: "default", Name: "test"},
+			}
+
+			assert.Equal(t, tt.expected, scheduler.RunScorePlugins(pods, ctx))
+		})
+	}
+}
+
+// TestScheduleWhenScorePluginReturnsNoScores checks that Schedule still picks
+// the filtered pods when the only score plugin returns nothing.
+func TestScheduleWhenScorePluginReturnsNoScores(t *testing.T) {
+	podA := createTestPodInfo("pod-a")
+	podB := createTestPodInfo("pod-b")
+
+	scheduler := &SchedulerImpl{
+		store:        datastore.New(),
+		scorePlugins: []*scorePlugin{{plugin: &partialScorer{}, weight: 1}},
+	}
+	ctx := &framework.Context{
+		Prompt:          &common.ChatMessage{Text: "hello"},
+		Model:           "test-model",
+		ModelServerName: types.NamespacedName{Namespace: "default", Name: "test"},
+	}
+
+	require.NoError(t, scheduler.Schedule(ctx, []*datastore.PodInfo{podA, podB}))
+	assert.ElementsMatch(t, []*datastore.PodInfo{podA, podB}, ctx.BestPods)
+}
+
 // Helper function to create test PodInfo
 func createTestPodInfo(name string) *datastore.PodInfo {
 	return &datastore.PodInfo{

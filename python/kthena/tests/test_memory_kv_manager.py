@@ -27,7 +27,7 @@ from kthena.runtime.memory_kv_manager import (
     KV_EVENTS_PATH,
     MemoryKVCacheManager,
 )
-from kthena.runtime.router_registry import RouterRegistry
+from kthena.runtime.router_registry import RouterRegistry, endpoint_matches_source
 
 
 def _make_manager(endpoints):
@@ -344,3 +344,37 @@ def test_router_registry_normalizes_trailing_slash():
     assert not registry.register("router-a", "http://10.0.0.5:9080")
     assert not registry.register("router-a", "http://10.0.0.5:9080/")
     assert registry.active_endpoints() == ["http://10.0.0.5:9080"]
+
+
+def test_router_registry_keyed_by_endpoint_host():
+    registry = RouterRegistry()
+    assert registry.register("router-a", "http://10.0.0.5:9080")
+    # Reusing another router's id does not replace its registration.
+    assert registry.register("router-a", "http://10.0.0.6:9080")
+    assert sorted(registry.active_endpoints()) == [
+        "http://10.0.0.5:9080", "http://10.0.0.6:9080"]
+
+    # A host holds a single registration regardless of the router id or port
+    # it announces, so registrations cannot pile up per host.
+    assert registry.register("router-b", "http://10.0.0.6:9081")
+    assert registry.register("router-c", "http://[::ffff:10.0.0.6]:9082")
+    assert sorted(registry.active_endpoints()) == [
+        "http://10.0.0.5:9080", "http://[::ffff:10.0.0.6]:9082"]
+
+
+@pytest.mark.parametrize("endpoint, source, expected", [
+    ("http://10.0.0.5:9080", "10.0.0.5", True),
+    ("https://10.0.0.5:9080", "10.0.0.5", True),
+    ("http://[fd00::5]:9080", "fd00:0::5", True),
+    ("http://10.0.0.5:9080", "::ffff:10.0.0.5", True),
+    ("http://[::ffff:10.0.0.5]:9080", "10.0.0.5", True),
+    ("http://10.0.0.5:9080", "10.0.0.6", False),
+    ("http://127.0.0.1:9080", "10.0.0.5", False),
+    ("http://router.svc:9080", "10.0.0.5", False),
+    ("http://10.0.0.5:9080", "testclient", False),
+    ("http://10.0.0.5:9080", None, False),
+    ("http://10.0.0.5:9080", "", False),
+    ("not-a-url", "10.0.0.5", False),
+])
+def test_endpoint_matches_source(endpoint, source, expected):
+    assert endpoint_matches_source(endpoint, source) is expected

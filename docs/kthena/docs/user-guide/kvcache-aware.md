@@ -39,6 +39,14 @@ Stale entries are garbage-collected in the router after 24 hours, and ownership 
 - Each router replica keeps its own copy of the index (memory usage scales with cached blocks × replicas).
 - If a runtime sidecar restarts, its in-memory engine-hash mapping is lost; entries it previously pushed age out via the router's 24h GC and pod-restart freshness checks.
 
+**Trust model of memory mode:**
+
+- The router accepts `POST /kvcache/events` only from the pod IP of a pod selected by a `ModelServer`, and only for that pod's own `pod_identifier`; other pushes are rejected with `403`. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so their pushes are rejected.
+- A runtime sidecar accepts `POST /kvcache/routers/register` only when the host of the announced endpoint is the IP the request comes from, so KV events are only pushed back to the registering router.
+- Store times are capped at the time the router receives them, each pod can hold at most `maxBlocksPerPod` blocks in the index, and the blocks of a pod are dropped when the pod is deleted.
+- Neither endpoint authenticates its callers; both rely on the cluster network being trusted. Restrict access to them with a NetworkPolicy if untrusted workloads share the cluster.
+- With a service mesh that redirects inbound traffic through a proxy (e.g. Istio), the receiving side sees the proxy instead of the caller's IP. Exclude `kvEventsPort` on router pods and the runtime sidecar port on model pods from inbound interception (e.g. with the `traffic.sidecar.istio.io/excludeInboundPorts` annotation).
+
 ## Prerequisites
 
 - **Redis** (Redis backend only): A Redis instance accessible by both the router and the runtime sidecars. Deploy Redis using the provided [redis-standalone.yaml](../assets/examples/redis/redis-standalone.yaml) example. Memory mode does not need Redis.
@@ -378,6 +386,7 @@ Always enable `kvcache-aware` together with at least one other score plugin (e.g
 | `runtimePort`                 | 9000     | Memory mode only: runtime sidecar port the router registers with (match the sidecar `--port`).                                         |
 | `registrationIntervalSeconds` | 30       | Memory mode only: how often the router re-registers (heartbeats) with each sidecar.                                                    |
 | `registrationTTLSeconds`      | 90       | Memory mode only: registration TTL requested from sidecars; must exceed the registration interval.                                     |
+| `maxBlocksPerPod`             | 1048576  | Memory mode only: maximum number of blocks one pod can hold in the router's index across all models; further blocks are ignored.       |
 
 > **Tip:** By default the plugin tokenizes prompts by calling the `/tokenize` endpoint of a backend engine pod, which adds load and latency to GPU pods. Consider enabling the [Tokenizer Service](./tokenizer-service.md) to offload tokenization to a dedicated, GPU-free component.
 
@@ -549,10 +558,13 @@ Redis backend (`indexMode: redis`):
 
 Memory backend (`indexMode: memory`):
 
-| Symptom                                                     | Possible Cause                                             | Resolution                                                                                             |
-| ----------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Plugin scores are always 0                                  | Sidecars cannot push to the router's KV events port        | Verify `POD_IP` is injected on the router deployment and the events port is reachable from model pods  |
-| Router log: `POD_IP environment variable is not set`        | Downward API env var missing on the router deployment      | Add `POD_IP` via the downward API (`status.podIP`) to the router container                             |
-| Runtime log: `Runtime is not in memory KV event sync mode`  | Sidecar not started in memory mode                         | Set `KV_EVENT_SYNC_MODE=memory` on the runtime sidecar                                                 |
-| Runtime log: `Failed to push KV events to router ...`       | Router events endpoint unreachable or router restarting    | Check network reachability; the sidecar resends a full snapshot on the router's next heartbeat         |
-| Scores stale after pod deletion                             | Missed removal events                                      | Entries are garbage-collected automatically; verify router logs for registration/heartbeat activity    |
+| Symptom                                                                    | Possible Cause                                                                                                                      | Resolution                                                                                                                         |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin scores are always 0                                                 | Sidecars cannot push to the router's KV events port                                                                                 | Verify `POD_IP` is injected on the router deployment and the events port is reachable from model pods                              |
+| Router log: `POD_IP environment variable is not set`                       | Downward API env var missing on the router deployment                                                                               | Add `POD_IP` via the downward API (`status.podIP`) to the router container                                                         |
+| Runtime log: `Runtime is not in memory KV event sync mode`                 | Sidecar not started in memory mode                                                                                                  | Set `KV_EVENT_SYNC_MODE=memory` on the runtime sidecar                                                                             |
+| Runtime log: `Failed to push KV events to router ...`                      | Router events endpoint unreachable or router restarting                                                                             | Check network reachability; the sidecar resends a full snapshot on the router's next heartbeat                                     |
+| Runtime log: `Failed to push KV events to router ...` with `403 Forbidden` | The router does not see the push as coming from a pod selected by a `ModelServer` (proxy in between, pod IP shared by several pods) | Make sure model pods have their own pod IP and exclude `kvEventsPort` from mesh inbound interception; see the trust model above    |
+| Runtime log: `Rejected router registration from ...`                       | The router's endpoint host is not the address the sidecar sees the registration coming from                                         | Make sure routers reach sidecars directly by pod IP and exclude the runtime port from mesh inbound interception                    |
+| Router log: `reached the limit of ... indexed blocks` (`-v=2`)             | The pod holds more blocks than `maxBlocksPerPod`                                                                                    | Raise `maxBlocksPerPod` if the engine KV cache legitimately holds more blocks                                                      |
+| Scores stale after pod deletion                                            | Missed removal events                                                                                                               | Blocks of deleted pods are dropped when the router observes the deletion; other stale entries are garbage-collected after 24 hours |

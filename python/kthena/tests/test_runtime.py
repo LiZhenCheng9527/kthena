@@ -13,9 +13,12 @@
 # limitations under the License.
 from types import SimpleNamespace
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from kthena.runtime.app import create_application, get_app_state
+from kthena.runtime.app import KV_SYNC_MODE_MEMORY, create_application, get_app_state
+from kthena.runtime.router_registry import RouterRegistry
 
 
 class _FakeAsyncResponse:
@@ -151,3 +154,38 @@ def test_load_lora_adapter_async_download_success(monkeypatch):
 
         # Assert (background task returns 202 Accepted)
         assert resp.status_code == 202
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint, client_ip, forwarded, expected_status", [
+    ("http://10.0.0.5:9080", "10.0.0.5", None, 200),
+    ("http://[fd00::5]:9080", "fd00::5", None, 200),
+    # The endpoint must point back at the caller.
+    ("http://10.0.0.6:9080", "10.0.0.5", None, 403),
+    ("http://router.kthena-system.svc:9080", "10.0.0.5", None, 403),
+    # Forwarding headers are not trusted.
+    ("http://10.0.0.6:9080", "10.0.0.5", "10.0.0.6", 403),
+    ("http://10.0.0.5:9080/path", "10.0.0.5", None, 400),
+    (None, "10.0.0.5", None, 400),
+    (["http://10.0.0.5:9080"], "10.0.0.5", None, 400),
+])
+async def test_register_router_requires_endpoint_of_caller(
+        monkeypatch, endpoint, client_ip, forwarded, expected_status):
+    app = create_application(_make_args())
+    state = get_app_state(app)
+    state.kv_sync_mode = KV_SYNC_MODE_MEMORY
+    registry = RouterRegistry()
+    monkeypatch.setattr("kthena.runtime.app.get_router_registry", lambda: registry)
+
+    headers = {"X-Forwarded-For": forwarded} if forwarded else {}
+    transport = httpx.ASGITransport(app=app, client=(client_ip, 41000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
+        resp = await client.post(
+            "/kvcache/routers/register",
+            json={"router_id": "router-a", "endpoint": endpoint},
+            headers=headers,
+        )
+
+    assert resp.status_code == expected_status, resp.text
+    expected_endpoints = [endpoint] if expected_status == 200 else []
+    assert registry.active_endpoints() == expected_endpoints

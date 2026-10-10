@@ -40,7 +40,9 @@ from kthena.runtime.memory_kv_manager import get_memory_kv_manager
 from kthena.runtime.redis_client import get_redis_client
 from kthena.runtime.router_registry import (
     DEFAULT_ROUTER_TTL_SECONDS,
+    endpoint_matches_source,
     get_router_registry,
+    validate_router_endpoint,
 )
 from kthena.runtime.standard import MetricStandard, EngineType
 from kthena.runtime.zmq_subscriber import get_vllm_zmq_subscriber
@@ -251,7 +253,8 @@ async def register_router(request: Request, background_tasks: BackgroundTasks) -
     Request body:
     - router_id: str - Unique identifier of the router instance (e.g. pod name)
     - endpoint: str - Base URL the runtime pushes KV events to,
-      e.g. "http://10.0.0.5:9080"
+      e.g. "http://10.0.0.5:9080"; its host must be the IP address the
+      registration request is sent from
     - generation: str (optional) - Identifier of the router process; changes
       when the router container restarts so a fresh snapshot is pushed
     - ttl_seconds: int (optional) - Registration TTL; routers must re-register
@@ -280,6 +283,20 @@ async def register_router(request: Request, background_tasks: BackgroundTasks) -
     endpoint = body.get("endpoint")
     generation = body.get("generation", "")
     ttl_seconds = body.get("ttl_seconds", DEFAULT_ROUTER_TTL_SECONDS)
+
+    if not isinstance(endpoint, str) or not validate_router_endpoint(endpoint):
+        raise HTTPException(
+            status_code=400, detail=f"invalid router endpoint: {endpoint!r}")
+    # Events are only pushed back to the caller itself: the endpoint host must
+    # be the IP the registration request comes from.
+    client_host = request.client.host if request.client else None
+    if not endpoint_matches_source(endpoint, client_host):
+        logger.warning(
+            "Rejected router registration from %s: endpoint %s does not "
+            "point at the caller", client_host, endpoint)
+        raise HTTPException(
+            status_code=403,
+            detail="endpoint host must be the IP address of the caller")
 
     try:
         needs_snapshot = get_router_registry().register(
@@ -427,7 +444,10 @@ def main() -> None:
             app,
             host=args.host,
             port=args.port,
-            log_level="info"
+            log_level="info",
+            # The router registration endpoint authorizes by the connection's
+            # source IP; never take it from client-supplied forwarding headers.
+            proxy_headers=False,
         )
 
     except KeyboardInterrupt:

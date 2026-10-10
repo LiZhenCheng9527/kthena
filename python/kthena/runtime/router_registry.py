@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ipaddress
 import logging
 import time
 from dataclasses import dataclass
@@ -49,6 +50,39 @@ def validate_router_endpoint(endpoint: str) -> bool:
     )
 
 
+def _normalize_ip(host: str) -> Optional[str]:
+    """Returns the canonical form of an IP literal, or None for non-IPs."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+def _endpoint_host(endpoint: str) -> str:
+    hostname = urlparse(endpoint).hostname or ""
+    return _normalize_ip(hostname) or hostname
+
+
+def endpoint_matches_source(endpoint: str, source_host: Optional[str]) -> bool:
+    """Whether endpoint points back at the host the registration came from.
+
+    Routers register the push endpoint built from their own pod IP, so the
+    endpoint host must be an IP literal equal to the connection's source IP.
+    This keeps a caller from directing KV event pushes to any other address.
+    """
+    if not source_host:
+        return False
+    try:
+        hostname = urlparse(endpoint).hostname
+    except ValueError:
+        return False
+    endpoint_ip = _normalize_ip(hostname) if hostname else None
+    return endpoint_ip is not None and endpoint_ip == _normalize_ip(source_host)
+
+
 @dataclass
 class RouterRegistration:
     router_id: str
@@ -64,6 +98,9 @@ class RouterRegistry:
 
     Routers re-register periodically (heartbeat); registrations that are not
     renewed within their TTL are pruned and no longer receive events.
+
+    Registrations are keyed by the endpoint host rather than the self-reported
+    router_id, so a registration can only replace one for the same host.
     """
 
     def __init__(self):
@@ -87,14 +124,16 @@ class RouterRegistry:
 
         ttl = min(max(int(ttl_seconds), 1), MAX_ROUTER_TTL_SECONDS)
         now = time.monotonic()
-        existing = self._routers.get(router_id)
+        key = _endpoint_host(endpoint)
+        existing = self._routers.get(key)
         needs_snapshot = (
             existing is None
+            or existing.router_id != router_id
             or existing.endpoint != endpoint
             or existing.generation != generation
             or existing.expires_at <= now
         )
-        self._routers[router_id] = RouterRegistration(
+        self._routers[key] = RouterRegistration(
             router_id=router_id,
             endpoint=endpoint,
             expires_at=now + ttl,
@@ -111,10 +150,10 @@ class RouterRegistry:
 
     def _prune(self) -> None:
         now = time.monotonic()
-        expired = [rid for rid, reg in self._routers.items() if reg.expires_at <= now]
-        for rid in expired:
-            logger.info(f"Router registration expired: id={rid}")
-            del self._routers[rid]
+        expired = [key for key, reg in self._routers.items() if reg.expires_at <= now]
+        for key in expired:
+            reg = self._routers.pop(key)
+            logger.info(f"Router registration expired: id={reg.router_id}, endpoint={reg.endpoint}")
 
 
 _router_registry: Optional[RouterRegistry] = None

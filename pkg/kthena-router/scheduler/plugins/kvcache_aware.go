@@ -43,6 +43,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -109,6 +110,9 @@ type KVCacheAwareArgs struct {
 	// RegistrationTTLSeconds is the registration TTL requested from sidecars;
 	// must exceed the registration interval (memory mode only, default 90).
 	RegistrationTTLSeconds int `yaml:"registrationTTLSeconds,omitempty"`
+	// MaxBlocksPerPod caps how many blocks a single pod may hold in the
+	// in-memory index across all models (memory mode only, default 1048576).
+	MaxBlocksPerPod int `yaml:"maxBlocksPerPod,omitempty"`
 	// TokenizerService configures the optional dedicated tokenizer service.
 	TokenizerService *TokenizerServiceArgs `yaml:"tokenizerService,omitempty"`
 }
@@ -211,7 +215,7 @@ func NewKVCacheAware(store datastore.Store, pluginArg runtime.RawExtension) *KVC
 	}
 
 	if indexMode == kvCacheIndexModeMemory {
-		plugin.memoryIndex = NewKVBlockMemoryIndex()
+		plugin.memoryIndex = NewKVBlockMemoryIndex(args.MaxBlocksPerPod)
 		plugin.startMemoryMode(store, args)
 		return plugin
 	}
@@ -270,8 +274,10 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 		}
 	}
 
-	startKVEventsServer(eventsPort, t.memoryIndex)
+	startKVEventsServer(eventsPort, t.memoryIndex, newKVEventSourceResolver(store).resolveOwner)
 	go t.memoryIndex.runGC(context.Background(), kvCacheGCInterval, kvCacheFieldFreshDuration)
+	// Drop a deleted pod's blocks right away instead of waiting for the GC.
+	store.RegisterCallback("Pod", t.onPodDeleted)
 
 	endpoint, err := routerSelfEndpoint(eventsPort)
 	if err != nil {
@@ -282,8 +288,15 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 
 	registrar := newKVRouterRegistrar(store, routerInstanceID(), endpoint, runtimePort, intervalSec, ttlSec)
 	go registrar.run(context.Background())
-	klog.Infof("KVCacheAware: memory mode active, eventsPort=%d, runtimePort=%d, interval=%ds, ttl=%ds, endpoint=%s",
-		eventsPort, runtimePort, intervalSec, ttlSec, endpoint)
+	klog.Infof("KVCacheAware: memory mode active, eventsPort=%d, runtimePort=%d, interval=%ds, ttl=%ds, maxBlocksPerPod=%d, endpoint=%s",
+		eventsPort, runtimePort, intervalSec, ttlSec, t.memoryIndex.maxBlocksPerOwner, endpoint)
+}
+
+// onPodDeleted drops the blocks of a pod removed from the datastore.
+func (t *KVCacheAware) onPodDeleted(data datastore.EventData) {
+	if data.EventType == datastore.EventDelete {
+		t.memoryIndex.RemoveOwner(cacheOwnerIdentifier(data.Pod))
+	}
 }
 
 func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {
@@ -519,7 +532,10 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 
 // podCacheOwnerIdentifier matches the pod.namespace Redis owner format written by the Runtime.
 func podCacheOwnerIdentifier(pod *datastore.PodInfo) string {
-	podName := pod.GetPodNamespacedName()
+	return cacheOwnerIdentifier(pod.GetPodNamespacedName())
+}
+
+func cacheOwnerIdentifier(podName types.NamespacedName) string {
 	return fmt.Sprintf("%s.%s", podName.Name, podName.Namespace)
 }
 

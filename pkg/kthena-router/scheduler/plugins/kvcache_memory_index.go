@@ -21,12 +21,17 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+
+	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
 
 // The in-memory KV index ("memory" index mode) replaces the shared Redis
@@ -47,6 +52,13 @@ import (
 //  4. Each router applies these events to its KVBlockMemoryIndex and scores
 //     pods by longest prefix match exactly like the Redis backend; a
 //     periodic GC drops entries not refreshed within the freshness window.
+//
+// The push endpoint trusts nothing in the payload about who sent it: the
+// sending pod is resolved from the connection's source IP against the pods
+// tracked by the datastore, so a caller can only write entries for itself.
+// Store times are capped at the receive time and every pod's share of the
+// index is bounded, so a misbehaving pod cannot pin entries past GC or grow
+// router memory without limit.
 //
 // KV event types pushed by the runtime sidecar in memory sync mode.
 // Kept in sync by hand with python/kthena/runtime/memory_kv_manager.py.
@@ -88,21 +100,38 @@ type ownerModelKey struct {
 	model string
 }
 
+// defaultMaxBlocksPerPod is the default upper bound of blocks a single pod may
+// hold in the index across all models. It is far above the KV cache capacity
+// of a single engine (1Mi blocks of 16 tokens is ~16.7M cached tokens) and only
+// exists to bound router memory.
+const defaultMaxBlocksPerPod = 1 << 20
+
 // KVBlockMemoryIndex is an in-memory replacement for the Redis block matrix.
 // It stores which pod (owner) currently caches which standardized token block
 // hash, per model, together with the time the block was last stored.
 type KVBlockMemoryIndex struct {
 	mu sync.RWMutex
+	// maxBlocksPerOwner caps ownerTotals; blocks stored beyond it are dropped.
+	maxBlocksPerOwner int
 	// model -> block hash -> owner(podName.namespace) -> unix seconds of last store
 	blocks map[string]map[uint64]map[string]int64
 	// reverse index for cleared/snapshot events
 	ownerBlocks map[ownerModelKey]map[uint64]struct{}
+	// owner -> number of blocks held across all models
+	ownerTotals map[string]int
 }
 
-func NewKVBlockMemoryIndex() *KVBlockMemoryIndex {
+// NewKVBlockMemoryIndex creates an index that holds at most maxBlocksPerOwner
+// blocks per pod; a non-positive value selects defaultMaxBlocksPerPod.
+func NewKVBlockMemoryIndex(maxBlocksPerOwner int) *KVBlockMemoryIndex {
+	if maxBlocksPerOwner <= 0 {
+		maxBlocksPerOwner = defaultMaxBlocksPerPod
+	}
 	return &KVBlockMemoryIndex{
-		blocks:      make(map[string]map[uint64]map[string]int64),
-		ownerBlocks: make(map[ownerModelKey]map[uint64]struct{}),
+		maxBlocksPerOwner: maxBlocksPerOwner,
+		blocks:            make(map[string]map[uint64]map[string]int64),
+		ownerBlocks:       make(map[ownerModelKey]map[uint64]struct{}),
+		ownerTotals:       make(map[string]int),
 	}
 }
 
@@ -115,6 +144,8 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	now := time.Now().Unix()
+	dropped := 0
 	for _, event := range payload.Events {
 		if len(event.Timestamps) > 0 && len(event.Timestamps) != len(event.BlockHashes) {
 			return fmt.Errorf("timestamps length %d does not match block_hashes length %d",
@@ -122,7 +153,7 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 		}
 		switch event.Type {
 		case kvEventStored:
-			idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps)
+			dropped += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
 		case kvEventRemoved:
 			idx.removeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes)
 		case kvEventCleared:
@@ -130,20 +161,34 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 		case kvEventSnapshot:
 			// A snapshot replaces everything known about this owner+model.
 			idx.clearLocked(payload.ModelName, payload.PodIdentifier)
-			idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps)
+			dropped += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
 		default:
 			return fmt.Errorf("unknown event type %q", event.Type)
 		}
 	}
+	if dropped > 0 {
+		klog.V(2).Infof("KVCacheAware: pod %s reached the limit of %d indexed blocks, dropped %d blocks of model %s",
+			payload.PodIdentifier, idx.maxBlocksPerOwner, dropped, payload.ModelName)
+	}
 	return nil
 }
 
-func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64, timestamp int64, timestamps []int64) {
-	if len(hashes) == 0 {
-		return
+// clampStoreTime returns the store time to record for a pushed block. Store
+// times come from the pushing pod: one in the future would never be garbage
+// collected and would defeat the restart freshness check, so it is capped at
+// the receive time; a missing one defaults to it.
+func clampStoreTime(ts, now int64) int64 {
+	if ts <= 0 || ts > now {
+		return now
 	}
-	if timestamp <= 0 {
-		timestamp = time.Now().Unix()
+	return ts
+}
+
+// storeLocked records hashes as owned by owner and returns how many new blocks
+// were dropped because owner reached maxBlocksPerOwner.
+func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64, timestamp int64, timestamps []int64, now int64) int {
+	if len(hashes) == 0 {
+		return 0
 	}
 	modelBlocks, ok := idx.blocks[model]
 	if !ok {
@@ -156,7 +201,16 @@ func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64,
 		owned = make(map[uint64]struct{})
 		idx.ownerBlocks[key] = owned
 	}
+	dropped := 0
 	for i, hash := range hashes {
+		if _, held := owned[hash]; !held {
+			if idx.ownerTotals[owner] >= idx.maxBlocksPerOwner {
+				dropped++
+				continue
+			}
+			owned[hash] = struct{}{}
+			idx.ownerTotals[owner]++
+		}
 		owners, ok := modelBlocks[hash]
 		if !ok {
 			owners = make(map[string]int64)
@@ -166,8 +220,24 @@ func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64,
 		if len(timestamps) > 0 && timestamps[i] > 0 {
 			ts = timestamps[i]
 		}
-		owners[owner] = ts
-		owned[hash] = struct{}{}
+		owners[owner] = clampStoreTime(ts, now)
+	}
+	// Everything may have been dropped; do not leave empty maps behind.
+	if len(owned) == 0 {
+		delete(idx.ownerBlocks, key)
+	}
+	if len(modelBlocks) == 0 {
+		delete(idx.blocks, model)
+	}
+	return dropped
+}
+
+// releaseLocked accounts for count blocks no longer held by owner.
+func (idx *KVBlockMemoryIndex) releaseLocked(owner string, count int) {
+	if remaining := idx.ownerTotals[owner] - count; remaining > 0 {
+		idx.ownerTotals[owner] = remaining
+	} else {
+		delete(idx.ownerTotals, owner)
 	}
 }
 
@@ -176,13 +246,17 @@ func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64
 	key := ownerModelKey{owner: owner, model: model}
 	owned := idx.ownerBlocks[key]
 	for _, hash := range hashes {
+		if _, held := owned[hash]; !held {
+			continue
+		}
+		delete(owned, hash)
+		idx.releaseLocked(owner, 1)
 		if owners, ok := modelBlocks[hash]; ok {
 			delete(owners, owner)
 			if len(owners) == 0 {
 				delete(modelBlocks, hash)
 			}
 		}
-		delete(owned, hash)
 	}
 	if len(owned) == 0 {
 		delete(idx.ownerBlocks, key)
@@ -195,7 +269,8 @@ func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64
 func (idx *KVBlockMemoryIndex) clearLocked(model, owner string) {
 	key := ownerModelKey{owner: owner, model: model}
 	modelBlocks := idx.blocks[model]
-	for hash := range idx.ownerBlocks[key] {
+	owned := idx.ownerBlocks[key]
+	for hash := range owned {
 		if owners, ok := modelBlocks[hash]; ok {
 			delete(owners, owner)
 			if len(owners) == 0 {
@@ -203,6 +278,7 @@ func (idx *KVBlockMemoryIndex) clearLocked(model, owner string) {
 			}
 		}
 	}
+	idx.releaseLocked(owner, len(owned))
 	delete(idx.ownerBlocks, key)
 	if len(modelBlocks) == 0 {
 		delete(idx.blocks, model)
@@ -274,6 +350,7 @@ func (idx *KVBlockMemoryIndex) gcStaleEntries(freshDuration time.Duration) {
 					key := ownerModelKey{owner: owner, model: model}
 					owned := idx.ownerBlocks[key]
 					delete(owned, hash)
+					idx.releaseLocked(owner, 1)
 					// Remove emptied parent entries so replaced pods do not
 					// leave empty maps behind indefinitely.
 					if len(owned) == 0 {
@@ -309,13 +386,149 @@ func (idx *KVBlockMemoryIndex) runGC(ctx context.Context, interval, freshDuratio
 // endpoint so oversized payloads cannot exhaust router memory.
 const kvEventsMaxBodyBytes = 4 << 20 // 4 MiB
 
+const (
+	// kvEventSourceCacheTTL bounds how long the source IP to pod mapping is
+	// reused before it is rebuilt from the datastore.
+	kvEventSourceCacheTTL = 30 * time.Second
+	// kvEventSourceMissRebuildInterval rate-limits rebuilds triggered by a
+	// push from an unknown source IP, e.g. a pod that was just added.
+	kvEventSourceMissRebuildInterval = time.Second
+)
+
+// podLister is the subset of datastore.Store used to resolve push sources.
+type podLister interface {
+	GetAllPods() map[types.NamespacedName]*datastore.PodInfo
+	GetPodInfo(podName types.NamespacedName) *datastore.PodInfo
+}
+
+// kvEventSourceResolver maps the source IP of a KV events push to the pod that
+// sent it. Only pods tracked by the datastore, i.e. selected by a ModelServer,
+// are accepted.
+type kvEventSourceResolver struct {
+	pods podLister
+
+	mu   sync.Mutex
+	byIP map[string]types.NamespacedName
+	// shared holds IPs used by more than one pod (e.g. hostNetwork pods on
+	// the same node); pushes from them cannot be attributed and are rejected.
+	shared      map[string]struct{}
+	lastRebuild time.Time
+}
+
+func newKVEventSourceResolver(pods podLister) *kvEventSourceResolver {
+	return &kvEventSourceResolver{pods: pods}
+}
+
+// resolveOwner returns the owner identifier of the pod whose IP matches the
+// host of remoteAddr.
+func (r *kvEventSourceResolver) resolveOwner(remoteAddr string) (string, error) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return "", fmt.Errorf("invalid remote address %q", remoteAddr)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", fmt.Errorf("invalid remote address %q", remoteAddr)
+	}
+	key := ip.String()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if time.Since(r.lastRebuild) >= kvEventSourceCacheTTL {
+		r.rebuildLocked()
+	}
+	pod := r.lookupLocked(key)
+	if pod == nil && time.Since(r.lastRebuild) >= kvEventSourceMissRebuildInterval {
+		r.rebuildLocked()
+		pod = r.lookupLocked(key)
+	}
+	if pod != nil {
+		return podCacheOwnerIdentifier(pod), nil
+	}
+	if _, ok := r.shared[key]; ok {
+		return "", fmt.Errorf("source IP %s is shared by multiple pods", key)
+	}
+	return "", fmt.Errorf("source IP %s is not a known model-serving pod", key)
+}
+
+func (r *kvEventSourceResolver) lookupLocked(ip string) *datastore.PodInfo {
+	name, ok := r.byIP[ip]
+	if !ok {
+		return nil
+	}
+	// Re-check the datastore so a cached entry of a deleted pod, or of a pod
+	// whose IP was reassigned, is never matched.
+	info := r.pods.GetPodInfo(name)
+	if info == nil || !slices.Contains(podIPs(info.GetPod()), ip) {
+		return nil
+	}
+	return info
+}
+
+func (r *kvEventSourceResolver) rebuildLocked() {
+	byIP := make(map[string]types.NamespacedName)
+	shared := make(map[string]struct{})
+	for name, info := range r.pods.GetAllPods() {
+		for _, ip := range podIPs(info.GetPod()) {
+			if _, ok := shared[ip]; ok {
+				continue
+			}
+			if other, ok := byIP[ip]; ok && other != name {
+				delete(byIP, ip)
+				shared[ip] = struct{}{}
+				continue
+			}
+			byIP[ip] = name
+		}
+	}
+	r.byIP = byIP
+	r.shared = shared
+	r.lastRebuild = time.Now()
+}
+
+// podIPs returns the normalized IPs assigned to pod.
+func podIPs(pod *corev1.Pod) []string {
+	if pod == nil {
+		return nil
+	}
+	var ips []string
+	add := func(s string) {
+		if ip := net.ParseIP(s); ip != nil {
+			ips = append(ips, ip.String())
+		}
+	}
+	add(pod.Status.PodIP)
+	for _, podIP := range pod.Status.PodIPs {
+		add(podIP.IP)
+	}
+	return ips
+}
+
 // kvEventsHandler handles POST /kvcache/events pushed by runtime sidecars.
-func kvEventsHandler(index *KVBlockMemoryIndex) gin.HandlerFunc {
+// resolveOwner maps the connection's remote address to the sending pod; the
+// payload's pod_identifier must match it.
+func kvEventsHandler(index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Use the TCP peer address, never c.ClientIP(): forwarding headers
+		// are set by the caller and would let it choose its identity.
+		owner, err := resolveOwner(c.Request.RemoteAddr)
+		if err != nil {
+			klog.V(2).Infof("KVCacheAware: rejected KV events push from %s: %v", c.Request.RemoteAddr, err)
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, kvEventsMaxBodyBytes)
 		var payload KVEventPayload
 		if err := c.ShouldBindJSON(&payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload: " + err.Error()})
+			return
+		}
+		if payload.PodIdentifier != owner {
+			klog.V(2).Infof("KVCacheAware: rejected KV events push from %s: pod_identifier %q does not match sending pod %q",
+				c.Request.RemoteAddr, payload.PodIdentifier, owner)
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": fmt.Sprintf("pod_identifier %q does not match the sending pod %q", payload.PodIdentifier, owner),
+			})
 			return
 		}
 		if err := index.Apply(&payload); err != nil {
@@ -332,10 +545,10 @@ func kvEventsHandler(index *KVBlockMemoryIndex) gin.HandlerFunc {
 // from runtime sidecars when the plugin runs in memory index mode. The listener
 // is bound synchronously so a startup failure (e.g. the port is already in use)
 // fails the router instead of leaving it running without an index feed.
-func startKVEventsServer(port int, index *KVBlockMemoryIndex) {
+func startKVEventsServer(port int, index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	engine.POST("/kvcache/events", kvEventsHandler(index))
+	engine.POST("/kvcache/events", kvEventsHandler(index, resolveOwner))
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),

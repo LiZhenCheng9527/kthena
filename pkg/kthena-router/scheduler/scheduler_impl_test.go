@@ -492,8 +492,7 @@ func (p *partialScorer) Score(_ *framework.Context, _ []*datastore.PodInfo) map[
 	return p.scores
 }
 
-// TestRunScorePluginsKeepsUnscoredPods checks that a pod no score plugin
-// returns stays a candidate with score 0.
+// TestRunScorePluginsKeepsUnscoredPods checks that a pod unscored by every plugin remains a candidate with score 0.
 func TestRunScorePluginsKeepsUnscoredPods(t *testing.T) {
 	podA := createTestPodInfo("pod-a")
 	podB := createTestPodInfo("pod-b")

@@ -43,7 +43,7 @@ func TestSchedulerPluginKVCacheAware(t *testing.T) {
 	t.Cleanup(restoreCfg)
 
 	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-kvcache.yaml")
-	prompt := "kthena-router-plugin-e2e-fixed-prompt-kvcache"
+	prompt := "kthena kvcache routing test"
 	warmedPod := pods[0]
 	waitForKVCacheOwnership(t, warmedPod, kthenaNamespace, route.Spec.ModelName, prompt)
 

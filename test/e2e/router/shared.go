@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
@@ -145,6 +146,17 @@ func ensureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace string
 	require.NotEmpty(t, redisDeploymentName, "Redis Deployment not found in manifest")
 
 	utils.WaitForDeploymentReady(t, ctx, kubeClient, namespace, redisDeploymentName, 1, 2*time.Minute)
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForward(namespace, "redis-server", localPort, "6379")
+	require.NoError(t, err, "Failed to port-forward Redis")
+	defer pf.Close()
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:" + localPort})
+	defer client.Close()
+	require.Eventually(t, func() bool {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return client.Ping(pingCtx).Err() == nil
+	}, 30*time.Second, time.Second, "Redis did not accept connections")
 	t.Log("Redis is ready")
 
 	return func() {

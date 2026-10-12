@@ -278,8 +278,6 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 	store.RegisterCallback("Pod", resolver.invalidate)
 	startKVEventsServer(eventsPort, t.memoryIndex, resolver.resolveOwner)
 	go t.memoryIndex.runGC(context.Background(), kvCacheGCInterval, kvCacheFieldFreshDuration)
-	// Drop a deleted pod's blocks right away instead of waiting for the GC.
-	store.RegisterCallback("Pod", t.onPodDeleted)
 
 	endpoint, err := routerSelfEndpoint(eventsPort)
 	if err != nil {
@@ -288,17 +286,10 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 		return
 	}
 
-	registrar := newKVRouterRegistrar(store, routerInstanceID(), endpoint, runtimePort, intervalSec, ttlSec)
+	registrar := newKVRouterRegistrar(store, t.memoryIndex, routerInstanceID(), endpoint, runtimePort, intervalSec, ttlSec)
 	go registrar.run(context.Background())
 	klog.Infof("KVCacheAware: memory mode active, eventsPort=%d, runtimePort=%d, interval=%ds, ttl=%ds, maxBlocksPerPod=%d, endpoint=%s",
 		eventsPort, runtimePort, intervalSec, ttlSec, t.memoryIndex.maxBlocksPerOwner, endpoint)
-}
-
-// onPodDeleted drops the blocks of a pod removed from the datastore.
-func (t *KVCacheAware) onPodDeleted(data datastore.EventData) {
-	if data.EventType == datastore.EventDelete {
-		t.memoryIndex.RemoveOwner(cacheOwnerIdentifier(data.Pod))
-	}
 }
 
 func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {

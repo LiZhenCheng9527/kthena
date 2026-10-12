@@ -589,6 +589,7 @@ func (f *fakePodLister) add(namespace, name string, ips ...string) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	if len(ips) > 0 {
 		pod.Status.PodIP = ips[0]
+		pod.Status.Phase = corev1.PodRunning
 	}
 	for _, ip := range ips {
 		pod.Status.PodIPs = append(pod.Status.PodIPs, corev1.PodIP{IP: ip})
@@ -794,29 +795,5 @@ func TestKVEventsHandler(t *testing.T) {
 	got := idx.GetBlockOwners("qwen", []uint64{42, 43, 44, 45})
 	if len(got) != 1 || got[42]["pod-1.default"] == "" {
 		t.Fatalf("expected only the block of the valid payload to be stored, got %v", got)
-	}
-}
-
-func TestKVCacheAware_OnPodDeleted(t *testing.T) {
-	idx := NewKVBlockMemoryIndex(0)
-	p := KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "qwen",
-		Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}}},
-	}
-	if err := idx.Apply(&p); err != nil {
-		t.Fatalf("Apply() failed: %v", err)
-	}
-	plugin := &KVCacheAware{indexMode: kvCacheIndexModeMemory, memoryIndex: idx}
-	pod := types.NamespacedName{Namespace: "default", Name: "pod-1"}
-
-	plugin.onPodDeleted(datastore.EventData{EventType: datastore.EventUpdate, Pod: pod})
-	if got := idx.GetBlockOwners("qwen", []uint64{1}); len(got) != 1 {
-		t.Fatalf("expected blocks to survive a pod update, got %v", got)
-	}
-
-	plugin.onPodDeleted(datastore.EventData{EventType: datastore.EventDelete, Pod: pod})
-	if got := idx.GetBlockOwners("qwen", []uint64{1}); len(got) != 0 {
-		t.Fatalf("expected blocks of the deleted pod to be removed, got %v", got)
 	}
 }

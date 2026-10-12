@@ -313,7 +313,7 @@ func (idx *KVBlockMemoryIndex) GetBlockOwners(model string, hashes []uint64) map
 }
 
 // RemoveOwner drops every block owned by the given pod identifier across all
-// models, e.g. when the pod is deleted.
+// models, e.g. once the pod is gone.
 func (idx *KVBlockMemoryIndex) RemoveOwner(owner string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -322,6 +322,17 @@ func (idx *KVBlockMemoryIndex) RemoveOwner(owner string) {
 			idx.clearLocked(key.model, key.owner)
 		}
 	}
+}
+
+// Owners returns the pod identifiers that hold at least one block.
+func (idx *KVBlockMemoryIndex) Owners() []string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	owners := make([]string, 0, len(idx.ownerTotals))
+	for owner := range idx.ownerTotals {
+		owners = append(owners, owner)
+	}
+	return owners
 }
 
 // gcStaleEntries drops ownership entries older than freshDuration, mirroring

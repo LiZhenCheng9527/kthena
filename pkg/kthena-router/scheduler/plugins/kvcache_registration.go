@@ -31,9 +31,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-
-	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
 
 const (
@@ -64,9 +63,12 @@ type routerRegistrationRequest struct {
 // kvRouterRegistrar periodically registers this router instance with the
 // runtime sidecar of every known model-serving pod, so the sidecars can push
 // KV cache events back. Registration doubles as a heartbeat: sidecars expire
-// routers that stop re-registering within the TTL.
+// routers that stop re-registering within the TTL. The router in turn drops
+// the blocks of a pod once it has not registered with it for that long, see
+// dropLapsedOwners.
 type kvRouterRegistrar struct {
-	store       datastore.Store
+	store       podLister
+	index       *KVBlockMemoryIndex
 	routerID    string
 	generation  string // unique per router process, see routerRegistrationRequest
 	endpoint    string // base URL the sidecar pushes events to, e.g. http://10.0.0.5:9080
@@ -74,12 +76,18 @@ type kvRouterRegistrar struct {
 	interval    time.Duration
 	ttlSeconds  int
 	client      *http.Client
+
+	mu sync.Mutex
+	// lastAttempt is when a registration was last sent to each pod, keyed by
+	// cache owner identifier.
+	lastAttempt map[string]time.Time
 }
 
-func newKVRouterRegistrar(store datastore.Store, routerID, endpoint string,
+func newKVRouterRegistrar(store podLister, index *KVBlockMemoryIndex, routerID, endpoint string,
 	runtimePort, intervalSeconds, ttlSeconds int) *kvRouterRegistrar {
 	return &kvRouterRegistrar{
 		store:       store,
+		index:       index,
 		routerID:    routerID,
 		generation:  newProcessGeneration(),
 		endpoint:    endpoint,
@@ -87,6 +95,7 @@ func newKVRouterRegistrar(store datastore.Store, routerID, endpoint string,
 		interval:    time.Duration(intervalSeconds) * time.Second,
 		ttlSeconds:  ttlSeconds,
 		client:      &http.Client{Timeout: 3 * time.Second},
+		lastAttempt: make(map[string]time.Time),
 	}
 }
 
@@ -130,10 +139,9 @@ func routerInstanceID() string {
 	return name
 }
 
-// run registers with all known pods immediately and then on every tick until
-// ctx is done.
+// run sweeps immediately and then on every tick until ctx is done.
 func (r *kvRouterRegistrar) run(ctx context.Context) {
-	r.registerAll(ctx)
+	r.sweep(ctx)
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
@@ -141,9 +149,16 @@ func (r *kvRouterRegistrar) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.registerAll(ctx)
+			r.sweep(ctx)
 		}
 	}
+}
+
+// sweep registers with all known pods, then drops the blocks of pods whose
+// registration has lapsed.
+func (r *kvRouterRegistrar) sweep(ctx context.Context) {
+	r.registerAll(ctx)
+	r.dropLapsedOwners(time.Now())
 }
 
 func (r *kvRouterRegistrar) registerAll(ctx context.Context) {
@@ -156,30 +171,77 @@ func (r *kvRouterRegistrar) registerAll(ctx context.Context) {
 	// Bounded fan-out: registrations run concurrently so a sweep over many
 	// pods without a reachable sidecar stays well below the TTL.
 	sem := make(chan struct{}, maxConcurrentRegistrations)
-	for _, podInfo := range pods {
+	for podName, podInfo := range pods {
 		pod := podInfo.GetPod()
 		if pod == nil || pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(namespace, name, podIP string) {
+		go func(podName types.NamespacedName, podIP string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			r.recordAttempt(cacheOwnerIdentifier(podName))
 			if err := r.registerWithPod(ctx, podIP); err != nil {
 				// Pods without a runtime sidecar (or not in memory mode) are expected
 				// to fail; keep this quiet.
-				klog.V(4).Infof("KVCacheAware: registration with pod %s/%s (%s) failed: %v",
-					namespace, name, podIP, err)
+				klog.V(4).Infof("KVCacheAware: registration with pod %s (%s) failed: %v",
+					podName, podIP, err)
 				return
 			}
 			mu.Lock()
 			registered++
 			mu.Unlock()
-		}(pod.Namespace, pod.Name, pod.Status.PodIP)
+		}(podName, pod.Status.PodIP)
 	}
 	wg.Wait()
 	klog.V(4).Infof("KVCacheAware: registered with %d/%d runtime sidecars", registered, len(pods))
+}
+
+func (r *kvRouterRegistrar) recordAttempt(owner string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastAttempt[owner] = time.Now()
+}
+
+// registrationLapse is how long after the last registration attempt with a
+// pod its sidecar has certainly expired this router: the TTL, plus the
+// request timeout as the request may be received until then, plus one
+// interval of slack for a sidecar that handles the request late.
+func (r *kvRouterRegistrar) registrationLapse() time.Duration {
+	return time.Duration(r.ttlSeconds)*time.Second + r.client.Timeout + r.interval
+}
+
+// dropLapsedOwners drops the blocks of every pod this router has not tried to
+// register with within registrationLapse. A pod leaves the sweep when it
+// leaves the datastore, either because it was deleted or because it is
+// temporarily not Ready.
+//
+// Blocks are kept until the registration lapsed, not dropped as soon as the
+// pod leaves: a sidecar only resends its full block set to a router that
+// registers anew (or after a failed push), so a pod that is Ready again
+// before its registration expired would otherwise stay without blocks. Once
+// the registration has lapsed, a pod that comes back always gets a snapshot.
+func (r *kvRouterRegistrar) dropLapsedOwners(now time.Time) {
+	lapse := r.registrationLapse()
+	var lapsed []string
+	r.mu.Lock()
+	for owner, last := range r.lastAttempt {
+		if now.Sub(last) >= lapse {
+			delete(r.lastAttempt, owner)
+		}
+	}
+	for _, owner := range r.index.Owners() {
+		if _, ok := r.lastAttempt[owner]; !ok {
+			lapsed = append(lapsed, owner)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, owner := range lapsed {
+		r.index.RemoveOwner(owner)
+		klog.V(4).Infof("KVCacheAware: dropped the blocks of pod %s, not registered with for %s", owner, lapse)
+	}
 }
 
 func (r *kvRouterRegistrar) registerWithPod(ctx context.Context, podIP string) error {

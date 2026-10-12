@@ -32,6 +32,8 @@ Because the router may run with multiple replicas, each router instance **active
 
 Stale entries are garbage-collected in the router after 24 hours, and ownership written before the owning pod's containers last restarted is ignored, same as in Redis mode.
 
+When a pod is deleted or stops being Ready, the router stops registering with it and drops its blocks once that registration has lapsed, within about 2.5 minutes with the default interval and TTL. A pod that is Ready again before then keeps its warm cache; one that comes back later receives a full snapshot when the router registers with it again.
+
 **Trade-offs of memory mode:**
 
 - Scoring lookups are local memory reads, removing the Redis round-trip latency from the request path.
@@ -43,7 +45,7 @@ Stale entries are garbage-collected in the router after 24 hours, and ownership 
 
 - The router accepts `POST /kvcache/events` only from the pod IP of a pod selected by a `ModelServer`, and only for that pod's own `pod_identifier`; other pushes are rejected with `403`. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so their pushes are rejected.
 - A runtime sidecar accepts `POST /kvcache/routers/register` only when the host of the announced endpoint is the IP the request comes from, so KV events are only pushed back to the registering router.
-- Store times are capped at the time the router receives them, each pod can hold at most `maxBlocksPerPod` blocks in the index, and the blocks of a pod are dropped when the pod is deleted.
+- Store times are capped at the time the router receives them, each pod can hold at most `maxBlocksPerPod` blocks in the index, and the blocks of a pod are dropped once its registration lapses after the pod is deleted or stops being Ready.
 - Neither endpoint authenticates its callers; both rely on the cluster network being trusted. Restrict access to them with a NetworkPolicy if untrusted workloads share the cluster.
 - With a service mesh that redirects inbound traffic through a proxy (e.g. Istio), the receiving side sees the proxy instead of the caller's IP. Exclude `kvEventsPort` on router pods and the runtime sidecar port on model pods from inbound interception (e.g. with the `traffic.sidecar.istio.io/excludeInboundPorts` annotation).
 
@@ -567,4 +569,4 @@ Memory backend (`indexMode: memory`):
 | Runtime log: `Failed to push KV events to router ...` with `403 Forbidden` | The router does not see the push as coming from a pod selected by a `ModelServer` (proxy in between, pod IP shared by several pods) | Make sure model pods have their own pod IP and exclude `kvEventsPort` from mesh inbound interception; see the trust model above    |
 | Runtime log: `Rejected router registration from ...`                       | The router's endpoint host is not the address the sidecar sees the registration coming from                                         | Make sure routers reach sidecars directly by pod IP and exclude the runtime port from mesh inbound interception                    |
 | Router log: `reached the limit of ... indexed blocks` (`-v=2`)             | The pod holds more blocks than `maxBlocksPerPod`                                                                                    | Raise `maxBlocksPerPod` if the engine KV cache legitimately holds more blocks                                                      |
-| Scores stale after pod deletion                                            | Missed removal events                                                                                                               | Blocks of deleted pods are dropped when the router observes the deletion; other stale entries are garbage-collected after 24 hours |
+| Scores stale after pod deletion                                            | Missed removal events                                                                                                               | Blocks of deleted or not Ready pods are dropped within about 2.5 minutes; other stale entries are garbage-collected after 24 hours |

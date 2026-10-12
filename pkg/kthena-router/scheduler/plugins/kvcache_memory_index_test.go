@@ -20,9 +20,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -795,5 +798,131 @@ func TestKVEventsHandler(t *testing.T) {
 	got := idx.GetBlockOwners("qwen", []uint64{42, 43, 44, 45})
 	if len(got) != 1 || got[42]["pod-1.default"] == "" {
 		t.Fatalf("expected only the block of the valid payload to be stored, got %v", got)
+	}
+}
+
+func TestKVEventsServer_ResolvesSourceOncePerConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	idx := NewKVBlockMemoryIndex(0)
+	var (
+		mu         sync.Mutex
+		resolves   int
+		resolveErr bool
+	)
+	resolveOwner := func(remoteAddr string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		resolves++
+		if resolveErr {
+			return "", fmt.Errorf("unknown source %s", remoteAddr)
+		}
+		return "pod-1.default", nil
+	}
+	ts := httptest.NewUnstartedServer(nil)
+	ts.Config = newKVEventsServer("", idx, resolveOwner)
+	ts.Start()
+	defer ts.Close()
+	client := ts.Client()
+
+	// push sends one stored event over the client's keep-alive connection and
+	// reports whether an existing connection was reused for it.
+	push := func(t *testing.T, podIdentifier string, hash uint64) (int, bool) {
+		t.Helper()
+		body, err := json.Marshal(KVEventPayload{
+			PodIdentifier: podIdentifier,
+			ModelName:     "qwen",
+			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{hash}}},
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal body: %v", err)
+		}
+		var reused bool
+		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/kvcache/events", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("push failed: %v", err)
+		}
+		// Drain the body so the connection is kept for the next push.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, reused
+	}
+
+	steps := []struct {
+		name          string
+		resolveErr    bool
+		newConn       bool
+		podIdentifier string
+		wantStatus    int
+		wantResolves  int
+	}{
+		{
+			name:          "first push of a connection from an unknown source",
+			resolveErr:    true,
+			newConn:       true,
+			podIdentifier: "pod-1.default",
+			wantStatus:    http.StatusForbidden,
+			wantResolves:  1,
+		},
+		{
+			name:          "failed resolution is retried on the next push",
+			podIdentifier: "pod-1.default",
+			wantStatus:    http.StatusOK,
+			wantResolves:  2,
+		},
+		{
+			name:          "resolved source is reused for the connection",
+			podIdentifier: "pod-1.default",
+			wantStatus:    http.StatusOK,
+			wantResolves:  2,
+		},
+		{
+			name:          "pod identifier is still checked on every push",
+			podIdentifier: "pod-2.default",
+			wantStatus:    http.StatusForbidden,
+			wantResolves:  2,
+		},
+		{
+			name:          "new connection is resolved again",
+			newConn:       true,
+			podIdentifier: "pod-1.default",
+			wantStatus:    http.StatusOK,
+			wantResolves:  3,
+		},
+	}
+	for i, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			mu.Lock()
+			resolveErr = step.resolveErr
+			mu.Unlock()
+			if step.newConn {
+				client.CloseIdleConnections()
+			}
+
+			status, reused := push(t, step.podIdentifier, uint64(i))
+			if reused == step.newConn {
+				t.Fatalf("connection reused = %v, want %v", reused, !step.newConn)
+			}
+			if status != step.wantStatus {
+				t.Fatalf("status = %d, want %d", status, step.wantStatus)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if resolves != step.wantResolves {
+				t.Fatalf("source resolved %d times, want %d", resolves, step.wantResolves)
+			}
+		})
+	}
+
+	got := idx.GetBlockOwners("qwen", []uint64{0, 1, 2, 3, 4})
+	if len(got) != 3 || got[1] == nil || got[2] == nil || got[4] == nil {
+		t.Fatalf("expected the blocks of the accepted pushes to be stored, got %v", got)
 	}
 }

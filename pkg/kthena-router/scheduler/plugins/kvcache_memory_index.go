@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -55,7 +56,8 @@ import (
 //
 // The push endpoint trusts nothing in the payload about who sent it: the
 // sending pod is resolved from the connection's source IP against the pods
-// tracked by the datastore, so a caller can only write entries for itself.
+// tracked by the datastore, once per connection, so a caller can only write
+// entries for itself.
 // Store times are capped at the receive time and every pod's share of the
 // index is bounded, so a misbehaving pod cannot pin entries past GC or grow
 // router memory without limit.
@@ -529,14 +531,51 @@ func podIPs(pod *corev1.Pod) []string {
 	return ips
 }
 
+// kvEventsConnKey is the context key of a kvEventsConn.
+type kvEventsConnKey struct{}
+
+// kvEventsConn is the state of one connection to the KV events server.
+type kvEventsConn struct {
+	// owner is the pod the connection was attributed to, see kvEventsSource.
+	owner atomic.Pointer[string]
+}
+
+// withKVEventsConn is the ConnContext hook of the KV events server.
+func withKVEventsConn(ctx context.Context, _ net.Conn) context.Context {
+	return context.WithValue(ctx, kvEventsConnKey{}, &kvEventsConn{})
+}
+
+// kvEventsSource returns the pod that sent r. A sidecar pushes over a
+// long-lived keep-alive connection, and the peer of a TCP connection does not
+// change while it is open, so the sending pod is resolved on the first push of
+// a connection and reused for the following ones. A failed resolution is not
+// kept: the next push on the connection retries it, e.g. once the datastore
+// knows the pod.
+func kvEventsSource(r *http.Request, resolveOwner func(remoteAddr string) (string, error)) (string, error) {
+	conn, _ := r.Context().Value(kvEventsConnKey{}).(*kvEventsConn)
+	if conn != nil {
+		if owner := conn.owner.Load(); owner != nil {
+			return *owner, nil
+		}
+	}
+	// Use the TCP peer address, never forwarding headers (gin's ClientIP):
+	// they are set by the caller and would let it choose its identity.
+	owner, err := resolveOwner(r.RemoteAddr)
+	if err != nil {
+		return "", err
+	}
+	if conn != nil {
+		conn.owner.Store(&owner)
+	}
+	return owner, nil
+}
+
 // kvEventsHandler handles POST /kvcache/events pushed by runtime sidecars.
-// resolveOwner maps the connection's remote address to the sending pod; the
-// payload's pod_identifier must match it.
+// resolveOwner maps the connection's remote address to the sending pod, see
+// kvEventsSource; the payload's pod_identifier must match it.
 func kvEventsHandler(index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Use the TCP peer address, never c.ClientIP(): forwarding headers
-		// are set by the caller and would let it choose its identity.
-		owner, err := resolveOwner(c.Request.RemoteAddr)
+		owner, err := kvEventsSource(c.Request, resolveOwner)
 		if err != nil {
 			klog.V(2).Infof("KVCacheAware: rejected KV events push from %s: %v", c.Request.RemoteAddr, err)
 			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
@@ -566,18 +605,18 @@ func kvEventsHandler(index *KVBlockMemoryIndex, resolveOwner func(remoteAddr str
 	}
 }
 
-// startKVEventsServer starts the HTTP listener that receives pushed KV events
-// from runtime sidecars when the plugin runs in memory index mode. The listener
-// is bound synchronously so a startup failure (e.g. the port is already in use)
-// fails the router instead of leaving it running without an index feed.
-func startKVEventsServer(port int, index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) {
+// newKVEventsServer returns the HTTP server that receives pushed KV events
+// from runtime sidecars on addr.
+func newKVEventsServer(addr string, index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) *http.Server {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	engine.POST("/kvcache/events", kvEventsHandler(index, resolveOwner))
 
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
+	return &http.Server{
+		Addr:    addr,
 		Handler: engine.Handler(),
+		// Lets the handler attribute each connection to its pod once.
+		ConnContext: withKVEventsConn,
 		// Basic hardening against slow or stalled clients holding
 		// connections open on this cluster-reachable endpoint.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -585,6 +624,14 @@ func startKVEventsServer(port int, index *KVBlockMemoryIndex, resolveOwner func(
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+}
+
+// startKVEventsServer starts the HTTP listener that receives pushed KV events
+// from runtime sidecars when the plugin runs in memory index mode. The listener
+// is bound synchronously so a startup failure (e.g. the port is already in use)
+// fails the router instead of leaving it running without an index feed.
+func startKVEventsServer(port int, index *KVBlockMemoryIndex, resolveOwner func(remoteAddr string) (string, error)) {
+	server := newKVEventsServer(fmt.Sprintf(":%d", port), index, resolveOwner)
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
 		klog.Fatalf("KVCacheAware: cannot listen on KV events port %d: %v", port, err)

@@ -33,6 +33,13 @@ KV_EVENT_SNAPSHOT = "snapshot"
 
 PUSH_TIMEOUT_SECONDS = 2.0
 
+# How long an idle connection to a router is kept open. The router attributes
+# a connection to this pod once, on its first push, so the connection is kept
+# across quiet periods instead of httpx's default 5s. It stays below the
+# router's 120s idle timeout so the router never closes a connection that is
+# about to be reused.
+PUSH_KEEPALIVE_EXPIRY_SECONDS = 60.0
+
 # Upper bound of deliveries queued per router endpoint. When a router cannot
 # keep up and its queue overflows, further deltas are dropped and the endpoint
 # is marked dirty so its next registration heartbeat receives a full snapshot.
@@ -104,7 +111,12 @@ class MemoryKVCacheManager:
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(PUSH_TIMEOUT_SECONDS))
+                timeout=httpx.Timeout(PUSH_TIMEOUT_SECONDS),
+                # httpx's default connection limits.
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=PUSH_KEEPALIVE_EXPIRY_SECONDS))
         return self._client
 
     async def close(self) -> None:

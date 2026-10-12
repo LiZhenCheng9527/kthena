@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import asyncio
 
+import httpx
 import pytest
 
 from kthena.runtime.kv_cache_manager import compute_standardized_hash
@@ -283,6 +284,21 @@ async def test_add_blocks_with_mismatched_tokens_fails():
     ok = await manager.add_blocks("qwen", [1, 2, 3], "pod-1.default", list(range(10)))
     assert not ok
     client.post.assert_not_awaited()
+
+
+def test_push_client_keeps_idle_connections_open(monkeypatch):
+    """The router attributes a push connection to the sending pod once, so
+    idle connections are kept longer than httpx's default 5s, but are closed
+    before the router's 120s idle timeout closes them."""
+    created = {}
+
+    def _client(**kwargs):
+        created.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+    MemoryKVCacheManager(registry=RouterRegistry())._get_client()
+    assert 5 < created["limits"].keepalive_expiry < 120
 
 
 def test_router_registry_register_and_expire(monkeypatch):

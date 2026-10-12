@@ -43,7 +43,7 @@ When a pod is deleted or stops being Ready, the router stops registering with it
 
 **Trust model of memory mode:**
 
-- The router accepts `POST /kvcache/events` only from the pod IP of a pod selected by a `ModelServer`, and only for that pod's own `pod_identifier`; other pushes are rejected with `403`. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so their pushes are rejected.
+- The router accepts `POST /kvcache/events` only from the pod IP of a pod selected by a `ModelServer`, and only for that pod's own `pod_identifier`; other pushes are rejected with `403`. A sidecar keeps its connection to each router open, and the router identifies the sending pod once per connection, on its first push. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so their pushes are rejected.
 - A runtime sidecar accepts `POST /kvcache/routers/register` only when the host of the announced endpoint is the IP the request comes from, so KV events are only pushed back to the registering router.
 - Store times are capped at the time the router receives them, each pod can hold at most `maxBlocksPerPod` blocks in the index, and the blocks of a pod are dropped once its registration lapses after the pod is deleted or stops being Ready.
 - Neither endpoint authenticates its callers; both rely on the cluster network being trusted. Restrict access to them with a NetworkPolicy if untrusted workloads share the cluster.

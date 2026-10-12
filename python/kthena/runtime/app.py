@@ -287,8 +287,10 @@ async def register_router(request: Request, background_tasks: BackgroundTasks) -
     if not isinstance(endpoint, str) or not validate_router_endpoint(endpoint):
         raise HTTPException(
             status_code=400, detail=f"invalid router endpoint: {endpoint!r}")
-    # Events are only pushed back to the caller itself: the endpoint host must
-    # be the IP the registration request comes from.
+    # This checks the registration (router -> sidecar), not the event pushes
+    # (sidecar -> router), which the router checks on its side. Events are only
+    # pushed back to the caller: the endpoint host must be the IP this request
+    # comes from, so a caller cannot point the pushes at a third party.
     client_host = request.client.host if request.client else None
     if not endpoint_matches_source(endpoint, client_host):
         logger.warning(

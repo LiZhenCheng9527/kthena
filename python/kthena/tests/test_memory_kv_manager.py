@@ -175,6 +175,7 @@ async def test_push_snapshot_sends_full_index_to_single_router():
     await manager.flush()
     client.post.reset_mock()
 
+    manager.registry.register("router-new", "http://router-new:9080")
     await manager.push_snapshot("http://router-new:9080", "pod-1.default")
 
     payloads = _pushed_payloads(client)
@@ -202,6 +203,7 @@ async def test_push_snapshot_represents_cleared_model_as_empty():
     await manager.flush()
     client.post.reset_mock()
 
+    manager.registry.register("router-new", "http://router-new:9080")
     await manager.push_snapshot("http://router-new:9080", "pod-1.default")
 
     payloads = _pushed_payloads(client)
@@ -209,6 +211,38 @@ async def test_push_snapshot_represents_cleared_model_as_empty():
     event = payloads[0][1]["events"][0]
     assert event["type"] == KV_EVENT_SNAPSHOT
     assert event["block_hashes"] == []
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed, endpoint", [
+    # The router re-registered on another port, replacing its registration.
+    (0, "http://10.0.0.5:9081"),
+    # The router re-registered from another IP after its registration expired.
+    (120, "http://10.0.0.6:9080"),
+])
+async def test_push_snapshot_stops_workers_of_unregistered_routers(
+        monkeypatch, elapsed, endpoint):
+    """Registrations can expire or be replaced while no delta is pushed, so
+    pushing a snapshot also stops the workers of routers that are no longer
+    registered, and skips snapshots still scheduled for them."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        "kthena.runtime.router_registry.time.monotonic", lambda: clock["now"])
+    manager, client = _make_manager(["http://10.0.0.5:9080"])
+    await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
+    await manager.flush()
+
+    clock["now"] += elapsed
+    manager.registry.register("router-0", endpoint, ttl_seconds=60)
+    client.post.reset_mock()
+    await manager.push_snapshot("http://10.0.0.5:9080", "pod-1.default")
+    await manager.push_snapshot(endpoint, "pod-1.default")
+
+    assert [url for url, _ in _pushed_payloads(client)] == [
+        f"{endpoint}{KV_EVENTS_PATH}"]
+    assert list(manager._workers) == [endpoint]
+    assert list(manager._queues) == [endpoint]
     await manager.close()
 
 
@@ -330,6 +364,24 @@ def test_router_registry_register_and_expire(monkeypatch):
         "router-a", "http://10.0.0.6:9080", ttl_seconds=60, generation="gen-2")
     assert not registry.register(
         "router-a", "http://10.0.0.6:9080", ttl_seconds=60, generation="gen-2")
+
+
+def test_router_registry_prunes_expired_routers_on_register(monkeypatch):
+    """Registering also drops expired registrations, so they do not pile up
+    while no KV events are pushed."""
+    registry = RouterRegistry()
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        "kthena.runtime.router_registry.time.monotonic", lambda: clock["now"])
+
+    registry.register("router-a", "http://10.0.0.5:9080", ttl_seconds=60)
+    clock["now"] += 30
+    registry.register("router-b", "http://10.0.0.6:9080", ttl_seconds=60)
+    clock["now"] += 40  # router-a has expired, router-b has not
+    registry.register("router-c", "http://10.0.0.7:9080", ttl_seconds=60)
+
+    assert sorted(r.router_id for r in registry._routers.values()) == [
+        "router-b", "router-c"]
 
 
 def test_router_registry_rejects_invalid_input():

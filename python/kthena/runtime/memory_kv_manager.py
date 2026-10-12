@@ -245,7 +245,16 @@ class MemoryKVCacheManager:
         reflects every mutation whose delta precedes it and cannot be
         overtaken by a newer delta it does not contain. Pending deltas are
         discarded first: the snapshot supersedes them.
+
+        Registrations can expire or be replaced while no delta is pushed, so
+        the workers of routers that are no longer registered are stopped here
+        as well. If this endpoint is one of them, the snapshot is skipped: a
+        router that registers again is sent a snapshot of its own.
         """
+        endpoints = self.registry.active_endpoints()
+        self._prune_workers(endpoints)
+        if endpoint not in endpoints:
+            return
         queue = self._ensure_worker(endpoint)
         self._drain_queue(queue)
         queue.put_nowait((_ITEM_SNAPSHOT, pod_identifier, None, None))
@@ -284,7 +293,8 @@ class MemoryKVCacheManager:
         return queue
 
     def _prune_workers(self, active_endpoints: List[str]) -> None:
-        """Stop workers of endpoints whose registration expired."""
+        """Stop workers of endpoints whose registration expired or was
+        replaced by one with another endpoint for the same host."""
         active = set(active_endpoints)
         for endpoint in list(self._workers):
             if endpoint not in active:

@@ -123,6 +123,9 @@ class RouterRegistry:
         endpoint = endpoint.rstrip("/")
 
         ttl = min(max(int(ttl_seconds), 1), MAX_ROUTER_TTL_SECONDS)
+        # Expired registrations are otherwise only pruned when KV events are
+        # pushed, so they would pile up while the cache is idle.
+        self._prune()
         now = time.monotonic()
         key = _endpoint_host(endpoint)
         existing = self._routers.get(key)

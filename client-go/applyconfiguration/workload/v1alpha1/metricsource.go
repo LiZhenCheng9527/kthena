@@ -32,7 +32,7 @@ package v1alpha1
 // metricSources:
 // gpu_cache_usage:
 // pod:
-// name: vllm:gpu_cache_usage_perc
+// name: vllm:kv_cache_usage_perc
 // uri: /metrics
 // port: 8000
 //

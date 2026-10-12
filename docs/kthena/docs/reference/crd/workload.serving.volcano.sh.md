@@ -375,7 +375,7 @@ Example (scrape the metric directly from each pod's /metrics endpoint):
 	metricSources:
 	  gpu_cache_usage:
 	    pod:
-	      name: vllm:gpu_cache_usage_perc
+	      name: vllm:kv_cache_usage_perc
 	      uri: /metrics
 	      port: 8000
 
@@ -796,7 +796,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `name` _string_ | Name is the Prometheus metric name matched against labels in the pod's scraped output.<br />Defaults to the policy metric key when omitted.<br />For example, set it to "vllm:gpu_cache_usage_perc" to read that exact series. |  |  |
+| `name` _string_ | Name is the Prometheus metric name matched against labels in the pod's scraped output.<br />Defaults to the policy metric key when omitted.<br />For example, set it to "vllm:kv_cache_usage_perc" to read that exact series. |  |  |
 | `uri` _string_ | Uri defines the HTTP path where metrics are exposed (e.g., "/metrics"). | /metrics | Pattern: `^/` <br /> |
 | `port` _integer_ | Port defines the network port where metrics are exposed by the pods (e.g., 8000). | 8100 | Maximum: 65535 <br />Minimum: 1 <br /> |
 

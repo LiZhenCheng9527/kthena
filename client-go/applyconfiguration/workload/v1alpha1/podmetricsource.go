@@ -44,7 +44,7 @@ import (
 type PodMetricSourceApplyConfiguration struct {
 	// Name is the Prometheus metric name matched against labels in the pod's scraped output.
 	// Defaults to the policy metric key when omitted.
-	// For example, set it to "vllm:gpu_cache_usage_perc" to read that exact series.
+	// For example, set it to "vllm:kv_cache_usage_perc" to read that exact series.
 	Name *string `json:"name,omitempty"`
 	// Uri defines the HTTP path where metrics are exposed (e.g., "/metrics").
 	Uri *string `json:"uri,omitempty"`

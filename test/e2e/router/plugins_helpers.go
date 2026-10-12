@@ -51,7 +51,7 @@ const (
 	kvCacheFixtureAppLabel         = kvCacheFixtureDeploymentName
 	kvCacheOwnershipWaitTimeout    = 90 * time.Second
 	kvCacheOwnershipPrefix         = "matrix:kv:block"
-	kvCacheRoutingRequestCount     = 20
+	kvCacheRoutingRequestCount     = 200
 )
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
@@ -335,18 +335,23 @@ func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, 
 }
 
 const (
-	schedulerOnlyKVCacheAware = `scheduler:
+	schedulerKVCacheAware = `scheduler:
   pluginConfig:
   - name: kvcache-aware
     args:
       blockSizeToHash: 8
       maxBlocksToMatch: 128
+  - name: least-request
+    args:
+      maxWaitingRequests: 10
   plugins:
     Filter:
       enabled: []
     Score:
       enabled:
         - name: kvcache-aware
+          weight: 1
+        - name: least-request
           weight: 1`
 
 	schedulerOnlyPrefixCache = `scheduler:

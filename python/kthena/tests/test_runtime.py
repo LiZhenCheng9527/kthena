@@ -15,9 +15,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
-from kthena.runtime.app import KV_SYNC_MODE_MEMORY, create_application, get_app_state
+from kthena.runtime.app import KV_SYNC_MODE_MEMORY, create_application, get_app_state, main
 from kthena.runtime.router_registry import RouterRegistry
 
 
@@ -189,3 +190,38 @@ async def test_register_router_requires_endpoint_of_caller(
     assert resp.status_code == expected_status, resp.text
     expected_endpoints = [endpoint] if expected_status == 200 else []
     assert registry.active_endpoints() == expected_endpoints
+
+
+@pytest.mark.asyncio
+async def test_main_serves_without_trusting_forwarding_headers(monkeypatch):
+    served = {}
+
+    def fake_run(app, **kwargs):
+        served["app"] = app
+        served["kwargs"] = kwargs
+
+    monkeypatch.setattr("kthena.runtime.app.uvicorn.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["kthena-runtime", "-E", "vllm", "-I", "pod-1.ns", "-N", "test-model"])
+    main()
+    assert served["kwargs"].get("proxy_headers") is False
+
+    # Load the app the way Uvicorn serves it with the options of main(). With
+    # proxy headers enabled, Uvicorn would take the client address from
+    # X-Forwarded-For when the peer is a trusted proxy (127.0.0.1 by default).
+    monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
+    config = uvicorn.Config(served["app"], **served["kwargs"], log_config=None)
+    config.load()
+    get_app_state(served["app"]).kv_sync_mode = KV_SYNC_MODE_MEMORY
+    registry = RouterRegistry()
+    monkeypatch.setattr("kthena.runtime.app.get_router_registry", lambda: registry)
+
+    transport = httpx.ASGITransport(app=config.loaded_app, client=("127.0.0.1", 41000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
+        resp = await client.post(
+            "/kvcache/routers/register",
+            json={"router_id": "router-a", "endpoint": "http://10.0.0.5:9080"},
+            headers={"X-Forwarded-For": "10.0.0.5"},
+        )
+
+    assert resp.status_code == 403, resp.text
+    assert registry.active_endpoints() == []

@@ -669,6 +669,32 @@ func TestKVEventSourceResolver_TracksPodChanges(t *testing.T) {
 	}
 }
 
+func TestKVEventSourceResolver_InvalidatedByPodEvents(t *testing.T) {
+	pods := &fakePodLister{pods: map[types.NamespacedName]*datastore.PodInfo{}}
+	pods.add("default", "host-1", "192.168.0.10")
+	resolver := newKVEventSourceResolver(pods)
+	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err != nil || owner != "host-1.default" {
+		t.Fatalf("resolveOwner() = %q, %v; want host-1.default", owner, err)
+	}
+
+	// A second hostNetwork pod on the node shares the cached IP. Its datastore
+	// event must make the IP unattributable for the very next push, not only
+	// after the cache TTL.
+	host2 := types.NamespacedName{Namespace: "default", Name: "host-2"}
+	pods.add(host2.Namespace, host2.Name, "192.168.0.10")
+	resolver.invalidate(datastore.EventData{EventType: datastore.EventAdd, Pod: host2})
+	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err == nil {
+		t.Fatalf("expected an IP shared with a newly added pod to be rejected, got %q", owner)
+	}
+
+	// Once that pod is gone, the IP belongs to host-1 alone again.
+	delete(pods.pods, host2)
+	resolver.invalidate(datastore.EventData{EventType: datastore.EventDelete, Pod: host2})
+	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err != nil || owner != "host-1.default" {
+		t.Fatalf("resolveOwner() = %q, %v; want host-1.default", owner, err)
+	}
+}
+
 func TestKVEventsHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	idx := NewKVBlockMemoryIndex(0)

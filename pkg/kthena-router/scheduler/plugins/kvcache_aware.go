@@ -274,7 +274,9 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 		}
 	}
 
-	startKVEventsServer(eventsPort, t.memoryIndex, newKVEventSourceResolver(store).resolveOwner)
+	resolver := newKVEventSourceResolver(store)
+	store.RegisterCallback("Pod", resolver.invalidate)
+	startKVEventsServer(eventsPort, t.memoryIndex, resolver.resolveOwner)
 	go t.memoryIndex.runGC(context.Background(), kvCacheGCInterval, kvCacheFieldFreshDuration)
 	// Drop a deleted pod's blocks right away instead of waiting for the GC.
 	store.RegisterCallback("Pod", t.onPodDeleted)

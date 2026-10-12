@@ -388,7 +388,8 @@ const kvEventsMaxBodyBytes = 4 << 20 // 4 MiB
 
 const (
 	// kvEventSourceCacheTTL bounds how long the source IP to pod mapping is
-	// reused before it is rebuilt from the datastore.
+	// reused before it is rebuilt from the datastore. Datastore pod events
+	// invalidate the mapping right away; the TTL is only a safety net.
 	kvEventSourceCacheTTL = 30 * time.Second
 	// kvEventSourceMissRebuildInterval rate-limits rebuilds triggered by a
 	// push from an unknown source IP, e.g. a pod that was just added.
@@ -413,10 +414,22 @@ type kvEventSourceResolver struct {
 	// the same node); pushes from them cannot be attributed and are rejected.
 	shared      map[string]struct{}
 	lastRebuild time.Time
+	// stale makes the next lookup rebuild the mapping, see invalidate.
+	stale bool
 }
 
 func newKVEventSourceResolver(pods podLister) *kvEventSourceResolver {
 	return &kvEventSourceResolver{pods: pods}
+}
+
+// invalidate is the datastore Pod callback of the resolver. Any pod add,
+// update or delete can change which pod an IP belongs to, or make an IP
+// shared (e.g. a second hostNetwork pod on a node), so the cached mapping must
+// not be used for the next push.
+func (r *kvEventSourceResolver) invalidate(datastore.EventData) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stale = true
 }
 
 // resolveOwner returns the owner identifier of the pod whose IP matches the
@@ -434,7 +447,7 @@ func (r *kvEventSourceResolver) resolveOwner(remoteAddr string) (string, error) 
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if time.Since(r.lastRebuild) >= kvEventSourceCacheTTL {
+	if r.stale || time.Since(r.lastRebuild) >= kvEventSourceCacheTTL {
 		r.rebuildLocked()
 	}
 	pod := r.lookupLocked(key)
@@ -484,6 +497,7 @@ func (r *kvEventSourceResolver) rebuildLocked() {
 	r.byIP = byIP
 	r.shared = shared
 	r.lastRebuild = time.Now()
+	r.stale = false
 }
 
 // podIPs returns the normalized IPs assigned to pod.

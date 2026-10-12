@@ -173,6 +173,14 @@ func unmarshalPlugins(schedulerConfig *SchedulerConfiguration) (map[string]int, 
 	scorePluginMap := make(map[string]int)
 	if len(schedulerConfig.Plugins.Score.Enabled) > 0 {
 		for _, plugin := range schedulerConfig.Plugins.Score.Enabled {
+			// RunScorePlugins multiplies every score by the weight, so a
+			// non-positive one leaves the plugin enabled with no part in pod
+			// selection. An omitted weight unmarshals to 0 and is rejected here
+			// rather than guessed at.
+			if plugin.Weight <= 0 {
+				return nil, nil, fmt.Errorf("score plugin %q must set a weight greater than 0, got %d",
+					plugin.Name, plugin.Weight)
+			}
 			scorePluginMap[plugin.Name] = plugin.Weight
 		}
 	}

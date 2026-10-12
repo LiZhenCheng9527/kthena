@@ -40,7 +40,7 @@ Score Plugins (Score):
 
 | Configuration Item | Description                                  |
 | ------------------ | -------------------------------------------- |
-| enabled            | List of enabled score plugins (with weights) |
+| enabled            | List of enabled score plugins. Each entry must set a `weight` greater than 0, which scales that plugin's scores when they are combined. |
 | disabled           | List of disabled score plugins               |
 
 ### Authentication Configuration

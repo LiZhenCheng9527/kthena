@@ -529,13 +529,13 @@ Send the same prompt to the router multiple times. On the first request, the `kv
 
 ## How It Differs from Other Plugins
 
-| Feature                | `prefix-cache`            | `kvcache-aware` (redis)           | `kvcache-aware` (memory)              |
-| ---------------------- | ------------------------- | --------------------------------- | ------------------------------------- |
-| Matching unit          | Byte-based prefix         | Token-block based                 | Token-block based                     |
-| Cache data source      | Router in-memory tracking | Redis (distributed)               | Router in-memory index (pushed)       |
-| Cross-pod coordination | No (local to router)      | Yes (via Redis)                   | Yes (sidecars push to every router)   |
-| Cache truth source     | Router heuristic          | Actual engine KV events from vLLM | Actual engine KV events from vLLM     |
-| Dependencies           | None                      | Redis + Runtime sidecar           | Runtime sidecar (no Redis)            |
+| Feature                | `prefix-cache`            | `kvcache-aware` (redis)           | `kvcache-aware` (memory)            |
+| ---------------------- | ------------------------- | --------------------------------- | ----------------------------------- |
+| Matching unit          | Byte-based prefix         | Token-block based                 | Token-block based                   |
+| Cache data source      | Router in-memory tracking | Redis (distributed)               | Router in-memory index (pushed)     |
+| Cross-pod coordination | No (local to router)      | Yes (via Redis)                   | Yes (sidecars push to every router) |
+| Cache truth source     | Router heuristic          | Actual engine KV events from vLLM | Actual engine KV events from vLLM   |
+| Dependencies           | None                      | Redis + Runtime sidecar           | Runtime sidecar (no Redis)          |
 
 - Use **`prefix-cache`** when you want lightweight, dependency-free prefix matching for simple workloads.
 - Use **`kvcache-aware`** when you need accurate, distributed KV cache coordination backed by real engine cache events — particularly effective with long shared system prompts.

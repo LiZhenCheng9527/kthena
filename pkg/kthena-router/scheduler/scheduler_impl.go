@@ -294,10 +294,9 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 				}
 			}
 			if _, ok := res[k]; !ok {
-				res[k] = v * scorePlugin.weight
-			} else {
-				res[k] += v * scorePlugin.weight
+				continue
 			}
+			res[k] += v * scorePlugin.weight
 		}
 	}
 

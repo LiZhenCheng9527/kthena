@@ -496,6 +496,7 @@ func (p *partialScorer) Score(_ *framework.Context, _ []*datastore.PodInfo) map[
 func TestRunScorePluginsKeepsUnscoredPods(t *testing.T) {
 	podA := createTestPodInfo("pod-a")
 	podB := createTestPodInfo("pod-b")
+	filteredOut := createTestPodInfo("pod-filtered-out")
 	pods := []*datastore.PodInfo{podA, podB}
 
 	tests := []struct {
@@ -520,6 +521,14 @@ func TestRunScorePluginsKeepsUnscoredPods(t *testing.T) {
 				weight: 2,
 			}},
 			expected: map[*datastore.PodInfo]int{podA: 200, podB: 0},
+		},
+		{
+			name: "plugin scores a pod that is not a candidate",
+			plugins: []*scorePlugin{{
+				plugin: &partialScorer{scores: map[*datastore.PodInfo]int{podA: 100, filteredOut: 100}},
+				weight: 1,
+			}},
+			expected: map[*datastore.PodInfo]int{podA: 100, podB: 0},
 		},
 	}
 

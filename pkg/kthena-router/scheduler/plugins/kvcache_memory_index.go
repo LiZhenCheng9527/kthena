@@ -19,6 +19,7 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -113,12 +114,14 @@ const defaultMaxBlocksPerPod = 1 << 20
 // hash, per model, together with the time the block was last stored.
 type KVBlockMemoryIndex struct {
 	mu sync.RWMutex
-	// maxBlocksPerOwner caps ownerTotals; blocks stored beyond it are dropped.
+	// maxBlocksPerOwner caps ownerTotals; an owner at the cap evicts its
+	// oldest blocks to store new ones, see evictOldestLocked.
 	maxBlocksPerOwner int
 	// model -> block hash -> owner(podName.namespace) -> unix seconds of last store
 	blocks map[string]map[uint64]map[string]int64
-	// reverse index for cleared/snapshot events
-	ownerBlocks map[ownerModelKey]map[uint64]struct{}
+	// reverse index for cleared/snapshot events and eviction:
+	// owner+model -> block hash -> unix seconds of last store, same as in blocks
+	ownerBlocks map[ownerModelKey]map[uint64]int64
 	// owner -> number of blocks held across all models
 	ownerTotals map[string]int
 }
@@ -132,7 +135,7 @@ func NewKVBlockMemoryIndex(maxBlocksPerOwner int) *KVBlockMemoryIndex {
 	return &KVBlockMemoryIndex{
 		maxBlocksPerOwner: maxBlocksPerOwner,
 		blocks:            make(map[string]map[uint64]map[string]int64),
-		ownerBlocks:       make(map[ownerModelKey]map[uint64]struct{}),
+		ownerBlocks:       make(map[ownerModelKey]map[uint64]int64),
 		ownerTotals:       make(map[string]int),
 	}
 }
@@ -147,7 +150,7 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 	defer idx.mu.Unlock()
 
 	now := time.Now().Unix()
-	dropped := 0
+	evicted := 0
 	for _, event := range payload.Events {
 		if len(event.Timestamps) > 0 && len(event.Timestamps) != len(event.BlockHashes) {
 			return fmt.Errorf("timestamps length %d does not match block_hashes length %d",
@@ -155,7 +158,7 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 		}
 		switch event.Type {
 		case kvEventStored:
-			dropped += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
+			evicted += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
 		case kvEventRemoved:
 			idx.removeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes)
 		case kvEventCleared:
@@ -163,14 +166,14 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 		case kvEventSnapshot:
 			// A snapshot replaces everything known about this owner+model.
 			idx.clearLocked(payload.ModelName, payload.PodIdentifier)
-			dropped += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
+			evicted += idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps, now)
 		default:
 			return fmt.Errorf("unknown event type %q", event.Type)
 		}
 	}
-	if dropped > 0 {
-		klog.V(2).Infof("KVCacheAware: pod %s reached the limit of %d indexed blocks, dropped %d blocks of model %s",
-			payload.PodIdentifier, idx.maxBlocksPerOwner, dropped, payload.ModelName)
+	if evicted > 0 {
+		klog.V(2).Infof("KVCacheAware: pod %s reached the limit of %d indexed blocks, evicted its %d oldest blocks",
+			payload.PodIdentifier, idx.maxBlocksPerOwner, evicted)
 	}
 	return nil
 }
@@ -186,52 +189,117 @@ func clampStoreTime(ts, now int64) int64 {
 	return ts
 }
 
-// storeLocked records hashes as owned by owner and returns how many new blocks
-// were dropped because owner reached maxBlocksPerOwner.
+// storeLocked records hashes as owned by owner and returns how many blocks of
+// owner were evicted to make room for them.
 func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64, timestamp int64, timestamps []int64, now int64) int {
 	if len(hashes) == 0 {
 		return 0
 	}
-	modelBlocks, ok := idx.blocks[model]
-	if !ok {
-		modelBlocks = make(map[uint64]map[string]int64)
-		idx.blocks[model] = modelBlocks
-	}
 	key := ownerModelKey{owner: owner, model: model}
-	owned, ok := idx.ownerBlocks[key]
-	if !ok {
-		owned = make(map[uint64]struct{})
-		idx.ownerBlocks[key] = owned
-	}
-	dropped := 0
+	modelBlocks, owned := idx.ownerModelLocked(key)
+	evicted := 0
 	for i, hash := range hashes {
+		ts := timestamp
+		if len(timestamps) > 0 && timestamps[i] > 0 {
+			ts = timestamps[i]
+		}
+		ts = clampStoreTime(ts, now)
 		if _, held := owned[hash]; !held {
 			if idx.ownerTotals[owner] >= idx.maxBlocksPerOwner {
-				dropped++
-				continue
+				evicted += idx.evictOldestLocked(owner)
+				// Eviction deletes the maps it empties, possibly these.
+				modelBlocks, owned = idx.ownerModelLocked(key)
 			}
-			owned[hash] = struct{}{}
 			idx.ownerTotals[owner]++
 		}
+		owned[hash] = ts
 		owners, ok := modelBlocks[hash]
 		if !ok {
 			owners = make(map[string]int64)
 			modelBlocks[hash] = owners
 		}
-		ts := timestamp
-		if len(timestamps) > 0 && timestamps[i] > 0 {
-			ts = timestamps[i]
+		owners[owner] = ts
+	}
+	return evicted
+}
+
+// ownerModelLocked returns the blocks of key.model and the blocks owned by
+// key.owner in that model, creating the maps if needed.
+func (idx *KVBlockMemoryIndex) ownerModelLocked(key ownerModelKey) (map[uint64]map[string]int64, map[uint64]int64) {
+	modelBlocks, ok := idx.blocks[key.model]
+	if !ok {
+		modelBlocks = make(map[uint64]map[string]int64)
+		idx.blocks[key.model] = modelBlocks
+	}
+	owned, ok := idx.ownerBlocks[key]
+	if !ok {
+		owned = make(map[uint64]int64)
+		idx.ownerBlocks[key] = owned
+	}
+	return modelBlocks, owned
+}
+
+// evictOldestLocked makes room for new blocks of owner, which holds
+// maxBlocksPerOwner blocks, by evicting its least recently stored blocks
+// across all models. Blocks left over from a previous incarnation of the pod
+// are older than its current ones, so they go first. A tenth of the limit is
+// evicted at once, so the scan over the owner's blocks is not repeated for
+// every new block. It returns the number of evicted blocks.
+func (idx *KVBlockMemoryIndex) evictOldestLocked(owner string) int {
+	n := max(1, idx.maxBlocksPerOwner/10)
+
+	// The n oldest blocks are those stored before cutoff, plus atCutoff of
+	// those stored at cutoff.
+	counts := make(map[int64]int)
+	for key, owned := range idx.ownerBlocks {
+		if key.owner != owner {
+			continue
 		}
-		owners[owner] = clampStoreTime(ts, now)
+		for _, ts := range owned {
+			counts[ts]++
+		}
 	}
-	// Everything may have been dropped; do not leave empty maps behind.
-	if len(owned) == 0 {
-		delete(idx.ownerBlocks, key)
+	var cutoff int64
+	atCutoff := n
+	for _, ts := range slices.Sorted(maps.Keys(counts)) {
+		cutoff = ts
+		if counts[ts] >= atCutoff {
+			break
+		}
+		atCutoff -= counts[ts]
 	}
-	if len(modelBlocks) == 0 {
-		delete(idx.blocks, model)
+
+	evicted := 0
+	for key, owned := range idx.ownerBlocks {
+		if key.owner != owner {
+			continue
+		}
+		modelBlocks := idx.blocks[key.model]
+		for hash, ts := range owned {
+			if ts > cutoff || (ts == cutoff && atCutoff == 0) {
+				continue
+			}
+			if ts == cutoff {
+				atCutoff--
+			}
+			delete(owned, hash)
+			if owners, ok := modelBlocks[hash]; ok {
+				delete(owners, owner)
+				if len(owners) == 0 {
+					delete(modelBlocks, hash)
+				}
+			}
+			evicted++
+		}
+		if len(owned) == 0 {
+			delete(idx.ownerBlocks, key)
+		}
+		if len(modelBlocks) == 0 {
+			delete(idx.blocks, key.model)
+		}
 	}
-	return dropped
+	idx.releaseLocked(owner, evicted)
+	return evicted
 }
 
 // releaseLocked accounts for count blocks no longer held by owner.

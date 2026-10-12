@@ -21,9 +21,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -478,30 +480,33 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 		defer idx.mu.RUnlock()
 		return idx.ownerTotals[owner]
 	}
-	stored := func(hashes ...uint64) KVEvent {
-		return KVEvent{Type: kvEventStored, BlockHashes: hashes, Timestamp: now}
+	storedAt := func(age int64, hashes ...uint64) KVEvent {
+		return KVEvent{Type: kvEventStored, BlockHashes: hashes, Timestamp: now - age}
 	}
 
 	// The cap spans all models of an owner.
-	apply("pod-1.default", "qwen", stored(1, 2))
-	apply("pod-1.default", "llama", stored(3, 4))
-	if got := idx.GetBlockOwners("llama", []uint64{3, 4}); len(got) != 1 || got[3] == nil {
-		t.Fatalf("expected only hash 3 of llama to be stored, got %v", got)
-	}
+	apply("pod-1.default", "qwen", storedAt(30, 1, 2))
+	apply("pod-1.default", "llama", storedAt(20, 3))
 	if got := total("pod-1.default"); got != 3 {
 		t.Fatalf("ownerTotals = %d, want 3", got)
 	}
 
 	// Re-storing held blocks does not consume capacity.
-	apply("pod-1.default", "qwen", stored(1, 2))
+	apply("pod-1.default", "qwen", storedAt(10, 1, 2))
 	if got := total("pod-1.default"); got != 3 {
 		t.Fatalf("ownerTotals after re-store = %d, want 3", got)
 	}
+	if got := idx.GetBlockOwners("llama", []uint64{3}); got[3]["pod-1.default"] == "" {
+		t.Fatalf("expected re-storing held blocks to evict nothing, got %v", got)
+	}
 
 	// Other owners have their own budget.
-	apply("pod-2.default", "qwen", stored(1, 2, 3))
+	apply("pod-2.default", "qwen", storedAt(0, 1, 2, 3))
 	if got := idx.GetBlockOwners("qwen", []uint64{3}); got[3]["pod-2.default"] == "" {
 		t.Fatalf("expected pod-2 to store hash 3, got %v", got)
+	}
+	if got := total("pod-1.default"); got != 3 {
+		t.Fatalf("ownerTotals of pod-1 after pod-2 stored = %d, want 3", got)
 	}
 
 	// Removing a block that is not held does not release capacity.
@@ -510,11 +515,11 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 		t.Fatalf("ownerTotals after removing unheld block = %d, want 3", got)
 	}
 
-	// Removal frees capacity.
+	// Removal frees capacity: the next block is stored without eviction.
 	apply("pod-1.default", "qwen", KVEvent{Type: kvEventRemoved, BlockHashes: []uint64{1}})
-	apply("pod-1.default", "llama", stored(4))
-	if got := idx.GetBlockOwners("llama", []uint64{4}); got[4]["pod-1.default"] == "" {
-		t.Fatalf("expected hash 4 to be stored after freeing capacity, got %v", got)
+	apply("pod-1.default", "llama", storedAt(0, 4))
+	if got := idx.GetBlockOwners("llama", []uint64{3, 4}); got[3]["pod-1.default"] == "" || got[4]["pod-1.default"] == "" {
+		t.Fatalf("expected hashes 3 and 4 to be held after freeing capacity, got %v", got)
 	}
 
 	// A snapshot replaces the model's blocks, releasing their capacity first.
@@ -522,6 +527,9 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 	got := idx.GetBlockOwners("qwen", []uint64{2, 7})
 	if _, ok := got[2]["pod-1.default"]; ok || got[7]["pod-1.default"] == "" {
 		t.Fatalf("expected snapshot to leave only hash 7 for pod-1, got %v", got)
+	}
+	if got := idx.GetBlockOwners("llama", []uint64{3, 4}); len(got) != 2 {
+		t.Fatalf("expected the snapshot to evict nothing, got llama blocks %v", got)
 	}
 	if got := total("pod-1.default"); got != 3 {
 		t.Fatalf("ownerTotals after snapshot = %d, want 3", got)
@@ -541,32 +549,204 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 	}
 }
 
-func TestKVBlockMemoryIndex_FullOwnerLeavesNoEmptyEntries(t *testing.T) {
-	idx := NewKVBlockMemoryIndex(1)
-	p := KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "qwen",
-		Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}}},
-	}
-	if err := idx.Apply(&p); err != nil {
-		t.Fatalf("Apply() failed: %v", err)
-	}
-	p = KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "llama",
-		Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{2}}},
-	}
-	if err := idx.Apply(&p); err != nil {
-		t.Fatalf("Apply() failed: %v", err)
-	}
-
+// indexedBlocks returns the sorted blocks held per owner and model, after
+// checking that the forward index, the reverse index and the per-owner totals
+// agree and hold no empty maps.
+func indexedBlocks(t *testing.T, idx *KVBlockMemoryIndex) map[ownerModelKey][]uint64 {
+	t.Helper()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	if _, ok := idx.blocks["llama"]; ok {
-		t.Errorf("expected no forward index entry for a model whose blocks were all dropped")
+
+	held := make(map[ownerModelKey][]uint64)
+	totals := make(map[string]int)
+	for key, owned := range idx.ownerBlocks {
+		if len(owned) == 0 {
+			t.Errorf("empty reverse index entry for %v", key)
+		}
+		for hash, ts := range owned {
+			if fts, ok := idx.blocks[key.model][hash][key.owner]; !ok || fts != ts {
+				t.Errorf("block %d of %v has store time %d in the reverse index, but %d (present: %v) in the forward index",
+					hash, key, ts, fts, ok)
+			}
+			held[key] = append(held[key], hash)
+			totals[key.owner]++
+		}
+		slices.Sort(held[key])
 	}
-	if _, ok := idx.ownerBlocks[ownerModelKey{owner: "pod-1.default", model: "llama"}]; ok {
-		t.Errorf("expected no reverse index entry for a model whose blocks were all dropped")
+	for model, modelBlocks := range idx.blocks {
+		if len(modelBlocks) == 0 {
+			t.Errorf("empty forward index entry for model %s", model)
+		}
+		for hash, owners := range modelBlocks {
+			if len(owners) == 0 {
+				t.Errorf("empty owner set for block %d of model %s", hash, model)
+			}
+			for owner := range owners {
+				if _, ok := idx.ownerBlocks[ownerModelKey{owner: owner, model: model}][hash]; !ok {
+					t.Errorf("block %d of %s/%s is missing from the reverse index", hash, owner, model)
+				}
+			}
+		}
+	}
+	if !maps.Equal(totals, idx.ownerTotals) {
+		t.Errorf("ownerTotals = %v, want %v", idx.ownerTotals, totals)
+	}
+	return held
+}
+
+func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
+	type push struct {
+		owner     string
+		model     string
+		eventType string
+		hashes    []uint64
+		// ages are the store times of hashes, in seconds before now.
+		ages []int64
+	}
+	pod1Qwen := ownerModelKey{owner: "pod-1.default", model: "qwen"}
+	pod1Llama := ownerModelKey{owner: "pod-1.default", model: "llama"}
+	pod2Qwen := ownerModelKey{owner: "pod-2.default", model: "qwen"}
+	seq := func(from, to uint64) []uint64 {
+		var s []uint64
+		for i := from; i <= to; i++ {
+			s = append(s, i)
+		}
+		return s
+	}
+	repeat := func(age int64, n int) []int64 {
+		return slices.Repeat([]int64{age}, n)
+	}
+	// Store times of seq(1, 20), from the oldest to the newest.
+	descendingAges := []int64{20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+
+	tests := []struct {
+		name   string
+		max    int
+		pushes []push
+		// want is the expected blocks per owner and model, if deterministic.
+		want       map[ownerModelKey][]uint64
+		wantTotals map[string]int
+	}{
+		{
+			name: "oldest blocks are evicted first, whatever their model",
+			max:  3,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2}, []int64{300, 200}},
+				{"pod-1.default", "llama", kvEventStored, []uint64{3}, []int64{100}},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{4, 5}, []int64{0, 0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: {4, 5}, pod1Llama: {3}},
+			wantTotals: map[string]int{"pod-1.default": 3},
+		},
+		{
+			name: "a tenth of the limit is evicted at once",
+			max:  20,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), descendingAges},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: seq(3, 21)},
+			wantTotals: map[string]int{"pod-1.default": 19},
+		},
+		{
+			name: "the room made by an eviction is used before evicting again",
+			max:  20,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), descendingAges},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{22}, []int64{0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: seq(3, 22)},
+			wantTotals: map[string]int{"pod-1.default": 20},
+		},
+		{
+			name: "blocks stored in the same second are evicted only up to the batch",
+			max:  20,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), repeat(10, 20)},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
+			},
+			wantTotals: map[string]int{"pod-1.default": 19},
+		},
+		{
+			name: "re-stored blocks are kept",
+			max:  3,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2, 3}, []int64{30, 20, 10}},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{0}},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{4}, []int64{0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: {1, 3, 4}},
+			wantTotals: map[string]int{"pod-1.default": 3},
+		},
+		{
+			name: "other pods keep a block evicted for one pod",
+			max:  1,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
+				{"pod-2.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
+				{"pod-1.default", "qwen", kvEventStored, []uint64{2}, []int64{0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: {2}, pod2Qwen: {1}},
+			wantTotals: map[string]int{"pod-1.default": 1, "pod-2.default": 1},
+		},
+		{
+			name: "evicting the last block of another model removes its entries",
+			max:  1,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
+				{"pod-1.default", "llama", kvEventStored, []uint64{2}, []int64{0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Llama: {2}},
+			wantTotals: map[string]int{"pod-1.default": 1},
+		},
+		{
+			name: "evicting the last block of the model being stored",
+			max:  1,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2}, []int64{10, 0}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: {2}},
+			wantTotals: map[string]int{"pod-1.default": 1},
+		},
+		{
+			name: "a snapshot over the limit keeps its newest blocks",
+			max:  3,
+			pushes: []push{
+				{"pod-1.default", "qwen", kvEventSnapshot, seq(1, 5), []int64{50, 40, 30, 20, 10}},
+			},
+			want:       map[ownerModelKey][]uint64{pod1Qwen: {3, 4, 5}},
+			wantTotals: map[string]int{"pod-1.default": 3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := NewKVBlockMemoryIndex(tt.max)
+			now := time.Now().Unix()
+			for _, p := range tt.pushes {
+				timestamps := make([]int64, len(p.ages))
+				for i, age := range p.ages {
+					timestamps[i] = now - age
+				}
+				payload := KVEventPayload{PodIdentifier: p.owner, ModelName: p.model, Events: []KVEvent{
+					{Type: p.eventType, BlockHashes: p.hashes, Timestamps: timestamps},
+				}}
+				if err := idx.Apply(&payload); err != nil {
+					t.Fatalf("Apply() failed: %v", err)
+				}
+			}
+
+			held := indexedBlocks(t, idx)
+			if tt.want != nil && !maps.EqualFunc(held, tt.want, slices.Equal[[]uint64]) {
+				t.Errorf("held blocks = %v, want %v", held, tt.want)
+			}
+			idx.mu.RLock()
+			defer idx.mu.RUnlock()
+			if !maps.Equal(idx.ownerTotals, tt.wantTotals) {
+				t.Errorf("ownerTotals = %v, want %v", idx.ownerTotals, tt.wantTotals)
+			}
+		})
 	}
 }
 

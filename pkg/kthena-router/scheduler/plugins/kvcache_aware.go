@@ -111,7 +111,8 @@ type KVCacheAwareArgs struct {
 	// must exceed the registration interval (memory mode only, default 90).
 	RegistrationTTLSeconds int `yaml:"registrationTTLSeconds,omitempty"`
 	// MaxBlocksPerPod caps how many blocks a single pod may hold in the
-	// in-memory index across all models (memory mode only, default 1048576).
+	// in-memory index across all models; at the cap, the pod's oldest blocks
+	// are evicted to store new ones (memory mode only, default 1048576).
 	MaxBlocksPerPod int `yaml:"maxBlocksPerPod,omitempty"`
 	// TokenizerService configures the optional dedicated tokenizer service.
 	TokenizerService *TokenizerServiceArgs `yaml:"tokenizerService,omitempty"`

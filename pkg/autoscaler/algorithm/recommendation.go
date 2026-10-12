@@ -30,9 +30,11 @@ type RecommendedInstancesAlgorithm struct {
 	CurrentInstancesCount int32
 	Tolerance             float64
 	MetricTargets         Metrics
-	UnreadyInstancesCount int32
-	ReadyInstancesMetrics []Metrics
-	ExternalMetrics       Metrics
+	// UnreadyInstancesCountByMetric and ReadyInstancesMetrics are keyed by metric
+	// name and cover only the pods selected for that metric.
+	UnreadyInstancesCountByMetric map[string]int32
+	ReadyInstancesMetrics         map[string][]Metrics
+	ExternalMetrics               Metrics
 }
 
 func (alg *RecommendedInstancesAlgorithm) GetRecommendedInstances() (recommendedInstances int32, skip bool) {
@@ -61,8 +63,8 @@ func (alg *RecommendedInstancesAlgorithm) GetRecommendedInstances() (recommended
 				alg.Tolerance,
 				name,
 				target,
-				alg.UnreadyInstancesCount,
-				alg.ReadyInstancesMetrics,
+				alg.UnreadyInstancesCountByMetric[name],
+				alg.ReadyInstancesMetrics[name],
 			); ok {
 				updateRecommendation(&recommendedInstances, &skip, desired)
 			}

@@ -107,17 +107,18 @@ func (collector *MetricCollector) UpdateMetrics(
 	ctx context.Context,
 	podLister listerv1.PodLister,
 	targetMetricSources map[string]v1alpha1.MetricSource,
-) (unreadyInstancesCount int32, readyInstancesMetrics []algorithm.Metrics, externalMetrics algorithm.Metrics, err error) {
-	// One entry per ready pod, merged across metric groups by pod key, because the
-	// recommendation algorithm averages over pods.
-	perPodMetrics := make(map[string]algorithm.Metrics)
+) (unreadyInstancesCountByMetric map[string]int32, readyInstancesMetrics map[string][]algorithm.Metrics, externalMetrics algorithm.Metrics, err error) {
+	// Results are keyed by metric. Each metric only sees the pods its own source
+	// selects, so a pod that was never asked for a metric is not counted as
+	// missing it, and an unready pod only counts for the metrics that select it.
+	unreadyInstancesCountByMetric = make(map[string]int32)
+	readyInstancesMetrics = make(map[string][]algorithm.Metrics)
 
 	pastHistograms, ok := collector.PastHistograms.GetLastUnfreshSnapshot()
 	if !ok {
 		pastHistograms = make(map[string]HistogramInfo)
 	}
 	currentHistograms := make(map[string]HistogramInfo)
-	unreadyPods := sets.New[string]()
 
 	// Group pod metrics by identical PodMetricSource (uri/port/selector) so we
 	// scrape each ready pod endpoint once per reconcile and extract every
@@ -135,21 +136,16 @@ func (collector *MetricCollector) UpdateMetrics(
 			klog.Warningf("collect pod metrics for target %s skipped because pod failed/restarted", collector.Target.TargetRef.Name)
 			continue
 		}
-		for podKey := range groupUnreadyPods {
-			unreadyPods.Insert(podKey)
+		groupMetrics := make([]algorithm.Metrics, 0, len(values))
+		for _, podKey := range slices.Sorted(maps.Keys(values)) {
+			groupMetrics = append(groupMetrics, values[podKey])
 		}
-		for podKey, podValues := range values {
-			if perPodMetrics[podKey] == nil {
-				perPodMetrics[podKey] = make(algorithm.Metrics, len(podValues))
-			}
-			maps.Copy(perPodMetrics[podKey], podValues)
+		for _, spec := range g.specs {
+			readyInstancesMetrics[spec.policyKey] = groupMetrics
+			unreadyInstancesCountByMetric[spec.policyKey] = int32(len(groupUnreadyPods))
 		}
 	}
 
-	for _, podKey := range slices.Sorted(maps.Keys(perPodMetrics)) {
-		readyInstancesMetrics = append(readyInstancesMetrics, perPodMetrics[podKey])
-	}
-	unreadyInstancesCount = int32(len(unreadyPods))
 	collector.PastHistograms.Append(currentHistograms)
 	return
 }

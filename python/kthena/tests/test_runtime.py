@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -18,8 +22,15 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from kthena.runtime.app import KV_SYNC_MODE_MEMORY, create_application, get_app_state, main
-from kthena.runtime.router_registry import RouterRegistry
+from kthena.runtime import memory_kv_manager as mkm
+from kthena.runtime.app import (
+    KV_SYNC_MODE_MEMORY,
+    _Server,
+    create_application,
+    get_app_state,
+)
+from kthena.runtime.kv_cache_manager import compute_standardized_hash
+from kthena.runtime.memory_kv_manager import MemoryKVCacheManager
 
 
 class _FakeAsyncResponse:
@@ -158,70 +169,64 @@ def test_load_lora_adapter_async_download_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint, client_ip, forwarded, expected_status", [
-    ("http://10.0.0.5:9080", "10.0.0.5", None, 200),
-    ("http://[fd00::5]:9080", "fd00::5", None, 200),
-    # The endpoint must point back at the caller.
-    ("http://10.0.0.6:9080", "10.0.0.5", None, 403),
-    ("http://router.kthena-system.svc:9080", "10.0.0.5", None, 403),
-    # Forwarding headers are not trusted.
-    ("http://10.0.0.6:9080", "10.0.0.5", "10.0.0.6", 403),
-    ("http://10.0.0.5:9080/path", "10.0.0.5", None, 400),
-    (None, "10.0.0.5", None, 400),
-    (["http://10.0.0.5:9080"], "10.0.0.5", None, 400),
+@pytest.mark.parametrize("mode, body, expected_status", [
+    ("redis", {"router_id": "router-a"}, 409),
+    (KV_SYNC_MODE_MEMORY, {}, 400),
+    (KV_SYNC_MODE_MEMORY, {"router_id": ""}, 400),
+    (KV_SYNC_MODE_MEMORY, {"router_id": ["router-a"]}, 400),
+    (KV_SYNC_MODE_MEMORY, ["router-a"], 400),
 ])
-async def test_register_router_requires_endpoint_of_caller(
-        monkeypatch, endpoint, client_ip, forwarded, expected_status):
+async def test_register_router_rejects_invalid_requests(mode, body, expected_status):
     app = create_application(_make_args())
     state = get_app_state(app)
-    state.kv_sync_mode = KV_SYNC_MODE_MEMORY
-    registry = RouterRegistry()
-    monkeypatch.setattr("kthena.runtime.app.get_router_registry", lambda: registry)
+    state.kv_sync_mode = mode
+    state.memory_kv_manager = MemoryKVCacheManager()
 
-    headers = {"X-Forwarded-For": forwarded} if forwarded else {}
-    transport = httpx.ASGITransport(app=app, client=(client_ip, 41000))
+    transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
-        resp = await client.post(
-            "/kvcache/routers/register",
-            json={"router_id": "router-a", "endpoint": endpoint},
-            headers=headers,
-        )
+        resp = await client.post("/kvcache/routers/register", json=body)
 
     assert resp.status_code == expected_status, resp.text
-    expected_endpoints = [endpoint] if expected_status == 200 else []
-    assert registry.active_endpoints() == expected_endpoints
+    assert state.memory_kv_manager._streams == {}
 
 
-@pytest.mark.asyncio
-async def test_main_serves_without_trusting_forwarding_headers(monkeypatch):
-    served = {}
+def test_register_router_streams_kv_events_until_shutdown(monkeypatch):
+    monkeypatch.setenv("KV_EVENT_SYNC_MODE", KV_SYNC_MODE_MEMORY)
+    monkeypatch.setattr(mkm, "_memory_kv_manager", None)
+    args = _make_args()
+    args.pod = None  # no KV event subscribers
+    app = create_application(args)
+    server = _Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(
+        target=loop.run_until_complete, args=(server.serve(),), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        assert thread.is_alive() and time.monotonic() < deadline, "server did not start"
+        time.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    manager = get_app_state(app).memory_kv_manager
 
-    def fake_run(app, **kwargs):
-        served["app"] = app
-        served["kwargs"] = kwargs
+    def run_in_server_loop(coro):
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=5)
 
-    monkeypatch.setattr("kthena.runtime.app.uvicorn.run", fake_run)
-    monkeypatch.setattr("sys.argv", ["kthena-runtime", "-E", "vllm", "-I", "pod-1.ns", "-N", "test-model"])
-    main()
-    assert served["kwargs"].get("proxy_headers") is False
+    with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as client:
+        with client.stream("POST", "/kvcache/routers/register",
+                           json={"router_id": "router-a"}) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"] == "application/x-ndjson"
+            lines = resp.iter_lines()
+            run_in_server_loop(manager.add_blocks(
+                "qwen", [111], "pod-1.ns", list(range(16))))
+            message = json.loads(next(line for line in lines if line))
+            assert message["model_name"] == "qwen"
+            assert message["events"][0]["block_hashes"] == [
+                compute_standardized_hash(list(range(16)))]
 
-    # Load the app the way Uvicorn serves it with the options of main(). With
-    # proxy headers enabled, Uvicorn would take the client address from
-    # X-Forwarded-For when the peer is a trusted proxy (127.0.0.1 by default).
-    monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
-    config = uvicorn.Config(served["app"], **served["kwargs"], log_config=None)
-    config.load()
-    get_app_state(served["app"]).kv_sync_mode = KV_SYNC_MODE_MEMORY
-    registry = RouterRegistry()
-    monkeypatch.setattr("kthena.runtime.app.get_router_registry", lambda: registry)
-
-    transport = httpx.ASGITransport(app=config.loaded_app, client=("127.0.0.1", 41000))
-    async with httpx.AsyncClient(transport=transport, base_url="http://runtime") as client:
-        resp = await client.post(
-            "/kvcache/routers/register",
-            json={"router_id": "router-a", "endpoint": "http://10.0.0.5:9080"},
-            headers={"X-Forwarded-For": "10.0.0.5"},
-        )
-
-    assert resp.status_code == 403, resp.text
-    assert registry.active_endpoints() == []
+            # The open stream does not hold up the shutdown.
+            server.should_exit = True
+            assert list(lines) == []
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    loop.close()

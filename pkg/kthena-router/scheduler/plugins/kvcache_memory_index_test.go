@@ -17,34 +17,25 @@ limitations under the License.
 package plugins
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
 	"maps"
-	"net/http"
-	"net/http/httptest"
-	"net/http/httptrace"
 	"slices"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 )
+
+// podKVEvents is a KV events message together with the pod it was streamed from.
+type podKVEvents struct {
+	owner   string
+	payload KVEventPayload
+}
 
 func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 	now := time.Now().Unix()
 
 	tests := []struct {
 		name        string
-		payloads    []KVEventPayload
+		payloads    []podKVEvents
 		wantErr     bool
 		queryModel  string
 		queryHashes []uint64
@@ -52,13 +43,12 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 	}{
 		{
 			name: "stored blocks are queryable",
-			payloads: []KVEventPayload{{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
+			payloads: []podKVEvents{{owner: "pod-1.default", payload: KVEventPayload{
+				ModelName: "qwen",
 				Events: []KVEvent{
 					{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now},
 				},
-			}},
+			}}},
 			queryModel:  "qwen",
 			queryHashes: []uint64{1, 2, 3},
 			wantOwners: map[uint64][]string{
@@ -68,15 +58,14 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 		},
 		{
 			name: "removed blocks disappear",
-			payloads: []KVEventPayload{
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
+			payloads: []podKVEvents{
+				{owner: "pod-1.default", payload: KVEventPayload{
+					ModelName: "qwen",
 					Events: []KVEvent{
 						{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now},
 						{Type: kvEventRemoved, BlockHashes: []uint64{1}},
 					},
-				},
+				}},
 			},
 			queryModel:  "qwen",
 			queryHashes: []uint64{1, 2},
@@ -86,22 +75,19 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 		},
 		{
 			name: "cleared drops only the clearing owner",
-			payloads: []KVEventPayload{
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
-				},
-				{
-					PodIdentifier: "pod-2.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
-				},
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventCleared}},
-				},
+			payloads: []podKVEvents{
+				{owner: "pod-1.default", payload: KVEventPayload{
+					ModelName: "qwen",
+					Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
+				}},
+				{owner: "pod-2.default", payload: KVEventPayload{
+					ModelName: "qwen",
+					Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
+				}},
+				{owner: "pod-1.default", payload: KVEventPayload{
+					ModelName: "qwen",
+					Events:    []KVEvent{{Type: kvEventCleared}},
+				}},
 			},
 			queryModel:  "qwen",
 			queryHashes: []uint64{1},
@@ -110,54 +96,15 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 			},
 		},
 		{
-			name: "snapshot replaces previous owner state",
-			payloads: []KVEventPayload{
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now}},
-				},
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventSnapshot, BlockHashes: []uint64{3}, Timestamp: now}},
-				},
-			},
-			queryModel:  "qwen",
-			queryHashes: []uint64{1, 2, 3},
-			wantOwners: map[uint64][]string{
-				3: {"pod-1.default"},
-			},
-		},
-		{
-			name: "empty snapshot clears previous owner state",
-			payloads: []KVEventPayload{
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now}},
-				},
-				{
-					PodIdentifier: "pod-1.default",
-					ModelName:     "qwen",
-					Events:        []KVEvent{{Type: kvEventSnapshot, Timestamp: now}},
-				},
-			},
-			queryModel:  "qwen",
-			queryHashes: []uint64{1, 2},
-			wantOwners:  map[uint64][]string{},
-		},
-		{
 			name: "mismatched timestamps length is rejected",
-			payloads: []KVEventPayload{{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
+			payloads: []podKVEvents{{owner: "pod-1.default", payload: KVEventPayload{
+				ModelName: "qwen",
 				Events: []KVEvent{{
-					Type:        kvEventSnapshot,
+					Type:        kvEventStored,
 					BlockHashes: []uint64{1, 2},
 					Timestamps:  []int64{now},
 				}},
-			}},
+			}}},
 			wantErr:     true,
 			queryModel:  "qwen",
 			queryHashes: []uint64{1, 2},
@@ -165,21 +112,20 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 		},
 		{
 			name: "models are isolated",
-			payloads: []KVEventPayload{{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
-				Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
-			}},
+			payloads: []podKVEvents{{owner: "pod-1.default", payload: KVEventPayload{
+				ModelName: "qwen",
+				Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
+			}}},
 			queryModel:  "other-model",
 			queryHashes: []uint64{1},
 			wantOwners:  map[uint64][]string{},
 		},
 		{
-			name: "missing pod identifier is rejected",
-			payloads: []KVEventPayload{{
+			name: "missing owner is rejected",
+			payloads: []podKVEvents{{payload: KVEventPayload{
 				ModelName: "qwen",
 				Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}}},
-			}},
+			}}},
 			wantErr:     true,
 			queryModel:  "qwen",
 			queryHashes: []uint64{1},
@@ -187,11 +133,10 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 		},
 		{
 			name: "unknown event type is rejected",
-			payloads: []KVEventPayload{{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
-				Events:        []KVEvent{{Type: "bogus", BlockHashes: []uint64{1}}},
-			}},
+			payloads: []podKVEvents{{owner: "pod-1.default", payload: KVEventPayload{
+				ModelName: "qwen",
+				Events:    []KVEvent{{Type: "bogus", BlockHashes: []uint64{1}}},
+			}}},
 			wantErr:     true,
 			queryModel:  "qwen",
 			queryHashes: []uint64{1},
@@ -204,7 +149,7 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 			idx := NewKVBlockMemoryIndex(0)
 			var gotErr error
 			for i := range tt.payloads {
-				if err := idx.Apply(&tt.payloads[i]); err != nil {
+				if err := idx.Apply(tt.payloads[i].owner, &tt.payloads[i].payload); err != nil {
 					gotErr = err
 				}
 			}
@@ -234,21 +179,20 @@ func TestKVBlockMemoryIndex_Apply(t *testing.T) {
 	}
 }
 
-func TestKVBlockMemoryIndex_SnapshotPreservesPerBlockTimestamps(t *testing.T) {
+func TestKVBlockMemoryIndex_PreservesPerBlockTimestamps(t *testing.T) {
 	idx := NewKVBlockMemoryIndex(0)
 	tsOld := time.Now().Add(-2 * time.Hour).Unix()
 	tsNew := time.Now().Unix()
 
 	payload := KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "qwen",
+		ModelName: "qwen",
 		Events: []KVEvent{{
-			Type:        kvEventSnapshot,
+			Type:        kvEventStored,
 			BlockHashes: []uint64{1, 2},
 			Timestamps:  []int64{tsOld, tsNew},
 		}},
 	}
-	if err := idx.Apply(&payload); err != nil {
+	if err := idx.Apply("pod-1.default", &payload); err != nil {
 		t.Fatalf("Apply() failed: %v", err)
 	}
 
@@ -264,25 +208,22 @@ func TestKVBlockMemoryIndex_SnapshotPreservesPerBlockTimestamps(t *testing.T) {
 func TestKVBlockMemoryIndex_RemoveOwner(t *testing.T) {
 	idx := NewKVBlockMemoryIndex(0)
 	now := time.Now().Unix()
-	for _, payload := range []KVEventPayload{
-		{
-			PodIdentifier: "pod-1.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now}},
-		},
-		{
-			PodIdentifier: "pod-1.default",
-			ModelName:     "llama",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{9}, Timestamp: now}},
-		},
-		{
-			PodIdentifier: "pod-2.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
-		},
+	for _, payload := range []podKVEvents{
+		{owner: "pod-1.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: now}},
+		}},
+		{owner: "pod-1.default", payload: KVEventPayload{
+			ModelName: "llama",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{9}, Timestamp: now}},
+		}},
+		{owner: "pod-2.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: now}},
+		}},
 	} {
 		p := payload
-		if err := idx.Apply(&p); err != nil {
+		if err := idx.Apply(p.owner, &p.payload); err != nil {
 			t.Fatalf("Apply() failed: %v", err)
 		}
 	}
@@ -306,20 +247,18 @@ func TestKVBlockMemoryIndex_GCStaleEntries(t *testing.T) {
 	fresh := time.Now().Unix()
 	stale := time.Now().Add(-25 * time.Hour).Unix()
 
-	for _, payload := range []KVEventPayload{
-		{
-			PodIdentifier: "pod-fresh.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: fresh}},
-		},
-		{
-			PodIdentifier: "pod-stale.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: stale}},
-		},
+	for _, payload := range []podKVEvents{
+		{owner: "pod-fresh.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: fresh}},
+		}},
+		{owner: "pod-stale.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: stale}},
+		}},
 	} {
 		p := payload
-		if err := idx.Apply(&p); err != nil {
+		if err := idx.Apply(p.owner, &p.payload); err != nil {
 			t.Fatalf("Apply() failed: %v", err)
 		}
 	}
@@ -345,25 +284,22 @@ func TestKVBlockMemoryIndex_GCRemovesEmptyParentEntries(t *testing.T) {
 	idx := NewKVBlockMemoryIndex(0)
 	stale := time.Now().Add(-25 * time.Hour).Unix()
 
-	for _, payload := range []KVEventPayload{
-		{
-			PodIdentifier: "pod-1.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: stale}},
-		},
-		{
-			PodIdentifier: "pod-2.default",
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{2, 3}, Timestamp: stale}},
-		},
-		{
-			PodIdentifier: "pod-3.default",
-			ModelName:     "llama",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{9}, Timestamp: stale}},
-		},
+	for _, payload := range []podKVEvents{
+		{owner: "pod-1.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{1, 2}, Timestamp: stale}},
+		}},
+		{owner: "pod-2.default", payload: KVEventPayload{
+			ModelName: "qwen",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{2, 3}, Timestamp: stale}},
+		}},
+		{owner: "pod-3.default", payload: KVEventPayload{
+			ModelName: "llama",
+			Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{9}, Timestamp: stale}},
+		}},
 	} {
 		p := payload
-		if err := idx.Apply(&p); err != nil {
+		if err := idx.Apply(p.owner, &p.payload); err != nil {
 			t.Fatalf("Apply() failed: %v", err)
 		}
 	}
@@ -387,11 +323,10 @@ func TestKVCacheAware_QueryMemoryForBlocks(t *testing.T) {
 	idx := NewKVBlockMemoryIndex(0)
 	now := time.Now().Unix()
 	payload := KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "qwen",
-		Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{111}, Timestamp: now}},
+		ModelName: "qwen",
+		Events:    []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{111}, Timestamp: now}},
 	}
-	if err := idx.Apply(&payload); err != nil {
+	if err := idx.Apply("pod-1.default", &payload); err != nil {
 		t.Fatalf("Apply() failed: %v", err)
 	}
 
@@ -426,15 +361,14 @@ func TestKVBlockMemoryIndex_ClampsStoreTime(t *testing.T) {
 	future := time.Now().Add(100 * 365 * 24 * time.Hour).Unix()
 
 	payload := KVEventPayload{
-		PodIdentifier: "pod-1.default",
-		ModelName:     "qwen",
+		ModelName: "qwen",
 		Events: []KVEvent{
 			{Type: kvEventStored, BlockHashes: []uint64{1}, Timestamp: future},
 			{Type: kvEventStored, BlockHashes: []uint64{2, 3, 4}, Timestamps: []int64{past, future, 0}},
 			{Type: kvEventStored, BlockHashes: []uint64{5}},
 		},
 	}
-	if err := idx.Apply(&payload); err != nil {
+	if err := idx.Apply("pod-1.default", &payload); err != nil {
 		t.Fatalf("Apply() failed: %v", err)
 	}
 	after := time.Now().Unix()
@@ -470,8 +404,8 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 	now := time.Now().Unix()
 	apply := func(owner, model string, events ...KVEvent) {
 		t.Helper()
-		p := KVEventPayload{PodIdentifier: owner, ModelName: model, Events: events}
-		if err := idx.Apply(&p); err != nil {
+		p := KVEventPayload{ModelName: model, Events: events}
+		if err := idx.Apply(owner, &p); err != nil {
 			t.Fatalf("Apply() failed: %v", err)
 		}
 	}
@@ -520,19 +454,6 @@ func TestKVBlockMemoryIndex_MaxBlocksPerOwner(t *testing.T) {
 	apply("pod-1.default", "llama", storedAt(0, 4))
 	if got := idx.GetBlockOwners("llama", []uint64{3, 4}); got[3]["pod-1.default"] == "" || got[4]["pod-1.default"] == "" {
 		t.Fatalf("expected hashes 3 and 4 to be held after freeing capacity, got %v", got)
-	}
-
-	// A snapshot replaces the model's blocks, releasing their capacity first.
-	apply("pod-1.default", "qwen", KVEvent{Type: kvEventSnapshot, BlockHashes: []uint64{7}, Timestamp: now})
-	got := idx.GetBlockOwners("qwen", []uint64{2, 7})
-	if _, ok := got[2]["pod-1.default"]; ok || got[7]["pod-1.default"] == "" {
-		t.Fatalf("expected snapshot to leave only hash 7 for pod-1, got %v", got)
-	}
-	if got := idx.GetBlockOwners("llama", []uint64{3, 4}); len(got) != 2 {
-		t.Fatalf("expected the snapshot to evict nothing, got llama blocks %v", got)
-	}
-	if got := total("pod-1.default"); got != 3 {
-		t.Fatalf("ownerTotals after snapshot = %d, want 3", got)
 	}
 
 	apply("pod-1.default", "llama", KVEvent{Type: kvEventCleared})
@@ -595,7 +516,7 @@ func indexedBlocks(t *testing.T, idx *KVBlockMemoryIndex) map[ownerModelKey][]ui
 }
 
 func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
-	type push struct {
+	type message struct {
 		owner     string
 		model     string
 		eventType string
@@ -620,9 +541,9 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 	descendingAges := []int64{20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 
 	tests := []struct {
-		name   string
-		max    int
-		pushes []push
+		name     string
+		max      int
+		messages []message
 		// want is the expected blocks per owner and model, if deterministic.
 		want       map[ownerModelKey][]uint64
 		wantTotals map[string]int
@@ -630,7 +551,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "oldest blocks are evicted first, whatever their model",
 			max:  3,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2}, []int64{300, 200}},
 				{"pod-1.default", "llama", kvEventStored, []uint64{3}, []int64{100}},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{4, 5}, []int64{0, 0}},
@@ -641,7 +562,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "a tenth of the limit is evicted at once",
 			max:  20,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), descendingAges},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
 			},
@@ -651,7 +572,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "the room made by an eviction is used before evicting again",
 			max:  20,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), descendingAges},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{22}, []int64{0}},
@@ -662,7 +583,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "blocks stored in the same second are evicted only up to the batch",
 			max:  20,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, seq(1, 20), repeat(10, 20)},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{21}, []int64{0}},
 			},
@@ -671,7 +592,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "re-stored blocks are kept",
 			max:  3,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2, 3}, []int64{30, 20, 10}},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{0}},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{4}, []int64{0}},
@@ -682,7 +603,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "other pods keep a block evicted for one pod",
 			max:  1,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
 				{"pod-2.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
 				{"pod-1.default", "qwen", kvEventStored, []uint64{2}, []int64{0}},
@@ -693,7 +614,7 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "evicting the last block of another model removes its entries",
 			max:  1,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1}, []int64{10}},
 				{"pod-1.default", "llama", kvEventStored, []uint64{2}, []int64{0}},
 			},
@@ -703,17 +624,17 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		{
 			name: "evicting the last block of the model being stored",
 			max:  1,
-			pushes: []push{
+			messages: []message{
 				{"pod-1.default", "qwen", kvEventStored, []uint64{1, 2}, []int64{10, 0}},
 			},
 			want:       map[ownerModelKey][]uint64{pod1Qwen: {2}},
 			wantTotals: map[string]int{"pod-1.default": 1},
 		},
 		{
-			name: "a snapshot over the limit keeps its newest blocks",
+			name: "a message over the limit keeps its newest blocks",
 			max:  3,
-			pushes: []push{
-				{"pod-1.default", "qwen", kvEventSnapshot, seq(1, 5), []int64{50, 40, 30, 20, 10}},
+			messages: []message{
+				{"pod-1.default", "qwen", kvEventStored, seq(1, 5), []int64{50, 40, 30, 20, 10}},
 			},
 			want:       map[ownerModelKey][]uint64{pod1Qwen: {3, 4, 5}},
 			wantTotals: map[string]int{"pod-1.default": 3},
@@ -724,15 +645,15 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			idx := NewKVBlockMemoryIndex(tt.max)
 			now := time.Now().Unix()
-			for _, p := range tt.pushes {
+			for _, p := range tt.messages {
 				timestamps := make([]int64, len(p.ages))
 				for i, age := range p.ages {
 					timestamps[i] = now - age
 				}
-				payload := KVEventPayload{PodIdentifier: p.owner, ModelName: p.model, Events: []KVEvent{
+				payload := KVEventPayload{ModelName: p.model, Events: []KVEvent{
 					{Type: p.eventType, BlockHashes: p.hashes, Timestamps: timestamps},
 				}}
-				if err := idx.Apply(&payload); err != nil {
+				if err := idx.Apply(p.owner, &payload); err != nil {
 					t.Fatalf("Apply() failed: %v", err)
 				}
 			}
@@ -747,362 +668,5 @@ func TestKVBlockMemoryIndex_EvictsOldestBlocksAtLimit(t *testing.T) {
 				t.Errorf("ownerTotals = %v, want %v", idx.ownerTotals, tt.wantTotals)
 			}
 		})
-	}
-}
-
-type fakePodLister struct {
-	pods      map[types.NamespacedName]*datastore.PodInfo
-	listCalls int
-}
-
-func (f *fakePodLister) GetAllPods() map[types.NamespacedName]*datastore.PodInfo {
-	f.listCalls++
-	pods := make(map[types.NamespacedName]*datastore.PodInfo, len(f.pods))
-	for name, info := range f.pods {
-		pods[name] = info
-	}
-	return pods
-}
-
-func (f *fakePodLister) GetPodInfo(name types.NamespacedName) *datastore.PodInfo {
-	return f.pods[name]
-}
-
-func (f *fakePodLister) add(namespace, name string, ips ...string) {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
-	if len(ips) > 0 {
-		pod.Status.PodIP = ips[0]
-		pod.Status.Phase = corev1.PodRunning
-	}
-	for _, ip := range ips {
-		pod.Status.PodIPs = append(pod.Status.PodIPs, corev1.PodIP{IP: ip})
-	}
-	f.pods[types.NamespacedName{Namespace: namespace, Name: name}] = datastore.NewPodInfo(pod, "vLLM")
-}
-
-func TestKVEventSourceResolver_ResolveOwner(t *testing.T) {
-	pods := &fakePodLister{pods: map[types.NamespacedName]*datastore.PodInfo{}}
-	pods.add("default", "pod-a", "10.0.0.1")
-	pods.add("ns-b", "pod-b", "10.0.0.2", "fd00::2")
-	pods.add("default", "host-1", "192.168.0.10")
-	pods.add("default", "host-2", "192.168.0.10")
-	pods.add("default", "pending")
-	resolver := newKVEventSourceResolver(pods)
-
-	tests := []struct {
-		name       string
-		remoteAddr string
-		wantOwner  string
-		wantErr    bool
-	}{
-		{name: "ipv4 pod", remoteAddr: "10.0.0.1:41000", wantOwner: "pod-a.default"},
-		{name: "secondary ipv6 pod IP", remoteAddr: "[fd00::2]:41000", wantOwner: "pod-b.ns-b"},
-		{name: "ipv4-mapped ipv6 source", remoteAddr: "[::ffff:10.0.0.2]:41000", wantOwner: "pod-b.ns-b"},
-		{name: "unknown source", remoteAddr: "10.9.9.9:41000", wantErr: true},
-		{name: "IP shared by multiple pods", remoteAddr: "192.168.0.10:41000", wantErr: true},
-		{name: "missing port", remoteAddr: "10.0.0.1", wantErr: true},
-		{name: "not an IP", remoteAddr: "pod-a:41000", wantErr: true},
-		{name: "empty", remoteAddr: "", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			owner, err := resolver.resolveOwner(tt.remoteAddr)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("resolveOwner(%q) error = %v, wantErr %v", tt.remoteAddr, err, tt.wantErr)
-			}
-			if owner != tt.wantOwner {
-				t.Fatalf("resolveOwner(%q) = %q, want %q", tt.remoteAddr, owner, tt.wantOwner)
-			}
-		})
-	}
-}
-
-func TestKVEventSourceResolver_TracksPodChanges(t *testing.T) {
-	pods := &fakePodLister{pods: map[types.NamespacedName]*datastore.PodInfo{}}
-	pods.add("default", "pod-a", "10.0.0.1")
-	resolver := newKVEventSourceResolver(pods)
-
-	if owner, err := resolver.resolveOwner("10.0.0.1:1"); err != nil || owner != "pod-a.default" {
-		t.Fatalf("resolveOwner() = %q, %v; want pod-a.default", owner, err)
-	}
-
-	// A deleted pod is rejected immediately, even while the cache is fresh.
-	delete(pods.pods, types.NamespacedName{Namespace: "default", Name: "pod-a"})
-	if owner, err := resolver.resolveOwner("10.0.0.1:1"); err == nil {
-		t.Fatalf("expected deleted pod to be rejected, got %q", owner)
-	}
-
-	// Misses rebuild the cache at most once per kvEventSourceMissRebuildInterval.
-	listCalls := pods.listCalls
-	for range 3 {
-		if _, err := resolver.resolveOwner("10.0.0.3:1"); err == nil {
-			t.Fatalf("expected unknown source to be rejected")
-		}
-	}
-	if pods.listCalls != listCalls {
-		t.Fatalf("expected no rebuild within the miss rebuild interval, got %d extra", pods.listCalls-listCalls)
-	}
-
-	// A pod that reuses the IP is picked up once a rebuild is allowed again.
-	pods.add("default", "pod-c", "10.0.0.1")
-	resolver.mu.Lock()
-	resolver.lastRebuild = time.Now().Add(-kvEventSourceMissRebuildInterval)
-	resolver.mu.Unlock()
-	if owner, err := resolver.resolveOwner("10.0.0.1:1"); err != nil || owner != "pod-c.default" {
-		t.Fatalf("resolveOwner() = %q, %v; want pod-c.default", owner, err)
-	}
-}
-
-func TestKVEventSourceResolver_InvalidatedByPodEvents(t *testing.T) {
-	pods := &fakePodLister{pods: map[types.NamespacedName]*datastore.PodInfo{}}
-	pods.add("default", "host-1", "192.168.0.10")
-	resolver := newKVEventSourceResolver(pods)
-	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err != nil || owner != "host-1.default" {
-		t.Fatalf("resolveOwner() = %q, %v; want host-1.default", owner, err)
-	}
-
-	// A second hostNetwork pod on the node shares the cached IP. Its datastore
-	// event must make the IP unattributable for the very next push, not only
-	// after the cache TTL.
-	host2 := types.NamespacedName{Namespace: "default", Name: "host-2"}
-	pods.add(host2.Namespace, host2.Name, "192.168.0.10")
-	resolver.invalidate(datastore.EventData{EventType: datastore.EventAdd, Pod: host2})
-	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err == nil {
-		t.Fatalf("expected an IP shared with a newly added pod to be rejected, got %q", owner)
-	}
-
-	// Once that pod is gone, the IP belongs to host-1 alone again.
-	delete(pods.pods, host2)
-	resolver.invalidate(datastore.EventData{EventType: datastore.EventDelete, Pod: host2})
-	if owner, err := resolver.resolveOwner("192.168.0.10:1"); err != nil || owner != "host-1.default" {
-		t.Fatalf("resolveOwner() = %q, %v; want host-1.default", owner, err)
-	}
-}
-
-func TestKVEventsHandler(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	idx := NewKVBlockMemoryIndex(0)
-	owners := map[string]string{"10.0.0.1:41000": "pod-1.default"}
-	resolveOwner := func(remoteAddr string) (string, error) {
-		if owner, ok := owners[remoteAddr]; ok {
-			return owner, nil
-		}
-		return "", fmt.Errorf("unknown source %s", remoteAddr)
-	}
-	engine := gin.New()
-	engine.POST("/kvcache/events", kvEventsHandler(idx, resolveOwner))
-
-	tests := []struct {
-		name       string
-		remoteAddr string
-		forwarded  string
-		body       any
-		rawBody    string
-		wantStatus int
-	}{
-		{
-			name:       "valid payload",
-			remoteAddr: "10.0.0.1:41000",
-			body: KVEventPayload{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
-				Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{42}, Timestamp: time.Now().Unix()}},
-			},
-			wantStatus: http.StatusOK,
-		},
-		{
-			name:       "unknown source",
-			remoteAddr: "10.0.0.9:41000",
-			forwarded:  "10.0.0.1",
-			body: KVEventPayload{
-				PodIdentifier: "pod-1.default",
-				ModelName:     "qwen",
-				Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{43}}},
-			},
-			wantStatus: http.StatusForbidden,
-		},
-		{
-			name:       "pod identifier of another pod",
-			remoteAddr: "10.0.0.1:41000",
-			body: KVEventPayload{
-				PodIdentifier: "pod-2.default",
-				ModelName:     "qwen",
-				Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{44}}},
-			},
-			wantStatus: http.StatusForbidden,
-		},
-		{
-			name:       "invalid json",
-			remoteAddr: "10.0.0.1:41000",
-			rawBody:    "{not-json",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "missing model name",
-			remoteAddr: "10.0.0.1:41000",
-			body: KVEventPayload{
-				PodIdentifier: "pod-1.default",
-				Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{45}}},
-			},
-			wantStatus: http.StatusBadRequest,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var body []byte
-			if tt.rawBody != "" {
-				body = []byte(tt.rawBody)
-			} else {
-				var err error
-				body, err = json.Marshal(tt.body)
-				if err != nil {
-					t.Fatalf("failed to marshal body: %v", err)
-				}
-			}
-			req := httptest.NewRequest(http.MethodPost, "/kvcache/events", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			req.RemoteAddr = tt.remoteAddr
-			if tt.forwarded != "" {
-				req.Header.Set("X-Forwarded-For", tt.forwarded)
-				req.Header.Set("X-Real-IP", tt.forwarded)
-			}
-			rec := httptest.NewRecorder()
-			engine.ServeHTTP(rec, req)
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d, body=%s", rec.Code, tt.wantStatus, rec.Body.String())
-			}
-		})
-	}
-
-	got := idx.GetBlockOwners("qwen", []uint64{42, 43, 44, 45})
-	if len(got) != 1 || got[42]["pod-1.default"] == "" {
-		t.Fatalf("expected only the block of the valid payload to be stored, got %v", got)
-	}
-}
-
-func TestKVEventsServer_ResolvesSourceOncePerConnection(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	idx := NewKVBlockMemoryIndex(0)
-	var (
-		mu         sync.Mutex
-		resolves   int
-		resolveErr bool
-	)
-	resolveOwner := func(remoteAddr string) (string, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		resolves++
-		if resolveErr {
-			return "", fmt.Errorf("unknown source %s", remoteAddr)
-		}
-		return "pod-1.default", nil
-	}
-	ts := httptest.NewUnstartedServer(nil)
-	ts.Config = newKVEventsServer("", idx, resolveOwner)
-	ts.Start()
-	defer ts.Close()
-	client := ts.Client()
-
-	// push sends one stored event over the client's keep-alive connection and
-	// reports whether an existing connection was reused for it.
-	push := func(t *testing.T, podIdentifier string, hash uint64) (int, bool) {
-		t.Helper()
-		body, err := json.Marshal(KVEventPayload{
-			PodIdentifier: podIdentifier,
-			ModelName:     "qwen",
-			Events:        []KVEvent{{Type: kvEventStored, BlockHashes: []uint64{hash}}},
-		})
-		if err != nil {
-			t.Fatalf("failed to marshal body: %v", err)
-		}
-		var reused bool
-		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
-			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
-		})
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/kvcache/events", bytes.NewReader(body))
-		if err != nil {
-			t.Fatalf("failed to create request: %v", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("push failed: %v", err)
-		}
-		// Drain the body so the connection is kept for the next push.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		return resp.StatusCode, reused
-	}
-
-	steps := []struct {
-		name          string
-		resolveErr    bool
-		newConn       bool
-		podIdentifier string
-		wantStatus    int
-		wantResolves  int
-	}{
-		{
-			name:          "first push of a connection from an unknown source",
-			resolveErr:    true,
-			newConn:       true,
-			podIdentifier: "pod-1.default",
-			wantStatus:    http.StatusForbidden,
-			wantResolves:  1,
-		},
-		{
-			name:          "failed resolution is retried on the next push",
-			podIdentifier: "pod-1.default",
-			wantStatus:    http.StatusOK,
-			wantResolves:  2,
-		},
-		{
-			name:          "resolved source is reused for the connection",
-			podIdentifier: "pod-1.default",
-			wantStatus:    http.StatusOK,
-			wantResolves:  2,
-		},
-		{
-			name:          "pod identifier is still checked on every push",
-			podIdentifier: "pod-2.default",
-			wantStatus:    http.StatusForbidden,
-			wantResolves:  2,
-		},
-		{
-			name:          "new connection is resolved again",
-			newConn:       true,
-			podIdentifier: "pod-1.default",
-			wantStatus:    http.StatusOK,
-			wantResolves:  3,
-		},
-	}
-	for i, step := range steps {
-		t.Run(step.name, func(t *testing.T) {
-			mu.Lock()
-			resolveErr = step.resolveErr
-			mu.Unlock()
-			if step.newConn {
-				client.CloseIdleConnections()
-			}
-
-			status, reused := push(t, step.podIdentifier, uint64(i))
-			if reused == step.newConn {
-				t.Fatalf("connection reused = %v, want %v", reused, !step.newConn)
-			}
-			if status != step.wantStatus {
-				t.Fatalf("status = %d, want %d", status, step.wantStatus)
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if resolves != step.wantResolves {
-				t.Fatalf("source resolved %d times, want %d", resolves, step.wantResolves)
-			}
-		})
-	}
-
-	got := idx.GetBlockOwners("qwen", []uint64{0, 1, 2, 3, 4})
-	if len(got) != 3 || got[1] == nil || got[2] == nil || got[4] == nil {
-		t.Fatalf("expected the blocks of the accepted pushes to be stored, got %v", got)
 	}
 }

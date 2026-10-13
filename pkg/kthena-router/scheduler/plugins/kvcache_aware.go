@@ -80,13 +80,9 @@ const (
 
 	// kvCacheIndexModeRedis queries the Redis block matrix written by runtime
 	// sidecars (default). kvCacheIndexModeMemory serves scores from an in-memory
-	// index fed by KV events that runtime sidecars push directly to this router.
+	// index fed by KV events that runtime sidecars stream to this router.
 	kvCacheIndexModeRedis  = "redis"
 	kvCacheIndexModeMemory = "memory"
-
-	// defaultKVEventsPort is the port this router listens on for KV events
-	// pushed by runtime sidecars in memory index mode.
-	defaultKVEventsPort = 9080
 )
 
 type KVCacheAwareArgs struct {
@@ -98,18 +94,9 @@ type KVCacheAwareArgs struct {
 	SGLangTokenizerPort int `yaml:"sglangTokenizerPort,omitempty"`
 	// IndexMode selects the coordination backend: "redis" (default) or "memory".
 	IndexMode string `yaml:"indexMode,omitempty"`
-	// KVEventsPort is the port this router listens on for KV events pushed by
-	// runtime sidecars (memory mode only, default 9080).
-	KVEventsPort int `yaml:"kvEventsPort,omitempty"`
-	// RuntimePort is the port of the runtime sidecar the router registers with
-	// (memory mode only, default 9000).
+	// RuntimePort is the port of the runtime sidecar the router streams KV
+	// events from (memory mode only, default 9000).
 	RuntimePort int `yaml:"runtimePort,omitempty"`
-	// RegistrationIntervalSeconds is the re-registration (heartbeat) interval
-	// (memory mode only, default 30).
-	RegistrationIntervalSeconds int `yaml:"registrationIntervalSeconds,omitempty"`
-	// RegistrationTTLSeconds is the registration TTL requested from sidecars;
-	// must exceed the registration interval (memory mode only, default 90).
-	RegistrationTTLSeconds int `yaml:"registrationTTLSeconds,omitempty"`
 	// MaxBlocksPerPod caps how many blocks a single pod may hold in the
 	// in-memory index across all models; at the cap, the pod's oldest blocks
 	// are evicted to store new ones (memory mode only, default 1048576).
@@ -245,17 +232,11 @@ func normalizeIndexMode(mode string) string {
 	}
 }
 
-// startMemoryMode starts the KV events listener, the sidecar registration
-// heartbeat, and the in-memory index GC.
+// startMemoryMode starts streaming KV events from the runtime sidecars and the
+// in-memory index GC.
 func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareArgs) {
 	if store == nil {
-		klog.Fatalf("KVCacheAware: memory mode requires a datastore for sidecar registration")
-	}
-	eventsPort := args.KVEventsPort
-	if eventsPort == 0 {
-		eventsPort = defaultKVEventsPort
-	} else if eventsPort < 1 || eventsPort > maxTokenizerPort {
-		klog.Fatalf("KVCacheAware: invalid kvEventsPort %d, must be within [1, %d]", eventsPort, maxTokenizerPort)
+		klog.Fatalf("KVCacheAware: memory mode requires a datastore to find runtime sidecars")
 	}
 	runtimePort := args.RuntimePort
 	if runtimePort == 0 {
@@ -263,34 +244,13 @@ func (t *KVCacheAware) startMemoryMode(store datastore.Store, args KVCacheAwareA
 	} else if runtimePort < 1 || runtimePort > maxTokenizerPort {
 		klog.Fatalf("KVCacheAware: invalid runtimePort %d, must be within [1, %d]", runtimePort, maxTokenizerPort)
 	}
-	intervalSec := args.RegistrationIntervalSeconds
-	if intervalSec <= 0 {
-		intervalSec = defaultRegistrationIntervalSec
-	}
-	ttlSec := args.RegistrationTTLSeconds
-	if ttlSec <= intervalSec {
-		ttlSec = defaultRegistrationTTLSec
-		if ttlSec <= intervalSec {
-			ttlSec = intervalSec * 3
-		}
-	}
 
-	resolver := newKVEventSourceResolver(store)
-	store.RegisterCallback("Pod", resolver.invalidate)
-	startKVEventsServer(eventsPort, t.memoryIndex, resolver.resolveOwner)
 	go t.memoryIndex.runGC(context.Background(), kvCacheGCInterval, kvCacheFieldFreshDuration)
-
-	endpoint, err := routerSelfEndpoint(eventsPort)
-	if err != nil {
-		klog.Errorf("KVCacheAware: memory mode enabled but router endpoint cannot be derived (%v); "+
-			"sidecar registration disabled, kvcache-aware scoring will not work", err)
-		return
-	}
-
-	registrar := newKVRouterRegistrar(store, t.memoryIndex, routerInstanceID(), endpoint, runtimePort, intervalSec, ttlSec)
-	go registrar.run(context.Background())
-	klog.Infof("KVCacheAware: memory mode active, eventsPort=%d, runtimePort=%d, interval=%ds, ttl=%ds, maxBlocksPerPod=%d, endpoint=%s",
-		eventsPort, runtimePort, intervalSec, ttlSec, t.memoryIndex.maxBlocksPerOwner, endpoint)
+	subscriber := newKVEventSubscriber(store, t.memoryIndex, routerInstanceID(), runtimePort)
+	store.RegisterCallback("Pod", subscriber.onPodEvent)
+	go subscriber.run(context.Background())
+	klog.Infof("KVCacheAware: memory mode active, runtimePort=%d, maxBlocksPerPod=%d",
+		runtimePort, t.memoryIndex.maxBlocksPerOwner)
 }
 
 func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {

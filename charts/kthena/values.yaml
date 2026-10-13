@@ -36,6 +36,15 @@ workload:
         serviceName: kthena-controller-manager-webhook
     # -- Tolerations for Controller Manager pods.
     tolerations: []
+    evictionWebhook:
+      # -- Enable pods/eviction protection webhook for ModelServing.
+      enabled: false
+      # -- Failure policy for the pods/eviction webhook.
+      failurePolicy: Fail
+      # -- Timeout for the pods/eviction webhook.
+      timeoutSeconds: 5
+      # -- ConfigMap-backed disruption tracker TTL in seconds.
+      trackerTTLSeconds: 60
 
 networking:
   # -- Enable the networking subchart.

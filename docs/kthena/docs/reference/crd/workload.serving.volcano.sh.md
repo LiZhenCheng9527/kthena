@@ -224,6 +224,24 @@ _Appears in:_
 | `ratioConstraint` _[RoleRatioConstraint](#roleratioconstraint)_ | RatioConstraint defines the acceptable ratio range of a single role pair.<br />It enforces that replicas[numeratorRole] / replicas[denominatorRole] stays<br />within [minRatio, maxRatio] when denominator replica is non-zero. |  |  |
 
 
+#### EvictionStrategySpec
+
+
+
+EvictionStrategySpec defines the protection policy during node eviction.
+
+
+
+_Appears in:_
+- [RolloutStrategy](#rolloutstrategy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `protectionLevel` _[ProtectionLevelType](#protectionleveltype)_ | ProtectionLevel defines the protection level: ServingGroup or Role.<br />- ServingGroup: guarantees that the number of ready ServingGroups is not below the threshold.<br />- Role: guarantees that the number of ready instances for each role is not below the threshold. | ServingGroup | Enum: [ServingGroup Role] <br /> |
+| `minAvailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util)_ | MinAvailable defines the minimum number of available ServingGroup instances.<br />It is used only when protectionLevel is ServingGroup.<br />It can be an absolute number (ex: 3) or a percentage of total instances (ex: 80%). |  |  |
+| `roleMinAvailable` _object (keys:string, values:[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#intorstring-intstr-util))_ | RoleMinAvailable defines role-specific minimum available role instances.<br />It is used only when protectionLevel is Role. Map keys must match names in spec.template.roles.<br />If a role is absent from this map, it is not protected by the eviction budget.<br />Values can be absolute numbers (ex: 3) or percentages of total role instances (ex: 80%). |  |  |
+
+
 #### GangPolicy
 
 
@@ -862,6 +880,23 @@ _Appears in:_
 | `auth` _[PrometheusAuth](#prometheusauth)_ | Auth holds optional authentication configuration for the Prometheus server. |  |  |
 
 
+#### ProtectionLevelType
+
+_Underlying type:_ _string_
+
+ProtectionLevelType defines the level of protection during eviction.
+
+
+
+_Appears in:_
+- [EvictionStrategySpec](#evictionstrategyspec)
+
+| Field | Description |
+| --- | --- |
+| `ServingGroup` | ProtectionLevelServingGroup guarantees that the number of ready ServingGroups is not below the threshold.<br /> |
+| `Role` | ProtectionLevelRole guarantees that the number of ready instances for each role is not below the threshold.<br /> |
+
+
 #### RecoveryPolicy
 
 _Underlying type:_ _string_
@@ -995,6 +1030,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `type` _[RolloutStrategyType](#rolloutstrategytype)_ | Type selects the granularity of rolling updates. Supported values are<br />ServingGroupRollingUpdate and RoleRollingUpdate. It defaults to<br />ServingGroupRollingUpdate.<br />ServingGroupRollingUpdate uses rolloutStrategy.rollingUpdateConfiguration;<br />rolling update settings on individual Roles do not take effect.<br />RoleRollingUpdate uses the rolling update configuration on each Role;<br />rolloutStrategy.rollingUpdateConfiguration must not be set.<br />Kthena performs RoleRollingUpdate across all ServingGroups at the same time.<br />Therefore, we recommend using it only in scenarios with a single ServingGroup. | ServingGroupRollingUpdate | Enum: [ServingGroupRollingUpdate RoleRollingUpdate] <br /> |
 | `rollingUpdateConfiguration` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdateConfiguration configures ServingGroupRollingUpdate.<br />It must not be set when type is RoleRollingUpdate; configure maxUnavailable<br />maxSurge, and partition on each Role instead. |  |  |
+| `evictionStrategy` _[EvictionStrategySpec](#evictionstrategyspec)_ | EvictionStrategy defines the protection policy during node eviction. |  |  |
 
 
 #### RolloutStrategyType

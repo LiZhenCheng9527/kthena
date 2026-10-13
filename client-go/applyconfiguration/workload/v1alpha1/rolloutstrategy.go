@@ -43,6 +43,8 @@ type RolloutStrategyApplyConfiguration struct {
 	// It must not be set when type is RoleRollingUpdate; configure maxUnavailable
 	// maxSurge, and partition on each Role instead.
 	RollingUpdateConfiguration *RollingUpdateConfigurationApplyConfiguration `json:"rollingUpdateConfiguration,omitempty"`
+	// EvictionStrategy defines the protection policy during node eviction.
+	EvictionStrategy *EvictionStrategySpecApplyConfiguration `json:"evictionStrategy,omitempty"`
 }
 
 // RolloutStrategyApplyConfiguration constructs a declarative configuration of the RolloutStrategy type for use with
@@ -64,5 +66,13 @@ func (b *RolloutStrategyApplyConfiguration) WithType(value workloadv1alpha1.Roll
 // If called multiple times, the RollingUpdateConfiguration field is set to the value of the last call.
 func (b *RolloutStrategyApplyConfiguration) WithRollingUpdateConfiguration(value *RollingUpdateConfigurationApplyConfiguration) *RolloutStrategyApplyConfiguration {
 	b.RollingUpdateConfiguration = value
+	return b
+}
+
+// WithEvictionStrategy sets the EvictionStrategy field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the EvictionStrategy field is set to the value of the last call.
+func (b *RolloutStrategyApplyConfiguration) WithEvictionStrategy(value *EvictionStrategySpecApplyConfiguration) *RolloutStrategyApplyConfiguration {
+	b.EvictionStrategy = value
 	return b
 }

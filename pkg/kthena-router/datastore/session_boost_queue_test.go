@@ -573,6 +573,79 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	}
 }
 
+// TestSessionBoostQueue_DequeueOrHoldPendingRelease covers the handling of an
+// arrival or a recheck. When a release is pending at the same time, select may
+// pick either signal first, so this handling must not hand the freed slot to the
+// head of the queue without the grace wait. The context is cancelled up front:
+// a grace wait then returns without dispatching, while a direct dequeue still
+// admits, so whether the held request is admitted shows which path was taken.
+func TestSessionBoostQueue_DequeueOrHoldPendingRelease(t *testing.T) {
+	tests := []struct {
+		name               string
+		gracePeriod        time.Duration
+		releasePending     bool
+		wantAdmitted       bool
+		wantReleasePending bool
+	}{
+		{name: "pending release holds the freed slot for grace", gracePeriod: time.Hour, releasePending: true, wantAdmitted: false, wantReleasePending: false},
+		{name: "no pending release admits directly", gracePeriod: time.Hour, releasePending: false, wantAdmitted: true, wantReleasePending: false},
+		{name: "grace disabled admits directly", gracePeriod: 0, releasePending: true, wantAdmitted: true, wantReleasePending: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := sessionBoostConfig()
+			cfg.SessionBoostGracePeriod = tt.gracePeriod
+			cfg.InflightPerPod = 1
+			q := newSessionBoostQueue(cfg, func() bool { return true })
+			defer q.Close()
+
+			// Fill the only slot, then hold a second request behind it.
+			now := time.Now()
+			req1 := &Request{UserID: "u1", ModelName: "m", RequestTime: now, NotifyChan: make(chan struct{})}
+			if err := q.PushRequest(req1); err != nil {
+				t.Fatalf("PushRequest failed: %v", err)
+			}
+			<-q.notifyCh
+			q.tryBackpressureDequeue(context.Background())
+			select {
+			case <-req1.NotifyChan:
+			default:
+				t.Fatal("req-1 should be admitted")
+			}
+			held := &Request{UserID: "u2", ModelName: "m", RequestTime: now.Add(time.Millisecond), NotifyChan: make(chan struct{})}
+			if err := q.PushRequest(held); err != nil {
+				t.Fatalf("PushRequest failed: %v", err)
+			}
+			<-q.notifyCh
+
+			// Free the slot. Without a pending release, its signal has already
+			// been handled.
+			req1.Release()
+			if !tt.releasePending {
+				<-q.releaseCh
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			q.dequeueOrHoldPendingRelease(ctx, tt.gracePeriod > 0)
+
+			admitted := false
+			select {
+			case <-held.NotifyChan:
+				admitted = true
+			default:
+			}
+			if admitted != tt.wantAdmitted {
+				t.Errorf("held request admitted = %v, want %v", admitted, tt.wantAdmitted)
+			}
+			if got := len(q.releaseCh) == 1; got != tt.wantReleasePending {
+				t.Errorf("release pending = %v, want %v", got, tt.wantReleasePending)
+			}
+		})
+	}
+}
+
 func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 	checker := func() bool { return true }
 

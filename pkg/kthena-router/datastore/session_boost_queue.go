@@ -227,23 +227,29 @@ func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
 			} else {
 				pq.tryBackpressureDequeue(ctx)
 			}
-		// A fresh request was enqueued. With grace enabled, if a release is also
-		// pending, route through the grace path so the freed slot is held for a
-		// same-session follow-up; otherwise admit immediately so an idle queue need
-		// not wait for the next signal.
+		// A fresh request was enqueued. Admit immediately so an idle queue need not
+		// wait for the next signal, unless a release is also pending.
 		case <-pq.notifyCh:
-			if grace && pq.drainPendingRelease() {
-				pq.waitGraceAndDequeue(ctx)
-			} else {
-				pq.tryBackpressureDequeue(ctx)
-			}
-		// Backend metrics were refreshed while requests were held. Re-check
-		// admission directly: this is not a freed slot, so there is nothing for
-		// the grace period to hold.
+			pq.dequeueOrHoldPendingRelease(ctx, grace)
+		// Backend metrics were refreshed while requests were held. This is not a
+		// freed slot, so re-check admission directly, unless a release is also
+		// pending.
 		case <-pq.recheckCh:
-			pq.tryBackpressureDequeue(ctx)
+			pq.dequeueOrHoldPendingRelease(ctx, grace)
 		}
 	}
+}
+
+// dequeueOrHoldPendingRelease handles a signal that did not itself free a slot:
+// an arrival or a backend metrics refresh. With grace enabled, if a release is
+// also pending, it routes through the grace path so the freed slot is held for a
+// same-session follow-up; otherwise it re-checks admission directly.
+func (pq *RequestPriorityQueue) dequeueOrHoldPendingRelease(ctx context.Context, grace bool) {
+	if grace && pq.drainPendingRelease() {
+		pq.waitGraceAndDequeue(ctx)
+		return
+	}
+	pq.tryBackpressureDequeue(ctx)
 }
 
 // RecheckBackpressure asks the session-boost dequeue loop to re-evaluate held
@@ -267,9 +273,9 @@ func (pq *RequestPriorityQueue) RecheckBackpressure() {
 }
 
 // drainPendingRelease non-blockingly consumes one pending release signal, reporting
-// whether one was present. It lets the arrival branch prefer the grace path when a
-// release is also waiting, keeping that ordering deterministic despite select's
-// random choice between simultaneously-ready cases.
+// whether one was present. It lets the arrival and recheck branches prefer the
+// grace path when a release is also waiting, keeping that ordering deterministic
+// despite select's random choice between simultaneously-ready cases.
 func (pq *RequestPriorityQueue) drainPendingRelease() bool {
 	select {
 	case <-pq.releaseCh:

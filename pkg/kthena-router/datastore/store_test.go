@@ -920,7 +920,6 @@ func TestStoreDeleteModelRoute(t *testing.T) {
 	})
 }
 
-// TestStoreDeleteModelRoute_RequestQueueCleanup specifically tests the cleanup of request queues
 func TestStoreRecheckSessionBoostQueues(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -960,6 +959,7 @@ func TestStoreRecheckSessionBoostQueues(t *testing.T) {
 	}
 }
 
+// TestStoreDeleteModelRoute_RequestQueueCleanup specifically tests the cleanup of request queues
 func TestStoreDeleteModelRoute_RequestQueueCleanup(t *testing.T) {
 	s := &store{
 		routeInfo:           make(map[string]*modelRouteInfo),

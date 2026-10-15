@@ -103,7 +103,9 @@ func (l *LeastRequest) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		}
 	}
 
-	// Normalise to [0, 100]: the least-loaded pod gets 100.
+	// Normalise to [0, 100] against maxScore (truncate to int): when
+	// maxScore > 0, the most-loaded pod gets 0 and a pod with base 0 gets 100;
+	// when maxScore == 0, all pods get 100.
 	for i, info := range pods {
 		score := 100.0
 		if maxScore > 0 {

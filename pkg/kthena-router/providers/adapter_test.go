@@ -621,6 +621,28 @@ func TestOpenAIAdapterResponseParser(t *testing.T) {
 		assert.True(t, parser.StreamCompleted())
 	})
 
+	// The space after the colon is optional, so a backend may send the
+	// terminator without it. Missing it leaves the stream looking unfinished,
+	// and ForwardStream then reports a clean disconnect as context.Canceled.
+	t.Run("the DONE terminator is recognised without the optional space", func(t *testing.T) {
+		for _, tc := range []struct {
+			line string
+			want bool
+		}{
+			{line: "data: [DONE]\n", want: true},
+			{line: "data:[DONE]\n", want: true},
+			// Only one space is stripped, so the value here is " [DONE]".
+			{line: "data:  [DONE]\n", want: false},
+			// A leading space makes the field name " data", not "data".
+			{line: " data: [DONE]\n", want: false},
+			{line: "data: {\"choices\":[]}\n", want: false},
+		} {
+			parser := adapter.ResponseParser(nil, "/v1/chat/completions")
+			parser.RecordStreamLineWritten(tc.line)
+			assert.Equal(t, tc.want, parser.StreamCompleted(), "line %q", tc.line)
+		}
+	})
+
 	t.Run("responses", func(t *testing.T) {
 		newParser := func() ResponseUsageParser { return adapter.ResponseParser(nil, "/v1/responses") }
 		wantUsage := TokenUsage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15}

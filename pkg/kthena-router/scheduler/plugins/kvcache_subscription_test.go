@@ -325,6 +325,24 @@ func TestKVEventSubscriber_CancelledStreamWaitsForItsPredecessor(t *testing.T) {
 	}
 }
 
+func TestKVEventSubscriber_DoesNotFollowRedirects(t *testing.T) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("registration was redirected to %s", r.URL)
+	}))
+	t.Cleanup(elsewhere.Close)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+runtimeRegisterPath, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(sidecar.Close)
+	port := sidecar.Listener.Addr().(*net.TCPAddr).Port
+
+	subscriber := newKVEventSubscriber(newFakePodLister(), NewKVBlockMemoryIndex(0), "router-0", port)
+	opened, err := subscriber.stream(context.Background(), "pod-a.default", "127.0.0.1")
+	if opened || err == nil {
+		t.Fatalf("stream() = %v, %v; want a failure to open the stream", opened, err)
+	}
+}
+
 func TestKVEventSubscriber_DropsBlocksWhenStreamEnds(t *testing.T) {
 	tests := []struct {
 		name string

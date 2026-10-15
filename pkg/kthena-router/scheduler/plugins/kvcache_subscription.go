@@ -143,6 +143,11 @@ func newKVEventSubscriber(store podLister, index *KVBlockMemoryIndex, routerID s
 				// Every stream holds its own connection until it ends.
 				DisableKeepAlives: true,
 			},
+			// The events of a stream are attributed to the pod the router
+			// dialed, so a stream must not be received from anywhere else.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		idleTimeout: kvStreamIdleTimeout,
 		minBackoff:  kvStreamMinBackoff,

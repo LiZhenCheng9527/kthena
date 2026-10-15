@@ -268,6 +268,9 @@ func (s *SchedulerImpl) RunFilterPlugins(pods []*datastore.PodInfo, ctx *framewo
 
 func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framework.Context) map[*datastore.PodInfo]int {
 	res := make(map[*datastore.PodInfo]int, len(pods))
+	for _, pod := range pods {
+		res[pod] = 0
+	}
 	// Checked once: V(4) arguments are boxed before klog can discard them
 	logScores := klog.V(4).Enabled()
 	for _, scorePlugin := range s.scorePlugins {
@@ -291,10 +294,9 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 				}
 			}
 			if _, ok := res[k]; !ok {
-				res[k] = v * scorePlugin.weight
-			} else {
-				res[k] += v * scorePlugin.weight
+				continue
 			}
+			res[k] += v * scorePlugin.weight
 		}
 	}
 

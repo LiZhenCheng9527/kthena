@@ -254,8 +254,9 @@ func (s *kvEventSubscriber) sync(ctx context.Context) {
 }
 
 // startLocked starts the stream of owner from target. prev is the done channel
-// of the previous stream of the same owner: the new stream waits for it, so
-// the previous stream cannot drop blocks the new one already received.
+// of the previous stream of the same owner, which has been cancelled: the new
+// stream waits for it, so the previous stream cannot drop blocks the new one
+// already received.
 func (s *kvEventSubscriber) startLocked(ctx context.Context, owner string, target kvStreamTarget, prev <-chan struct{}) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream := &kvStream{target: target, cancel: cancel, done: make(chan struct{})}
@@ -277,9 +278,12 @@ func isClosed(ch <-chan struct{}) bool {
 func (s *kvEventSubscriber) follow(ctx context.Context, owner, ip string, prev <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	if prev != nil {
-		select {
-		case <-prev:
-		case <-ctx.Done():
+		// Wait even if ctx is done: done must not be closed before prev, or
+		// a stream started after this one would only wait for this one, and
+		// could receive blocks that the still running previous stream drops.
+		// The previous stream was cancelled, so it ends soon.
+		<-prev
+		if ctx.Err() != nil {
 			return
 		}
 	}

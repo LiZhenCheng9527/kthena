@@ -301,6 +301,30 @@ func TestKVEventSubscriber_ReopensStreamOfReplacedPod(t *testing.T) {
 	waitForOwners(t, idx, "qwen", 2, "pod-a.default")
 }
 
+// A stream replaced while it still waits for its own predecessor must keep
+// waiting for it: otherwise the next stream, which only waits for the
+// replaced one, could receive blocks the predecessor drops when it ends.
+func TestKVEventSubscriber_CancelledStreamWaitsForItsPredecessor(t *testing.T) {
+	subscriber := newKVEventSubscriber(newFakePodLister(), NewKVBlockMemoryIndex(0), "router-0", 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prev := make(chan struct{})
+	done := make(chan struct{})
+	go subscriber.follow(ctx, "pod-a.default", "127.0.0.1", prev, done)
+
+	select {
+	case <-done:
+		t.Fatal("cancelled stream ended before its predecessor")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(prev)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled stream did not end after its predecessor")
+	}
+}
+
 func TestKVEventSubscriber_DropsBlocksWhenStreamEnds(t *testing.T) {
 	tests := []struct {
 		name string

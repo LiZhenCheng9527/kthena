@@ -459,6 +459,30 @@ func TestStoreAddOrUpdatePod(t *testing.T) {
 	}
 }
 
+func TestStoreAddOrUpdatePodFiresPodEvents(t *testing.T) {
+	s := &store{
+		modelServer: sync.Map{},
+		pods:        sync.Map{},
+		callbacks:   make(map[string][]CallbackFunc),
+	}
+	ms := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "model1"}}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod1"}}
+
+	events := make(chan EventData, 1)
+	s.RegisterCallback("Pod", func(data EventData) { events <- data })
+
+	for _, want := range []EventType{EventAdd, EventUpdate} {
+		assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+		select {
+		case got := <-events:
+			assert.Equal(t, EventData{EventType: want, Pod: utils.GetNamespaceName(pod)}, got)
+		case <-time.After(time.Second):
+			t.Fatalf("no Pod %s event fired", want)
+		}
+	}
+}
+
 func TestStoreDeletePod(t *testing.T) {
 	podName := types.NamespacedName{Namespace: "default", Name: "pod1"}
 	modelServerName := types.NamespacedName{Namespace: "default", Name: "model1"}

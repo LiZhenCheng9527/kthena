@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from fastapi import BackgroundTasks
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from kthena.downloader.app import load_config
 from kthena.downloader.downloader import download_model
@@ -36,18 +37,19 @@ from kthena.runtime.kv_cache_manager import (
     get_vllm_kv_cache_handler,
     get_sglang_kv_cache_handler,
 )
-from kthena.runtime.memory_kv_manager import get_memory_kv_manager
-from kthena.runtime.redis_client import get_redis_client
-from kthena.runtime.router_registry import (
-    DEFAULT_ROUTER_TTL_SECONDS,
-    get_router_registry,
+from kthena.runtime.memory_kv_manager import (
+    MemoryKVCacheManager,
+    RouterStream,
+    RouterStreamUnavailable,
+    get_memory_kv_manager,
 )
+from kthena.runtime.redis_client import get_redis_client
 from kthena.runtime.standard import MetricStandard, EngineType
 from kthena.runtime.zmq_subscriber import get_vllm_zmq_subscriber
 from kthena.runtime.sglang_zmq_subscriber import get_sglang_zmq_subscriber
 
 # KV event sync backend: "redis" writes standardized block hashes to Redis;
-# "memory" pushes them directly to registered router instances.
+# "memory" streams them directly to registered router instances.
 KV_SYNC_MODE_REDIS = "redis"
 KV_SYNC_MODE_MEMORY = "memory"
 
@@ -121,7 +123,7 @@ async def lifespan(app: FastAPI):
     if state.kv_sync_mode == KV_SYNC_MODE_MEMORY:
         state.memory_kv_manager = get_memory_kv_manager()
         state.redis_client = None
-        logger.info("KV event sync mode: memory (push to registered routers)")
+        logger.info("KV event sync mode: memory (stream to registered routers)")
     else:
         try:
             redis_client = get_redis_client()
@@ -245,24 +247,23 @@ async def health_check() -> JSONResponse:
 
 
 @router.post("/kvcache/routers/register", tags=["KVCache"])
-async def register_router(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
-    """Register (or renew) a router instance for in-memory KV event push.
+async def register_router(request: Request) -> StreamingResponse:
+    """Register a router instance and stream KV events to it.
 
     Request body:
-    - router_id: str - Unique identifier of the router instance (e.g. pod name)
-    - endpoint: str - Base URL the runtime pushes KV events to,
-      e.g. "http://10.0.0.5:9080"
-    - generation: str (optional) - Identifier of the router process; changes
-      when the router container restarts so a fresh snapshot is pushed
-    - ttl_seconds: int (optional) - Registration TTL; routers must re-register
-      before it expires (default: 90)
+    - router_id: str - Unique identifier of the router instance; a new
+      registration replaces the stream of the same router
 
-    When the registration is new (renewed after expiry, or from a new process
-    generation), or when a previous event push to this router failed, the
-    current KV block snapshot is pushed to the router in the background.
+    The response is an application/x-ndjson stream that stays open until the
+    router closes it. Every line is a JSON object
+    {"model_name": str, "events": [...]} with stored/removed/cleared events of
+    standardized block hashes. The stream starts with the full block set as
+    stored events, and carries an empty heartbeat line when it is otherwise
+    idle. Events always belong to this runtime's pod: the router attributes
+    them to the pod it connected to.
     """
     state = get_app_state(request.app)
-    if state.kv_sync_mode != KV_SYNC_MODE_MEMORY:
+    if state.kv_sync_mode != KV_SYNC_MODE_MEMORY or state.memory_kv_manager is None:
         raise HTTPException(
             status_code=409,
             detail="Runtime is not in memory KV event sync mode "
@@ -277,32 +278,33 @@ async def register_router(request: Request, background_tasks: BackgroundTasks) -
             status_code=400, detail="Request body must be a JSON object")
 
     router_id = body.get("router_id")
-    endpoint = body.get("endpoint")
-    generation = body.get("generation", "")
-    ttl_seconds = body.get("ttl_seconds", DEFAULT_ROUTER_TTL_SECONDS)
+    if not isinstance(router_id, str) or not router_id:
+        raise HTTPException(
+            status_code=400, detail="router_id must be a non-empty string")
 
+    manager = state.memory_kv_manager
     try:
-        needs_snapshot = get_router_registry().register(
-            router_id, endpoint, ttl_seconds, generation)
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        stream = manager.open_stream(router_id)
+    except RouterStreamUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return _RouterStreamResponse(manager, stream)
 
-    if state.memory_kv_manager and state.pod_identifier:
-        endpoint_base = endpoint.rstrip("/")
-        # Also resend a snapshot when a previous push to this router failed,
-        # so a transient delivery failure cannot leave it divergent forever.
-        if needs_snapshot or state.memory_kv_manager.is_dirty(endpoint_base):
-            needs_snapshot = True
-            background_tasks.add_task(
-                state.memory_kv_manager.push_snapshot,
-                endpoint_base,
-                state.pod_identifier,
-            )
 
-    return JSONResponse(
-        content={"registered": True, "snapshot_scheduled": needs_snapshot},
-        status_code=200,
-    )
+class _RouterStreamResponse(StreamingResponse):
+    """Sends a router stream through MemoryKVCacheManager.serve, which
+    cancels the response once the stream has ended but the response has
+    not."""
+
+    def __init__(self, manager: MemoryKVCacheManager, stream: RouterStream):
+        super().__init__(manager.iter_stream(stream),
+                         media_type="application/x-ndjson")
+        self._manager = manager
+        self._stream = stream
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self._manager.serve(
+            self._stream,
+            functools.partial(super().__call__, scope, receive, send))
 
 
 @router.get("/metrics", tags=["Metrics"])
@@ -416,6 +418,26 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Bound of the graceful shutdown. Connections whose client does not read
+# never close: closing them waits until the pending response data is sent.
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
+
+
+class _Server(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config):
+        if config.timeout_graceful_shutdown is None:
+            config.timeout_graceful_shutdown = GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+        super().__init__(config)
+
+    async def shutdown(self, sockets=None) -> None:
+        # Router KV event streams never end on their own, and the server
+        # waits for open requests to finish before shutting down.
+        app_state = getattr(self.config.app.state, "app_state", None)
+        if app_state is not None and app_state.memory_kv_manager is not None:
+            await app_state.memory_kv_manager.close()
+        await super().shutdown(sockets=sockets)
+
+
 def main() -> None:
     try:
         args = parse_arguments()
@@ -423,12 +445,12 @@ def main() -> None:
 
         logger.info("Starting service on %s:%s", args.host, args.port)
 
-        uvicorn.run(
+        _Server(uvicorn.Config(
             app,
             host=args.host,
             port=args.port,
             log_level="info"
-        )
+        )).run()
 
     except KeyboardInterrupt:
         logger.info("Service stopped by user")

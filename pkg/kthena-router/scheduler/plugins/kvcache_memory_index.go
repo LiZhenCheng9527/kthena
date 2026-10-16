@@ -19,62 +19,63 @@ package plugins
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/http"
+	"maps"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"k8s.io/klog/v2"
 )
 
 // The in-memory KV index ("memory" index mode) replaces the shared Redis
-// block matrix with a per-router-process index kept in sync by push:
+// block matrix with a per-router-process index kept in sync by streamed KV events:
 //
 //  1. The runtime sidecar next to each inference engine subscribes to the
 //     engine's KV cache events, converts engine block hashes into
 //     standardized token-block hashes, and keeps the authoritative
 //     per-model block set for its pod
 //     (python/kthena/runtime/memory_kv_manager.py).
-//  2. Every router periodically registers with each runtime sidecar
-//     (kvcache_registration.go), announcing its push endpoint, a TTL, and a
-//     per-process generation.
-//  3. Sidecars push incremental stored/removed/cleared deltas to all
-//     registered routers, and push a full replace-style snapshot to a router
-//     whose process is new (generation change or expired registration) or
-//     whose previous push failed, so a router can always rebuild its index.
-//  4. Each router applies these events to its KVBlockMemoryIndex and scores
+//  2. Every router opens one long-lived connection to the runtime sidecar of
+//     each model-serving pod in its datastore (kvcache_subscription.go). The
+//     sidecar answers with a stream that starts with the pod's full block
+//     set and continues with its stored/removed/cleared deltas.
+//  3. Each router applies these events to its KVBlockMemoryIndex and scores
 //     pods by longest prefix match exactly like the Redis backend; a
 //     periodic GC drops entries not refreshed within the freshness window.
 //
-// KV event types pushed by the runtime sidecar in memory sync mode.
+// Events are attributed to the pod the router connected to, never to
+// anything in the stream, and the router exposes no endpoint for them.
+// Store times are capped at the receive time and every pod's share of the
+// index is bounded, so a misbehaving pod cannot pin entries past GC or grow
+// router memory without limit.
+//
+// KV event types streamed by the runtime sidecar in memory sync mode.
 // Kept in sync by hand with python/kthena/runtime/memory_kv_manager.py.
 const (
-	kvEventStored   = "stored"
-	kvEventRemoved  = "removed"
-	kvEventCleared  = "cleared"
-	kvEventSnapshot = "snapshot"
+	kvEventStored  = "stored"
+	kvEventRemoved = "removed"
+	kvEventCleared = "cleared"
 )
 
-// KVEvent is a single KV cache event carried in a push payload. All block
+// KVEvent is a single KV cache event carried in a KV events message. All block
 // hashes are standardized hashes computed by the runtime sidecar.
 type KVEvent struct {
 	Type        string   `json:"type"`
 	BlockHashes []uint64 `json:"block_hashes,omitempty"`
 	Timestamp   int64    `json:"timestamp,omitempty"`
 	// Timestamps optionally carries one unix-second store time per entry of
-	// BlockHashes. Snapshots use it to preserve original store times instead
-	// of re-stamping every block at snapshot time, which would defeat the
-	// engine-restart freshness filter.
+	// BlockHashes. The initial block set of a stream uses it to preserve
+	// original store times instead of re-stamping every block when it is
+	// sent, which would defeat the engine-restart freshness filter.
 	Timestamps []int64 `json:"timestamps,omitempty"`
 }
 
-// KVEventPayload is the body of POST /kvcache/events pushed by a runtime sidecar.
+// KVEventPayload is one message, i.e. one line, of the KV events stream of a
+// runtime sidecar.
 type KVEventPayload struct {
-	PodIdentifier string    `json:"pod_identifier"`
-	ModelName     string    `json:"model_name"`
-	Events        []KVEvent `json:"events"`
+	ModelName string    `json:"model_name"`
+	Events    []KVEvent `json:"events"`
 }
 
 // An owner is the pod identifier of the inference engine pod that holds a
@@ -82,39 +83,60 @@ type KVEventPayload struct {
 // identifier the Redis backend stores as hash field names, so lookup results
 // flow through the shared scoring path unchanged.
 //
-// ownerModelKey indexes per-owner-per-model block sets for removal and snapshots.
+// ownerModelKey indexes per-owner-per-model block sets for removal and clearing.
 type ownerModelKey struct {
 	owner string
 	model string
 }
+
+// defaultMaxBlocksPerPod is the default upper bound of blocks a single pod may
+// hold in the index across all models. It is far above the KV cache capacity
+// of a single engine (1Mi blocks of 16 tokens is ~16.7M cached tokens) and only
+// exists to bound router memory.
+const defaultMaxBlocksPerPod = 1 << 20
 
 // KVBlockMemoryIndex is an in-memory replacement for the Redis block matrix.
 // It stores which pod (owner) currently caches which standardized token block
 // hash, per model, together with the time the block was last stored.
 type KVBlockMemoryIndex struct {
 	mu sync.RWMutex
+	// maxBlocksPerOwner caps ownerTotals; an owner at the cap evicts its
+	// oldest blocks to store new ones, see evictOldestLocked.
+	maxBlocksPerOwner int
 	// model -> block hash -> owner(podName.namespace) -> unix seconds of last store
 	blocks map[string]map[uint64]map[string]int64
-	// reverse index for cleared/snapshot events
-	ownerBlocks map[ownerModelKey]map[uint64]struct{}
+	// reverse index for cleared events, pod removal and eviction:
+	// owner+model -> block hash -> unix seconds of last store, same as in blocks
+	ownerBlocks map[ownerModelKey]map[uint64]int64
+	// owner -> number of blocks held across all models
+	ownerTotals map[string]int
 }
 
-func NewKVBlockMemoryIndex() *KVBlockMemoryIndex {
+// NewKVBlockMemoryIndex creates an index that holds at most maxBlocksPerOwner
+// blocks per pod; a non-positive value selects defaultMaxBlocksPerPod.
+func NewKVBlockMemoryIndex(maxBlocksPerOwner int) *KVBlockMemoryIndex {
+	if maxBlocksPerOwner <= 0 {
+		maxBlocksPerOwner = defaultMaxBlocksPerPod
+	}
 	return &KVBlockMemoryIndex{
-		blocks:      make(map[string]map[uint64]map[string]int64),
-		ownerBlocks: make(map[ownerModelKey]map[uint64]struct{}),
+		maxBlocksPerOwner: maxBlocksPerOwner,
+		blocks:            make(map[string]map[uint64]map[string]int64),
+		ownerBlocks:       make(map[ownerModelKey]map[uint64]int64),
+		ownerTotals:       make(map[string]int),
 	}
 }
 
-// Apply updates the index with a pushed event payload.
-func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
-	if payload.PodIdentifier == "" || payload.ModelName == "" {
-		return fmt.Errorf("pod_identifier and model_name are required")
+// Apply updates the index with a KV events message received from owner.
+func (idx *KVBlockMemoryIndex) Apply(owner string, payload *KVEventPayload) error {
+	if owner == "" || payload.ModelName == "" {
+		return fmt.Errorf("owner and model_name are required")
 	}
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	now := time.Now().Unix()
+	evicted := 0
 	for _, event := range payload.Events {
 		if len(event.Timestamps) > 0 && len(event.Timestamps) != len(event.BlockHashes) {
 			return fmt.Errorf("timestamps length %d does not match block_hashes length %d",
@@ -122,52 +144,152 @@ func (idx *KVBlockMemoryIndex) Apply(payload *KVEventPayload) error {
 		}
 		switch event.Type {
 		case kvEventStored:
-			idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps)
+			evicted += idx.storeLocked(payload.ModelName, owner, event.BlockHashes, event.Timestamp, event.Timestamps, now)
 		case kvEventRemoved:
-			idx.removeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes)
+			idx.removeLocked(payload.ModelName, owner, event.BlockHashes)
 		case kvEventCleared:
-			idx.clearLocked(payload.ModelName, payload.PodIdentifier)
-		case kvEventSnapshot:
-			// A snapshot replaces everything known about this owner+model.
-			idx.clearLocked(payload.ModelName, payload.PodIdentifier)
-			idx.storeLocked(payload.ModelName, payload.PodIdentifier, event.BlockHashes, event.Timestamp, event.Timestamps)
+			idx.clearLocked(payload.ModelName, owner)
 		default:
 			return fmt.Errorf("unknown event type %q", event.Type)
 		}
 	}
+	if evicted > 0 {
+		klog.V(2).Infof("KVCacheAware: pod %s reached the limit of %d indexed blocks, evicted its %d oldest blocks",
+			owner, idx.maxBlocksPerOwner, evicted)
+	}
 	return nil
 }
 
-func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64, timestamp int64, timestamps []int64) {
+// clampStoreTime returns the store time to record for a streamed block. Store
+// times come from the pod: one in the future would never be garbage
+// collected and would defeat the restart freshness check, so it is capped at
+// the receive time; a missing one defaults to it.
+func clampStoreTime(ts, now int64) int64 {
+	if ts <= 0 || ts > now {
+		return now
+	}
+	return ts
+}
+
+// storeLocked records hashes as owned by owner and returns how many blocks of
+// owner were evicted to make room for them.
+func (idx *KVBlockMemoryIndex) storeLocked(model, owner string, hashes []uint64, timestamp int64, timestamps []int64, now int64) int {
 	if len(hashes) == 0 {
-		return
-	}
-	if timestamp <= 0 {
-		timestamp = time.Now().Unix()
-	}
-	modelBlocks, ok := idx.blocks[model]
-	if !ok {
-		modelBlocks = make(map[uint64]map[string]int64)
-		idx.blocks[model] = modelBlocks
+		return 0
 	}
 	key := ownerModelKey{owner: owner, model: model}
-	owned, ok := idx.ownerBlocks[key]
-	if !ok {
-		owned = make(map[uint64]struct{})
-		idx.ownerBlocks[key] = owned
-	}
+	modelBlocks, owned := idx.ownerModelLocked(key)
+	evicted := 0
 	for i, hash := range hashes {
+		ts := timestamp
+		if len(timestamps) > 0 && timestamps[i] > 0 {
+			ts = timestamps[i]
+		}
+		ts = clampStoreTime(ts, now)
+		if _, held := owned[hash]; !held {
+			if idx.ownerTotals[owner] >= idx.maxBlocksPerOwner {
+				evicted += idx.evictOldestLocked(owner)
+				// Eviction deletes the maps it empties, possibly these.
+				modelBlocks, owned = idx.ownerModelLocked(key)
+			}
+			idx.ownerTotals[owner]++
+		}
+		owned[hash] = ts
 		owners, ok := modelBlocks[hash]
 		if !ok {
 			owners = make(map[string]int64)
 			modelBlocks[hash] = owners
 		}
-		ts := timestamp
-		if len(timestamps) > 0 && timestamps[i] > 0 {
-			ts = timestamps[i]
-		}
 		owners[owner] = ts
-		owned[hash] = struct{}{}
+	}
+	return evicted
+}
+
+// ownerModelLocked returns the blocks of key.model and the blocks owned by
+// key.owner in that model, creating the maps if needed.
+func (idx *KVBlockMemoryIndex) ownerModelLocked(key ownerModelKey) (map[uint64]map[string]int64, map[uint64]int64) {
+	modelBlocks, ok := idx.blocks[key.model]
+	if !ok {
+		modelBlocks = make(map[uint64]map[string]int64)
+		idx.blocks[key.model] = modelBlocks
+	}
+	owned, ok := idx.ownerBlocks[key]
+	if !ok {
+		owned = make(map[uint64]int64)
+		idx.ownerBlocks[key] = owned
+	}
+	return modelBlocks, owned
+}
+
+// evictOldestLocked makes room for new blocks of owner, which holds
+// maxBlocksPerOwner blocks, by evicting its least recently stored blocks
+// across all models. Blocks left over from a previous incarnation of the pod
+// are older than its current ones, so they go first. A tenth of the limit is
+// evicted at once, so the scan over the owner's blocks is not repeated for
+// every new block. It returns the number of evicted blocks.
+func (idx *KVBlockMemoryIndex) evictOldestLocked(owner string) int {
+	n := max(1, idx.maxBlocksPerOwner/10)
+
+	// The n oldest blocks are those stored before cutoff, plus atCutoff of
+	// those stored at cutoff.
+	counts := make(map[int64]int)
+	for key, owned := range idx.ownerBlocks {
+		if key.owner != owner {
+			continue
+		}
+		for _, ts := range owned {
+			counts[ts]++
+		}
+	}
+	var cutoff int64
+	atCutoff := n
+	for _, ts := range slices.Sorted(maps.Keys(counts)) {
+		cutoff = ts
+		if counts[ts] >= atCutoff {
+			break
+		}
+		atCutoff -= counts[ts]
+	}
+
+	evicted := 0
+	for key, owned := range idx.ownerBlocks {
+		if key.owner != owner {
+			continue
+		}
+		modelBlocks := idx.blocks[key.model]
+		for hash, ts := range owned {
+			if ts > cutoff || (ts == cutoff && atCutoff == 0) {
+				continue
+			}
+			if ts == cutoff {
+				atCutoff--
+			}
+			delete(owned, hash)
+			if owners, ok := modelBlocks[hash]; ok {
+				delete(owners, owner)
+				if len(owners) == 0 {
+					delete(modelBlocks, hash)
+				}
+			}
+			evicted++
+		}
+		if len(owned) == 0 {
+			delete(idx.ownerBlocks, key)
+		}
+		if len(modelBlocks) == 0 {
+			delete(idx.blocks, key.model)
+		}
+	}
+	idx.releaseLocked(owner, evicted)
+	return evicted
+}
+
+// releaseLocked accounts for count blocks no longer held by owner.
+func (idx *KVBlockMemoryIndex) releaseLocked(owner string, count int) {
+	if remaining := idx.ownerTotals[owner] - count; remaining > 0 {
+		idx.ownerTotals[owner] = remaining
+	} else {
+		delete(idx.ownerTotals, owner)
 	}
 }
 
@@ -176,13 +298,17 @@ func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64
 	key := ownerModelKey{owner: owner, model: model}
 	owned := idx.ownerBlocks[key]
 	for _, hash := range hashes {
+		if _, held := owned[hash]; !held {
+			continue
+		}
+		delete(owned, hash)
+		idx.releaseLocked(owner, 1)
 		if owners, ok := modelBlocks[hash]; ok {
 			delete(owners, owner)
 			if len(owners) == 0 {
 				delete(modelBlocks, hash)
 			}
 		}
-		delete(owned, hash)
 	}
 	if len(owned) == 0 {
 		delete(idx.ownerBlocks, key)
@@ -195,7 +321,8 @@ func (idx *KVBlockMemoryIndex) removeLocked(model, owner string, hashes []uint64
 func (idx *KVBlockMemoryIndex) clearLocked(model, owner string) {
 	key := ownerModelKey{owner: owner, model: model}
 	modelBlocks := idx.blocks[model]
-	for hash := range idx.ownerBlocks[key] {
+	owned := idx.ownerBlocks[key]
+	for hash := range owned {
 		if owners, ok := modelBlocks[hash]; ok {
 			delete(owners, owner)
 			if len(owners) == 0 {
@@ -203,6 +330,7 @@ func (idx *KVBlockMemoryIndex) clearLocked(model, owner string) {
 			}
 		}
 	}
+	idx.releaseLocked(owner, len(owned))
 	delete(idx.ownerBlocks, key)
 	if len(modelBlocks) == 0 {
 		delete(idx.blocks, model)
@@ -237,7 +365,7 @@ func (idx *KVBlockMemoryIndex) GetBlockOwners(model string, hashes []uint64) map
 }
 
 // RemoveOwner drops every block owned by the given pod identifier across all
-// models, e.g. when the pod is deleted.
+// models, e.g. once the KV events stream of the pod ended.
 func (idx *KVBlockMemoryIndex) RemoveOwner(owner string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -274,6 +402,7 @@ func (idx *KVBlockMemoryIndex) gcStaleEntries(freshDuration time.Duration) {
 					key := ownerModelKey{owner: owner, model: model}
 					owned := idx.ownerBlocks[key]
 					delete(owned, hash)
+					idx.releaseLocked(owner, 1)
 					// Remove emptied parent entries so replaced pods do not
 					// leave empty maps behind indefinitely.
 					if len(owned) == 0 {
@@ -303,58 +432,4 @@ func (idx *KVBlockMemoryIndex) runGC(ctx context.Context, interval, freshDuratio
 			idx.gcStaleEntries(freshDuration)
 		}
 	}
-}
-
-// kvEventsMaxBodyBytes caps the request body accepted on the KV events
-// endpoint so oversized payloads cannot exhaust router memory.
-const kvEventsMaxBodyBytes = 4 << 20 // 4 MiB
-
-// kvEventsHandler handles POST /kvcache/events pushed by runtime sidecars.
-func kvEventsHandler(index *KVBlockMemoryIndex) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, kvEventsMaxBodyBytes)
-		var payload KVEventPayload
-		if err := c.ShouldBindJSON(&payload); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload: " + err.Error()})
-			return
-		}
-		if err := index.Apply(&payload); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		klog.V(4).Infof("KVCacheAware: applied %d pushed events from pod=%s model=%s",
-			len(payload.Events), payload.PodIdentifier, payload.ModelName)
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	}
-}
-
-// startKVEventsServer starts the HTTP listener that receives pushed KV events
-// from runtime sidecars when the plugin runs in memory index mode. The listener
-// is bound synchronously so a startup failure (e.g. the port is already in use)
-// fails the router instead of leaving it running without an index feed.
-func startKVEventsServer(port int, index *KVBlockMemoryIndex) {
-	engine := gin.New()
-	engine.Use(gin.Recovery())
-	engine.POST("/kvcache/events", kvEventsHandler(index))
-
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: engine.Handler(),
-		// Basic hardening against slow or stalled clients holding
-		// connections open on this cluster-reachable endpoint.
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
-	listener, err := net.Listen("tcp", server.Addr)
-	if err != nil {
-		klog.Fatalf("KVCacheAware: cannot listen on KV events port %d: %v", port, err)
-	}
-	go func() {
-		klog.Infof("KVCacheAware: starting KV events server on %s", server.Addr)
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			klog.Errorf("KVCacheAware: KV events server failed: %v", err)
-		}
-	}()
 }

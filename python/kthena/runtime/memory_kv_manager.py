@@ -13,38 +13,89 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import time
-from typing import Dict, List, Optional
-
-import httpx
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from kthena.runtime.kv_cache_manager import standardize_block_hashes
-from kthena.runtime.router_registry import RouterRegistry, get_router_registry
 
 logger = logging.getLogger(__name__)
-
-KV_EVENTS_PATH = "/kvcache/events"
 
 KV_EVENT_STORED = "stored"
 KV_EVENT_REMOVED = "removed"
 KV_EVENT_CLEARED = "cleared"
-KV_EVENT_SNAPSHOT = "snapshot"
 
-PUSH_TIMEOUT_SECONDS = 2.0
+# Interval of the empty heartbeat lines sent on an otherwise idle stream. The
+# router closes a stream that stays silent for 30s, see kvStreamIdleTimeout in
+# pkg/kthena-router/scheduler/plugins/kvcache_subscription.go.
+STREAM_HEARTBEAT_SECONDS = 10.0
 
-# Upper bound of deliveries queued per router endpoint. When a router cannot
-# keep up and its queue overflows, further deltas are dropped and the endpoint
-# is marked dirty so its next registration heartbeat receives a full snapshot.
-ENDPOINT_QUEUE_MAXSIZE = 1024
+# Upper bound of messages queued per router stream. When a router cannot keep
+# up and its queue overflows, its stream is ended; the router opens a new one,
+# which starts with the full block set again.
+STREAM_QUEUE_MAXSIZE = 1024
 
-# Queue item kinds processed by the per-endpoint delivery worker.
-_ITEM_DELTA = "delta"
-_ITEM_SNAPSHOT = "snapshot"
+# Upper bound of block hashes per message, which keeps every message far below
+# the router's 4 MiB limit per message.
+MAX_BLOCKS_PER_MESSAGE = 4096
+
+# Upper bound of concurrently open router streams. Every router replica holds
+# one stream. A stream counts until its response has exited, including after
+# it was replaced or ended.
+MAX_ROUTER_STREAMS = 128
+
+# Time an ended stream's response gets to finish on its own before it is
+# cancelled, e.g. because the client does not read it and sending blocks.
+STREAM_ABORT_GRACE_SECONDS = 1.0
+
+
+class RouterStreamUnavailable(Exception):
+    """Raised when a router stream cannot be opened: MAX_ROUTER_STREAMS
+    streams are open already, or the runtime is shutting down."""
+
+
+class RouterStream:
+    """The KV events stream of one registered router."""
+
+    def __init__(self, router_id: str,
+                 initial_blocks: List[Tuple[str, Dict[int, int]]]):
+        self.router_id = router_id
+        # Copy of the block set when the router registered, sent first.
+        self.initial_blocks = initial_blocks
+        # Encoded messages queued after the initial block set; None ends the
+        # stream.
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAXSIZE)
+        self.closed = False
+        # Set by close(); the response is cancelled if it does not end within
+        # STREAM_ABORT_GRACE_SECONDS.
+        self.aborted = asyncio.Event()
+
+    def close(self) -> None:
+        """End the stream right away, discarding what was not sent yet."""
+        if self.closed:
+            return
+        self.closed = True
+        self.initial_blocks = []
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queue.put_nowait(None)
+        self.aborted.set()
+
+
+def _encode(model_name: str, events: List[dict]) -> bytes:
+    return (json.dumps({"model_name": model_name, "events": events},
+                       separators=(",", ":")) + "\n").encode()
+
+
+def _chunks(items: List):
+    size = MAX_BLOCKS_PER_MESSAGE
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 class MemoryKVCacheManager:
-    """KV cache manager that pushes standardized block hashes directly to
+    """KV cache manager that streams standardized block hashes directly to
     registered router instances instead of writing them to Redis.
 
     Implements the same interface as VLLMKVCacheRedisManager
@@ -54,26 +105,20 @@ class MemoryKVCacheManager:
     Unlike Redis mode, there is no shared, durable store here: every router
     process keeps its own private in-memory copy of the index. In Redis mode
     the sidecar writes each event once into Redis and can forget it, because
-    Redis itself is the authoritative state that any router — including one
-    that just (re)started or briefly lost connectivity — reads on demand. In
-    memory mode this class has to retain that authoritative state (_blocks)
-    itself, so it can replay it as a full snapshot to any router that starts
-    fresh, restarts, or missed a delta push.
+    Redis itself is the authoritative state that any router reads on demand.
+    In memory mode this class has to retain that authoritative state (_blocks)
+    itself, so it can send it to every router that registers.
 
-    Delivery is decoupled per endpoint: each registered router has its own
-    bounded queue drained by a dedicated worker task, so one slow or
-    unreachable router delays neither the other routers nor the engine event
-    consumer. Snapshots travel through the same queue and build their payload
-    at delivery time, which keeps them ordered with the deltas around them.
-    On queue overflow the endpoint is marked dirty and deltas are dropped;
-    the next registration heartbeat then pushes a full snapshot, which
-    supersedes everything the endpoint may have missed.
+    A router registers by opening a long-lived request; the response is its
+    stream of KV events (see register in app.py). The stream starts with the
+    full block set and continues with the stored/removed/cleared deltas, so
+    the router knows which pod the events belong to from the connection
+    alone. Each stream has its own bounded queue, so a slow router delays
+    neither the other routers nor the engine event consumer; a stream whose
+    queue overflows is ended and the router registers again.
     """
 
-    def __init__(self, registry: Optional[RouterRegistry] = None,
-                 client: Optional[httpx.AsyncClient] = None):
-        self.registry = registry or get_router_registry()
-        self._client = client
+    def __init__(self):
         # engine hash -> standardized hash, needed because removal events only
         # carry engine hashes.
         self.hash_mapping: Dict[int, int] = {}
@@ -83,47 +128,110 @@ class MemoryKVCacheManager:
         # standardized hash may only be dropped once its last engine-hash
         # reference is removed.
         self._std_refs: Dict[str, Dict[int, int]] = {}
-        # model name -> {std_hash: unix seconds when stored}, mirrors what has
-        # been pushed so a newly registered router can receive a snapshot.
-        # Models stay present (with an empty dict) after being cleared so a
-        # snapshot can authoritatively represent an empty cache.
+        # model name -> {std_hash: unix seconds when stored}, the block set
+        # sent to every router that registers.
         self._blocks: Dict[str, Dict[int, int]] = {}
-        # Per-endpoint bounded delivery queues and their worker tasks.
-        self._queues: Dict[str, asyncio.Queue] = {}
-        self._workers: Dict[str, asyncio.Task] = {}
-        # Endpoints whose last push failed or whose queue overflowed; they
-        # receive a fresh snapshot on their next registration heartbeat
-        # instead of staying divergent.
-        self._dirty_endpoints: set = set()
+        # router id -> its open stream.
+        self._streams: Dict[str, RouterStream] = {}
+        # Streams whose responses have not exited yet, counted against
+        # MAX_ROUTER_STREAMS.
+        self._live: Set[RouterStream] = set()
+        # Set by close(); no stream is opened afterwards.
+        self._closed = False
 
-    def is_dirty(self, endpoint: str) -> bool:
-        """Whether this endpoint's index may have diverged (a push failed or
-        deltas were dropped), requiring a fresh snapshot."""
-        return endpoint in self._dirty_endpoints
+    def open_stream(self, router_id: str) -> RouterStream:
+        """Register a router and return its stream, whose response must be
+        sent through serve().
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(PUSH_TIMEOUT_SECONDS))
-        return self._client
+        A router that registers again, e.g. after its connection broke,
+        replaces its previous stream. The block set is captured here, together
+        with registering the stream for deltas, so the stream neither misses
+        nor repeats a mutation.
+        """
+        if self._closed:
+            raise RouterStreamUnavailable("the runtime is shutting down")
+        previous = self._streams.pop(router_id, None)
+        if previous is not None:
+            previous.close()
+        if len(self._live) >= MAX_ROUTER_STREAMS:
+            raise RouterStreamUnavailable(
+                f"{MAX_ROUTER_STREAMS} router streams are open already")
+        stream = RouterStream(router_id, [
+            (model_name, dict(blocks))
+            for model_name, blocks in self._blocks.items() if blocks])
+        self._streams[router_id] = stream
+        self._live.add(stream)
+        logger.info(f"Router registered: id={router_id}")
+        return stream
+
+    def _close_stream(self, stream: RouterStream) -> None:
+        stream.close()
+        if self._streams.get(stream.router_id) is stream:
+            del self._streams[stream.router_id]
+            logger.info(f"Router stream ended: id={stream.router_id}")
+
+    async def serve(self, stream: RouterStream,
+                    respond: Callable[[], Awaitable[None]]) -> None:
+        """Run respond, which sends the response of stream, and cancel it if
+        it does not end within STREAM_ABORT_GRACE_SECONDS after the stream was
+        closed. Closing a stream alone cannot end a response whose client
+        does not read, because sending it blocks."""
+        response = asyncio.ensure_future(respond())
+        aborted = asyncio.ensure_future(stream.aborted.wait())
+        try:
+            await asyncio.wait({response, aborted},
+                               return_when=asyncio.FIRST_COMPLETED)
+            if not response.done():
+                await asyncio.wait({response}, timeout=STREAM_ABORT_GRACE_SECONDS)
+        finally:
+            aborted.cancel()
+            cancelled = not response.done()
+            if cancelled:
+                logger.warning(
+                    f"Router {stream.router_id} does not read its stream; "
+                    f"aborting the response")
+                response.cancel()
+            try:
+                await response
+            except asyncio.CancelledError:
+                if not cancelled:
+                    raise
+            finally:
+                self._close_stream(stream)
+                self._live.discard(stream)
+
+    async def iter_stream(self, stream: RouterStream) -> AsyncIterator[bytes]:
+        """Yield the encoded messages of stream until it is closed."""
+        initial_blocks, stream.initial_blocks = stream.initial_blocks, []
+        for model_name, blocks in initial_blocks:
+            # Preserve original per-block store times; re-stamping them
+            # would defeat the engine-restart freshness filter.
+            for hashes in _chunks(list(blocks)):
+                if stream.closed:
+                    return
+                yield _encode(model_name, [{
+                    "type": KV_EVENT_STORED,
+                    "block_hashes": hashes,
+                    "timestamps": [blocks[h] for h in hashes],
+                }])
+        # The stream lives on; do not keep the block set copy with it.
+        initial_blocks = blocks = hashes = None
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    stream.queue.get(), STREAM_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                yield b"\n"
+                continue
+            if message is None:
+                return
+            yield message
 
     async def close(self) -> None:
-        for worker in self._workers.values():
-            worker.cancel()
-        if self._workers:
-            await asyncio.gather(*self._workers.values(),
-                                 return_exceptions=True)
-        self._workers.clear()
-        self._queues.clear()
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-    async def flush(self) -> None:
-        """Wait until every queued delivery has been processed (test helper
-        and shutdown aid)."""
-        if self._queues:
-            await asyncio.gather(*(q.join() for q in self._queues.values()))
+        """End all router streams; called on shutdown."""
+        self._closed = True
+        for stream in list(self._live):
+            self._close_stream(stream)
 
     async def add_blocks(self, model_name: str, block_hashes: List[int],
                          pod_identifier: str, token_ids: Optional[List[int]] = None) -> bool:
@@ -151,13 +259,9 @@ class MemoryKVCacheManager:
             if std_hash not in std_hashes:
                 std_hashes.append(std_hash)
 
-        self._push_to_all(pod_identifier, model_name, [{
-            "type": KV_EVENT_STORED,
-            "block_hashes": std_hashes,
-            "timestamp": timestamp,
-        }])
+        self._publish(model_name, KV_EVENT_STORED, std_hashes, timestamp)
         logger.info(
-            f"Runtime memory push - Model: {model_name}, Pod: {pod_identifier}, "
+            f"Runtime memory stream - Model: {model_name}, Pod: {pod_identifier}, "
             f"Count: {len(std_hashes)}")
         return True
 
@@ -195,10 +299,7 @@ class MemoryKVCacheManager:
             return 0
 
         if std_hashes:
-            self._push_to_all(pod_identifier, model_name, [{
-                "type": KV_EVENT_REMOVED,
-                "block_hashes": std_hashes,
-            }])
+            self._publish(model_name, KV_EVENT_REMOVED, std_hashes)
         logger.info(
             f"Removed {len(std_hashes)} blocks for model {model_name}, pod {pod_identifier}")
         return removed
@@ -208,152 +309,43 @@ class MemoryKVCacheManager:
             return 0
 
         cleared = len(self._blocks.get(model_name, {}))
-        # Keep the model key so later snapshots can still represent the empty
-        # cache for this model and remove stale router entries.
-        self._blocks[model_name] = {}
+        self._blocks.pop(model_name, None)
         self._std_refs.clear()
         self.hash_mapping.clear()
 
-        self._push_to_all(pod_identifier, model_name, [{
-            "type": KV_EVENT_CLEARED,
-        }])
+        self._publish(model_name, KV_EVENT_CLEARED)
         logger.info(
             f"Cleared {cleared} blocks for model {model_name}, pod {pod_identifier}")
         return cleared
 
-    async def push_snapshot(self, endpoint: str, pod_identifier: str) -> None:
-        """Queue a full-index snapshot for a single router endpoint.
-
-        Called when a router registers for the first time, re-registers after
-        its previous registration expired, or heartbeats while marked dirty
-        after a failed or dropped push, so it can rebuild its in-memory index.
-
-        The snapshot is delivered by the endpoint's worker in order with the
-        deltas around it, and its payload is built at delivery time, so it
-        reflects every mutation whose delta precedes it and cannot be
-        overtaken by a newer delta it does not contain. Pending deltas are
-        discarded first: the snapshot supersedes them.
-        """
-        queue = self._ensure_worker(endpoint)
-        self._drain_queue(queue)
-        queue.put_nowait((_ITEM_SNAPSHOT, pod_identifier, None, None))
-        await queue.join()
-
-    def _push_to_all(self, pod_identifier: str, model_name: str,
-                     events: List[dict]) -> None:
-        """Queue a delta for every registered router endpoint; delivery is
-        asynchronous so a slow router never blocks event processing."""
-        endpoints = self.registry.active_endpoints()
-        self._prune_workers(endpoints)
-        if not endpoints:
-            logger.debug("No routers registered, skipping KV event push")
+    def _publish(self, model_name: str, event_type: str,
+                 block_hashes: Optional[List[int]] = None,
+                 timestamp: Optional[int] = None) -> None:
+        """Queue a delta on every open router stream."""
+        if not self._streams:
+            logger.debug("No routers registered, skipping KV event stream")
             return
-        for endpoint in endpoints:
-            queue = self._ensure_worker(endpoint)
-            try:
-                queue.put_nowait(
-                    (_ITEM_DELTA, pod_identifier, model_name, events))
-            except asyncio.QueueFull:
-                # The router is too slow to keep up; drop the delta and let
-                # its next registration heartbeat recover it with a snapshot.
-                if endpoint not in self._dirty_endpoints:
-                    logger.warning(
-                        f"KV event queue for router {endpoint} is full; "
-                        f"dropping deltas until a snapshot reconciles it")
-                self._dirty_endpoints.add(endpoint)
-
-    def _ensure_worker(self, endpoint: str) -> asyncio.Queue:
-        queue = self._queues.get(endpoint)
-        if queue is None:
-            queue = asyncio.Queue(maxsize=ENDPOINT_QUEUE_MAXSIZE)
-            self._queues[endpoint] = queue
-            self._workers[endpoint] = asyncio.get_running_loop().create_task(
-                self._deliver(endpoint, queue))
-        return queue
-
-    def _prune_workers(self, active_endpoints: List[str]) -> None:
-        """Stop workers of endpoints whose registration expired."""
-        active = set(active_endpoints)
-        for endpoint in list(self._workers):
-            if endpoint not in active:
-                self._workers.pop(endpoint).cancel()
-                queue = self._queues.pop(endpoint)
-                self._drain_queue(queue)
-                self._dirty_endpoints.discard(endpoint)
-
-    @staticmethod
-    def _drain_queue(queue: asyncio.Queue) -> None:
-        while True:
-            try:
-                queue.get_nowait()
-                queue.task_done()
-            except asyncio.QueueEmpty:
-                return
-
-    async def _deliver(self, endpoint: str,
-                       queue: asyncio.Queue) -> None:
-        """Per-endpoint worker delivering queued items sequentially."""
-        while True:
-            kind, pod_identifier, model_name, events = await queue.get()
-            try:
-                if kind == _ITEM_SNAPSHOT:
-                    await self._send_snapshot(endpoint, pod_identifier)
-                elif endpoint in self._dirty_endpoints:
-                    # This endpoint already diverged; skip the delta instead
-                    # of burning a timeout on it — the pending snapshot
-                    # supersedes it anyway.
-                    pass
-                else:
-                    await self._send(
-                        endpoint, pod_identifier, model_name, events)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 - keep the worker alive
-                self._dirty_endpoints.add(endpoint)
-                logger.warning(
-                    f"Unexpected error delivering KV events to router "
-                    f"{endpoint}: {e}")
-            finally:
-                queue.task_done()
-
-    async def _send_snapshot(self, endpoint: str, pod_identifier: str) -> None:
-        ok = True
-        for model_name, model_blocks in self._blocks.items():
-            # Preserve original per-block store times; re-stamping them at
-            # snapshot time would defeat the engine-restart freshness filter.
-            hashes = list(model_blocks.keys())
-            if not await self._send(endpoint, pod_identifier, model_name, [{
-                "type": KV_EVENT_SNAPSHOT,
-                "block_hashes": hashes,
-                "timestamps": [model_blocks[h] for h in hashes],
-            }]):
-                ok = False
-        if ok:
-            self._dirty_endpoints.discard(endpoint)
-            logger.info(f"Pushed KV snapshot to router endpoint {endpoint}")
+        if block_hashes is None:
+            messages = [_encode(model_name, [{"type": event_type}])]
         else:
-            logger.warning(
-                f"KV snapshot to router endpoint {endpoint} failed; will retry "
-                f"on its next registration heartbeat")
-
-    async def _send(self, endpoint: str, pod_identifier: str,
-                    model_name: str, events: List[dict]) -> bool:
-        payload = {
-            "pod_identifier": pod_identifier,
-            "model_name": model_name,
-            "events": events,
-        }
-        try:
-            response = await self._get_client().post(
-                f"{endpoint}{KV_EVENTS_PATH}", json=payload)
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            # Mark the endpoint dirty so its next registration heartbeat
-            # triggers a full snapshot instead of leaving it divergent.
-            self._dirty_endpoints.add(endpoint)
-            logger.warning(f"Failed to push KV events to router {endpoint}: {e}")
-            return False
+            messages = []
+            for hashes in _chunks(block_hashes):
+                event = {"type": event_type, "block_hashes": hashes}
+                if timestamp is not None:
+                    event["timestamp"] = timestamp
+                messages.append(_encode(model_name, [event]))
+        for stream in list(self._streams.values()):
+            for message in messages:
+                try:
+                    stream.queue.put_nowait(message)
+                except asyncio.QueueFull:
+                    # The router cannot keep up; end its stream so it
+                    # registers again and receives the full block set.
+                    logger.warning(
+                        f"KV event queue of router {stream.router_id} is "
+                        f"full; ending its stream")
+                    self._close_stream(stream)
+                    break
 
 
 _memory_kv_manager: Optional[MemoryKVCacheManager] = None

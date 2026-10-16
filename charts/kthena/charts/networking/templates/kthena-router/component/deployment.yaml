@@ -73,10 +73,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
             - name: REDIS_HOST
               valueFrom:
                 configMapKeyRef:

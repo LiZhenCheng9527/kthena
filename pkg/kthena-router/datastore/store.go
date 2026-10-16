@@ -1142,6 +1142,10 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		}
 
 		oldPodInfo.UpdatePod(pod, engine, newModelServers)
+		s.triggerCallbacks("Pod", EventData{
+			EventType: EventUpdate,
+			Pod:       podName,
+		})
 		return nil
 	}
 
@@ -1153,6 +1157,10 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		models:      sets.New[string](),
 	}
 	s.pods.Store(podName, newPodInfo)
+	s.triggerCallbacks("Pod", EventData{
+		EventType: EventAdd,
+		Pod:       podName,
+	})
 	s.updatePodMetrics(newPodInfo)
 	s.updatePodModels(newPodInfo)
 

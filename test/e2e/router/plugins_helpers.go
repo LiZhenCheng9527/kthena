@@ -17,19 +17,24 @@ limitations under the License.
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	backendmetrics "github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/backend/vllm"
 	routerutils "github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	plugincontext "github.com/volcano-sh/kthena/test/e2e/router/router-plugins/context"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -42,6 +47,11 @@ const (
 	gpuCacheUsageLoadWaitTimeout   = 90 * time.Second
 	gpuCacheUsageLoadConcurrency   = 2
 	gpuCacheUsageLoadMaxTokens     = 256
+	kvCacheFixtureDeploymentName   = "router-plugin-kvcache-mock"
+	kvCacheFixtureAppLabel         = kvCacheFixtureDeploymentName
+	kvCacheOwnershipWaitTimeout    = 90 * time.Second
+	kvCacheOwnershipPrefix         = "matrix:kv:block"
+	kvCacheRoutingRequestCount     = 200
 )
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
@@ -49,6 +59,70 @@ func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string
 	ready := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.DeploymentName)
 	require.NotEmpty(t, ready, "no ready mock pods")
 	return ready
+}
+
+func setupKVCacheFixture(t *testing.T, kube kubernetes.Interface, namespace, redisNamespace string) []corev1.Pod {
+	t.Helper()
+	ctx := context.Background()
+	deployment := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-kvcache.yaml"))
+	deployment.Namespace = namespace
+	redisHostSet := false
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name != "kthena-runtime" {
+			continue
+		}
+		for j := range container.Env {
+			if container.Env[j].Name == "REDIS_HOST" {
+				container.Env[j].Value = fmt.Sprintf("redis-server.%s.svc.cluster.local", redisNamespace)
+				redisHostSet = true
+			}
+		}
+	}
+	require.True(t, redisHostSet, "KV-cache fixture Runtime needs REDIS_HOST")
+
+	_, err := kube.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
+	require.NoError(t, err, "create KV-cache fixture")
+	t.Cleanup(func() {
+		utils.DeleteDeploymentAndWait(t, kube, namespace, kvCacheFixtureDeploymentName, 2*time.Minute)
+	})
+
+	utils.WaitForDeploymentReady(t, ctx, kube, namespace, kvCacheFixtureDeploymentName, pluginMockReplicaCount, 5*time.Minute)
+	pods := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+kvCacheFixtureAppLabel)
+	require.Len(t, pods, pluginMockReplicaCount, "KV-cache fixture needs %d mock pods", pluginMockReplicaCount)
+	return pods
+}
+
+func waitForKVCacheOwnership(t *testing.T, pod corev1.Pod, redisNamespace, model, prompt string) {
+	t.Helper()
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForward(redisNamespace, "redis-server", localPort, "6379")
+	require.NoError(t, err, "port-forward to Redis")
+	defer pf.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:" + localPort})
+	defer client.Close()
+
+	owner := pod.Name + "." + pod.Namespace
+	ownershipPattern := fmt.Sprintf("%s:%s@*", kvCacheOwnershipPrefix, model)
+	deadline := time.Now().Add(kvCacheOwnershipWaitTimeout)
+	for time.Now().Before(deadline) {
+		// Re-send while polling because ZMQ may drop an event before the subscriber is ready.
+		utils.DirectChatToPod(t, pod, model, prompt, 1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		iter := client.Scan(ctx, 0, ownershipPattern, 0).Iterator()
+		for iter.Next(ctx) {
+			exists, err := client.HExists(ctx, iter.Val(), owner).Result()
+			if err == nil && exists {
+				cancel()
+				return
+			}
+		}
+		cancel()
+		time.Sleep(time.Second)
+	}
+	require.FailNowf(t, "KV-cache ownership not found", "expected ownership for %s", owner)
 }
 
 func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, pluginType string) {
@@ -261,6 +335,25 @@ func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, 
 }
 
 const (
+	schedulerKVCacheAware = `scheduler:
+  pluginConfig:
+  - name: kvcache-aware
+    args:
+      blockSizeToHash: 8
+      maxBlocksToMatch: 128
+  - name: least-request
+    args:
+      maxWaitingRequests: 10
+  plugins:
+    Filter:
+      enabled: []
+    Score:
+      enabled:
+        - name: kvcache-aware
+          weight: 1
+        - name: least-request
+          weight: 1`
+
 	schedulerOnlyPrefixCache = `scheduler:
   pluginConfig:
   - name: prefix-cache

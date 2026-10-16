@@ -214,6 +214,8 @@ class MemoryKVCacheManager:
                     "block_hashes": hashes,
                     "timestamps": [blocks[h] for h in hashes],
                 }])
+        # The stream lives on; do not keep the block set copy with it.
+        initial_blocks = blocks = hashes = None
         while True:
             try:
                 message = await asyncio.wait_for(

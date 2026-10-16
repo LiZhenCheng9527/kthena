@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import sys
 
 import pytest
 
@@ -175,6 +176,25 @@ async def test_stream_starts_with_full_block_set(monkeypatch):
     assert messages[3]["events"][0]["block_hashes"] == [
         compute_standardized_hash(list(range(100, 116)))]
     await stream_iter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_releases_initial_block_set_once_sent(monkeypatch):
+    monkeypatch.setattr(mkm, "MAX_BLOCKS_PER_MESSAGE", 1)
+    manager = MemoryKVCacheManager()
+    await manager.add_blocks("qwen", [1, 2], "pod-1.default", list(range(32)))
+    stream = manager.open_stream("router-a")
+    initial_blocks = stream.initial_blocks[0][1]
+    stream_iter = manager.iter_stream(stream)
+    await _read(stream_iter, 2)
+
+    # Wait for the next delta, past the initial block set.
+    pending = asyncio.ensure_future(stream_iter.__anext__())
+    await asyncio.sleep(0)
+    assert not pending.done()
+    # Only this test and getrefcount's argument refer to the copy.
+    assert sys.getrefcount(initial_blocks) == 2
+    pending.cancel()
 
 
 @pytest.mark.asyncio

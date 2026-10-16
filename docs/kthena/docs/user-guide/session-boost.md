@@ -179,7 +179,7 @@ Ordering by completion time (rather than a plain LIFO on arrival) keeps the queu
 The queue uses two-level admission control to avoid flooding backends:
 
 1. **Inflight limit**: at most `SESSION_BOOST_INFLIGHT_PER_POD` requests can be in-flight per backend pod; the total limit is that value times the number of backend pods serving the model.
-2. **Backend metrics check**: the queue checks backend pod metrics to confirm at least one pod has available capacity before dispatching. These metrics are refreshed by the router's periodic metrics scrape (`METRICS_SCRAPE_INTERVAL`, default `1s`). The backpressure loop is event-driven: it re-checks capacity on request completion, on new arrivals, and after each metrics scrape while requests are held. The scrape re-check is needed because the capacity check reads cached metrics: when a request completes, the cached metrics can still show the backend as busy, and capacity can also grow without a completion (for example, when a new backend pod becomes Ready).
+2. **Backend metrics check**: the queue checks backend pod metrics to confirm at least one pod has available capacity before dispatching. These metrics are refreshed by the router's periodic metrics scrape (`METRICS_SCRAPE_INTERVAL`, default `1s`). The backpressure loop is event-driven: it re-checks capacity on request completion, on new arrivals, and whenever a backend pod's metrics or served models are refreshed while requests are held. The refresh re-check is triggered per pod as soon as that pod's scrape completes, so a slow or unresponsive pod does not delay re-checks driven by other pods. It is needed because the capacity check reads cached metrics: when a request completes, the cached metrics can still show the backend as busy, and capacity can also grow without a completion (for example, when a new backend pod becomes Ready).
 
 When a request completes, the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next metrics refresh.
 
@@ -218,7 +218,7 @@ Recommended tuning:
 
 - **Many concurrent conversations**: increase `SESSION_BOOST_MAX_SESSIONS` so that active sessions are not evicted from the LRU cache before their follow-up arrives. The default (`4096`) suits most deployments; raise it if you serve a larger number of simultaneous conversations.
 - **High-throughput backends**: the default per-pod inflight limit (`SESSION_BOOST_INFLIGHT_PER_POD=16`) is conservative. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`); the total limit scales with the number of backend pods. Reduce for conservative admission control; increase for backends that handle high parallelism.
-- **Faster reaction to capacity changes**: the queue re-checks capacity whenever one of its own requests completes, a new request arrives, or the metrics scrape refreshes the cached pod metrics while requests are held. Lower `METRICS_SCRAPE_INTERVAL` (default `1s`) if you need the queue to notice freed capacity sooner, keeping in mind it also increases metrics scraping load.
+- **Faster reaction to capacity changes**: the queue re-checks capacity whenever one of its own requests completes, a new request arrives, or a backend pod's cached metrics or served models are refreshed while requests are held. Lower `METRICS_SCRAPE_INTERVAL` (default `1s`) if you need the queue to notice freed capacity sooner, keeping in mind it also increases metrics scraping load.
 
 ## Verify Session Boost
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import json
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
+from kthena.runtime import app as runtime_app
 from kthena.runtime import memory_kv_manager as mkm
 from kthena.runtime.app import (
     KV_SYNC_MODE_MEMORY,
@@ -190,7 +192,9 @@ async def test_register_router_rejects_invalid_requests(mode, body, expected_sta
     assert state.memory_kv_manager._streams == {}
 
 
-def test_register_router_streams_kv_events_until_shutdown(monkeypatch):
+def _start_memory_mode_server(monkeypatch):
+    """Start the runtime in memory mode on a real server in a background
+    thread; returns the server, its loop, thread, port and memory manager."""
     monkeypatch.setenv("KV_EVENT_SYNC_MODE", KV_SYNC_MODE_MEMORY)
     monkeypatch.setattr(mkm, "_memory_kv_manager", None)
     args = _make_args()
@@ -206,7 +210,30 @@ def test_register_router_streams_kv_events_until_shutdown(monkeypatch):
         assert thread.is_alive() and time.monotonic() < deadline, "server did not start"
         time.sleep(0.01)
     port = server.servers[0].sockets[0].getsockname()[1]
-    manager = get_app_state(app).memory_kv_manager
+    return server, loop, thread, port, get_app_state(app).memory_kv_manager
+
+
+def _register_without_reading(port, router_id):
+    """Register a router on a connection whose response is never read."""
+    sock = socket.create_connection(("127.0.0.1", port))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    body = json.dumps({"router_id": router_id}).encode()
+    sock.sendall(
+        b"POST /kvcache/routers/register HTTP/1.1\r\nHost: runtime\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    return sock
+
+
+def _wait_until(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.01)
+
+
+def test_register_router_streams_kv_events_until_shutdown(monkeypatch):
+    server, loop, thread, port, manager = _start_memory_mode_server(monkeypatch)
 
     def run_in_server_loop(coro):
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=5)
@@ -229,4 +256,34 @@ def test_register_router_streams_kv_events_until_shutdown(monkeypatch):
             assert list(lines) == []
     thread.join(timeout=10)
     assert not thread.is_alive()
+    loop.close()
+
+
+def test_unread_router_streams_are_aborted(monkeypatch):
+    """Streams whose client does not read block on sending. Replacing them
+    must not leave their responses running, and they must not hold up the
+    shutdown."""
+    monkeypatch.setattr(mkm, "STREAM_ABORT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(runtime_app, "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", 1)
+    server, loop, thread, port, manager = _start_memory_mode_server(monkeypatch)
+    # Large enough an initial block set to fill the socket buffers.
+    manager._blocks["qwen"] = {i: 1700000000 for i in range(300_000)}
+
+    sockets = []
+    try:
+        current = None
+        for _ in range(3):
+            sockets.append(_register_without_reading(port, "router-a"))
+            _wait_until(lambda: manager._streams.get("router-a") not in (None, current))
+            current = manager._streams["router-a"]
+        # The replaced streams' responses were cancelled.
+        _wait_until(lambda: manager._live == {current})
+
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert manager._live == set()
+    finally:
+        for sock in sockets:
+            sock.close()
     loop.close()

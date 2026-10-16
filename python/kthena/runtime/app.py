@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -37,6 +38,8 @@ from kthena.runtime.kv_cache_manager import (
     get_sglang_kv_cache_handler,
 )
 from kthena.runtime.memory_kv_manager import (
+    MemoryKVCacheManager,
+    RouterStream,
     RouterStreamUnavailable,
     get_memory_kv_manager,
 )
@@ -284,8 +287,24 @@ async def register_router(request: Request) -> StreamingResponse:
         stream = manager.open_stream(router_id)
     except RouterStreamUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
-    return StreamingResponse(
-        manager.iter_stream(stream), media_type="application/x-ndjson")
+    return _RouterStreamResponse(manager, stream)
+
+
+class _RouterStreamResponse(StreamingResponse):
+    """Sends a router stream through MemoryKVCacheManager.serve, which
+    cancels the response once the stream has ended but the response has
+    not."""
+
+    def __init__(self, manager: MemoryKVCacheManager, stream: RouterStream):
+        super().__init__(manager.iter_stream(stream),
+                         media_type="application/x-ndjson")
+        self._manager = manager
+        self._stream = stream
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self._manager.serve(
+            self._stream,
+            functools.partial(super().__call__, scope, receive, send))
 
 
 @router.get("/metrics", tags=["Metrics"])
@@ -399,7 +418,17 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Bound of the graceful shutdown. Connections whose client does not read
+# never close: closing them waits until the pending response data is sent.
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 10
+
+
 class _Server(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config):
+        if config.timeout_graceful_shutdown is None:
+            config.timeout_graceful_shutdown = GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+        super().__init__(config)
+
     async def shutdown(self, sockets=None) -> None:
         # Router KV event streams never end on their own, and the server
         # waits for open requests to finish before shutting down.

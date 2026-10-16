@@ -44,7 +44,7 @@ Stale entries are garbage-collected in the router after 24 hours, and ownership 
 **Trust model of memory mode:**
 
 - The router only receives KV events on connections it opens itself, to the pod IP of a pod selected by a `ModelServer`; nothing in a stream can claim another pod's identity. Pods sharing an IP (e.g. `hostNetwork` pods on the same node) cannot be told apart, so the router does not stream from them.
-- A runtime sidecar only sends KV events back on the connection of the caller of `POST /kvcache/routers/register`, so a caller cannot direct them anywhere else. A registration with the `router_id` of an open stream replaces that stream, and a sidecar serves at most 128 streams at once.
+- A runtime sidecar only sends KV events back on the connection of the caller of `POST /kvcache/routers/register`, so a caller cannot direct them anywhere else. A registration with the `router_id` of an open stream replaces that stream, and a sidecar serves at most 128 streams at once; a replaced or ended stream still counts until its response has exited, and a response that is not read is aborted within a second.
 - Store times are capped at the time the router receives them, and each pod can hold at most `maxBlocksPerPod` blocks in the index.
 - The register endpoint does not authenticate its callers, so any workload that can reach the runtime port can read the block hashes of the pod. Restrict access to it with a NetworkPolicy if untrusted workloads share the cluster.
 

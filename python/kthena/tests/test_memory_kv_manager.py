@@ -211,14 +211,99 @@ async def test_registering_again_replaces_the_stream():
 
 
 @pytest.mark.asyncio
-async def test_ended_stream_is_unregistered():
+async def test_ended_response_unregisters_the_stream():
     manager = MemoryKVCacheManager()
-    stream_iter = manager.iter_stream(manager.open_stream("router-a"))
+    stream = manager.open_stream("router-a")
+    stream_iter = manager.iter_stream(stream)
+
+    async def respond():
+        await _read(stream_iter, 1)
+        # E.g. the router disconnected.
+        await stream_iter.aclose()
+
+    serving = asyncio.create_task(manager.serve(stream, respond))
     await manager.add_blocks("qwen", [111], "pod-1.default", list(range(16)))
-    await _read(stream_iter, 1)
-    # E.g. the router disconnected.
-    await stream_iter.aclose()
+    await asyncio.wait_for(serving, timeout=1)
     assert manager._streams == {}
+    assert manager._live == set()
+
+
+@pytest.mark.asyncio
+async def test_closed_stream_ends_without_sending_pending_data(monkeypatch):
+    monkeypatch.setattr(mkm, "MAX_BLOCKS_PER_MESSAGE", 1)
+    manager = MemoryKVCacheManager()
+    await manager.add_blocks("qwen", [1, 2], "pod-1.default", list(range(32)))
+    stream = manager.open_stream("router-a")
+    await manager.add_blocks("qwen", [3], "pod-1.default", list(range(32, 48)))
+    stream_iter = manager.iter_stream(stream)
+    await _read(stream_iter, 1)
+
+    stream.close()
+    # Neither the rest of the initial block set nor the queued delta.
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(stream_iter.__anext__(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_response_that_does_not_end_is_cancelled(monkeypatch):
+    """A response whose client does not read blocks on sending and never
+    notices that its stream was closed; it must not outlive the stream nor
+    escape MAX_ROUTER_STREAMS."""
+    monkeypatch.setattr(mkm, "MAX_ROUTER_STREAMS", 1)
+    monkeypatch.setattr(mkm, "STREAM_ABORT_GRACE_SECONDS", 0.01)
+    manager = MemoryKVCacheManager()
+    old = manager.open_stream("router-a")
+    blocked = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def respond():
+        blocked.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    serving = asyncio.create_task(manager.serve(old, respond))
+    await blocked.wait()
+
+    # The replaced stream still counts until its response has exited.
+    with pytest.raises(RouterStreamUnavailable):
+        manager.open_stream("router-a")
+    assert old.closed
+    await asyncio.wait_for(serving, timeout=1)
+    assert cancelled.is_set()
+    assert manager._live == set()
+    new = manager.open_stream("router-a")
+    assert manager._streams == {"router-a": new}
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_responses_that_do_not_end(monkeypatch):
+    monkeypatch.setattr(mkm, "STREAM_ABORT_GRACE_SECONDS", 0.01)
+    manager = MemoryKVCacheManager()
+    stream = manager.open_stream("router-a")
+    serving = asyncio.create_task(
+        manager.serve(stream, lambda: asyncio.Event().wait()))
+    await asyncio.sleep(0)
+
+    await manager.close()
+    await asyncio.wait_for(serving, timeout=1)
+    assert manager._live == set()
+
+
+@pytest.mark.asyncio
+async def test_serve_propagates_response_errors():
+    manager = MemoryKVCacheManager()
+    stream = manager.open_stream("router-a")
+
+    async def respond():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await manager.serve(stream, respond)
+    assert manager._streams == {}
+    assert manager._live == set()
 
 
 @pytest.mark.asyncio
@@ -246,8 +331,6 @@ async def test_queue_overflow_ends_the_stream(monkeypatch):
 async def test_open_stream_limits(monkeypatch):
     monkeypatch.setattr(mkm, "MAX_ROUTER_STREAMS", 1)
     manager = MemoryKVCacheManager()
-    manager.open_stream("router-a")
-    # Replacing a stream does not count against the limit.
     stream = manager.open_stream("router-a")
     with pytest.raises(RouterStreamUnavailable):
         manager.open_stream("router-b")

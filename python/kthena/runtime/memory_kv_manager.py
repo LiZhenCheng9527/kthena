@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import AsyncIterator, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from kthena.runtime.kv_cache_manager import standardize_block_hashes
 
@@ -41,8 +41,13 @@ STREAM_QUEUE_MAXSIZE = 1024
 MAX_BLOCKS_PER_MESSAGE = 4096
 
 # Upper bound of concurrently open router streams. Every router replica holds
-# one stream.
+# one stream. A stream counts until its response has exited, including after
+# it was replaced or ended.
 MAX_ROUTER_STREAMS = 128
+
+# Time an ended stream's response gets to finish on its own before it is
+# cancelled, e.g. because the client does not read it and sending blocks.
+STREAM_ABORT_GRACE_SECONDS = 1.0
 
 
 class RouterStreamUnavailable(Exception):
@@ -62,19 +67,20 @@ class RouterStream:
         # stream.
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAXSIZE)
         self.closed = False
+        # Set by close(); the response is cancelled if it does not end within
+        # STREAM_ABORT_GRACE_SECONDS.
+        self.aborted = asyncio.Event()
 
     def close(self) -> None:
-        """End the stream once the router has read what it received so far,
-        or right away when its queue is full."""
+        """End the stream right away, discarding what was not sent yet."""
         if self.closed:
             return
         self.closed = True
-        try:
-            self.queue.put_nowait(None)
-        except asyncio.QueueFull:
-            while not self.queue.empty():
-                self.queue.get_nowait()
-            self.queue.put_nowait(None)
+        self.initial_blocks = []
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queue.put_nowait(None)
+        self.aborted.set()
 
 
 def _encode(model_name: str, events: List[dict]) -> bytes:
@@ -127,11 +133,15 @@ class MemoryKVCacheManager:
         self._blocks: Dict[str, Dict[int, int]] = {}
         # router id -> its open stream.
         self._streams: Dict[str, RouterStream] = {}
+        # Streams whose responses have not exited yet, counted against
+        # MAX_ROUTER_STREAMS.
+        self._live: Set[RouterStream] = set()
         # Set by close(); no stream is opened afterwards.
         self._closed = False
 
     def open_stream(self, router_id: str) -> RouterStream:
-        """Register a router and return its stream.
+        """Register a router and return its stream, whose response must be
+        sent through serve().
 
         A router that registers again, e.g. after its connection broke,
         replaces its previous stream. The block set is captured here, together
@@ -143,13 +153,14 @@ class MemoryKVCacheManager:
         previous = self._streams.pop(router_id, None)
         if previous is not None:
             previous.close()
-        if len(self._streams) >= MAX_ROUTER_STREAMS:
+        if len(self._live) >= MAX_ROUTER_STREAMS:
             raise RouterStreamUnavailable(
                 f"{MAX_ROUTER_STREAMS} router streams are open already")
         stream = RouterStream(router_id, [
             (model_name, dict(blocks))
             for model_name, blocks in self._blocks.items() if blocks])
         self._streams[router_id] = stream
+        self._live.add(stream)
         logger.info(f"Router registered: id={router_id}")
         return stream
 
@@ -159,36 +170,65 @@ class MemoryKVCacheManager:
             del self._streams[stream.router_id]
             logger.info(f"Router stream ended: id={stream.router_id}")
 
+    async def serve(self, stream: RouterStream,
+                    respond: Callable[[], Awaitable[None]]) -> None:
+        """Run respond, which sends the response of stream, and cancel it if
+        it does not end within STREAM_ABORT_GRACE_SECONDS after the stream was
+        closed. Closing a stream alone cannot end a response whose client
+        does not read, because sending it blocks."""
+        response = asyncio.ensure_future(respond())
+        aborted = asyncio.ensure_future(stream.aborted.wait())
+        try:
+            await asyncio.wait({response, aborted},
+                               return_when=asyncio.FIRST_COMPLETED)
+            if not response.done():
+                await asyncio.wait({response}, timeout=STREAM_ABORT_GRACE_SECONDS)
+        finally:
+            aborted.cancel()
+            cancelled = not response.done()
+            if cancelled:
+                logger.warning(
+                    f"Router {stream.router_id} does not read its stream; "
+                    f"aborting the response")
+                response.cancel()
+            try:
+                await response
+            except asyncio.CancelledError:
+                if not cancelled:
+                    raise
+            finally:
+                self._close_stream(stream)
+                self._live.discard(stream)
+
     async def iter_stream(self, stream: RouterStream) -> AsyncIterator[bytes]:
         """Yield the encoded messages of stream until it is closed."""
-        try:
-            initial_blocks, stream.initial_blocks = stream.initial_blocks, []
-            for model_name, blocks in initial_blocks:
-                # Preserve original per-block store times; re-stamping them
-                # would defeat the engine-restart freshness filter.
-                for hashes in _chunks(list(blocks)):
-                    yield _encode(model_name, [{
-                        "type": KV_EVENT_STORED,
-                        "block_hashes": hashes,
-                        "timestamps": [blocks[h] for h in hashes],
-                    }])
-            while True:
-                try:
-                    message = await asyncio.wait_for(
-                        stream.queue.get(), STREAM_HEARTBEAT_SECONDS)
-                except asyncio.TimeoutError:
-                    yield b"\n"
-                    continue
-                if message is None:
+        initial_blocks, stream.initial_blocks = stream.initial_blocks, []
+        for model_name, blocks in initial_blocks:
+            # Preserve original per-block store times; re-stamping them
+            # would defeat the engine-restart freshness filter.
+            for hashes in _chunks(list(blocks)):
+                if stream.closed:
                     return
-                yield message
-        finally:
-            self._close_stream(stream)
+                yield _encode(model_name, [{
+                    "type": KV_EVENT_STORED,
+                    "block_hashes": hashes,
+                    "timestamps": [blocks[h] for h in hashes],
+                }])
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    stream.queue.get(), STREAM_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                yield b"\n"
+                continue
+            if message is None:
+                return
+            yield message
 
     async def close(self) -> None:
         """End all router streams; called on shutdown."""
         self._closed = True
-        for stream in list(self._streams.values()):
+        for stream in list(self._live):
             self._close_stream(stream)
 
     async def add_blocks(self, model_name: str, block_hashes: List[int],

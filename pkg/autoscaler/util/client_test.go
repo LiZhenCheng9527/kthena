@@ -284,14 +284,15 @@ func TestGetTargetLabelsDoesNotMutateInput(t *testing.T) {
 			t.Fatalf("GetTargetLabels() error = %v", err)
 		}
 
+		want := map[string]string{"app": "my-app"}
+		if !reflect.DeepEqual(podSource.LabelSelector.MatchLabels, want) {
+			t.Errorf("after two targets matchLabels = %v, want %v", podSource.LabelSelector.MatchLabels, want)
+		}
 		if !strings.Contains((*first).String(), workload.ModelServingNameLabelKey+"=serving-a") {
 			t.Errorf("first selector %q lost its target name", (*first).String())
 		}
 		if !strings.Contains((*second).String(), workload.ModelServingNameLabelKey+"=serving-b") {
 			t.Errorf("second selector %q lost its target name", (*second).String())
-		}
-		if strings.Contains((*second).String(), "serving-a") {
-			t.Errorf("second selector %q still carries the first target", (*second).String())
 		}
 	})
 }

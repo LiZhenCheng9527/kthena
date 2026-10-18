@@ -93,15 +93,14 @@ func GetTargetLabels(target *workload.Target, podSource *workload.PodMetricSourc
 	if target == nil || target.TargetRef.Name == "" {
 		return nil, nil
 	}
-	kind := target.TargetRef.Kind
-	if kind == "" {
-		kind = workload.ModelServingKind.Kind
+	if target.TargetRef.Kind == "" {
+		target.TargetRef.Kind = workload.ModelServingKind.Kind
 	}
 
 	selector := metav1.LabelSelector{}
-	if kind == workload.ModelServingKind.Kind {
+	if target.TargetRef.Kind == workload.ModelServingKind.Kind {
 		if podSource != nil && podSource.LabelSelector != nil {
-			selector = *podSource.LabelSelector.DeepCopy()
+			selector = *podSource.LabelSelector
 		}
 		if selector.MatchLabels == nil {
 			selector.MatchLabels = map[string]string{}
@@ -109,7 +108,7 @@ func GetTargetLabels(target *workload.Target, podSource *workload.PodMetricSourc
 		selector.MatchLabels[workload.ModelServingNameLabelKey] = target.TargetRef.Name
 		selector.MatchLabels[workload.EntryLabelKey] = Entry
 	} else {
-		return nil, fmt.Errorf("unsupported target ref kind: %s", kind)
+		return nil, fmt.Errorf("unsupported target ref kind: %s", target.TargetRef.Kind)
 	}
 
 	labelSelector, err := metav1.LabelSelectorAsSelector(&selector)

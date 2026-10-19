@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	clientsetfake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	workloadlisters "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
@@ -265,8 +266,8 @@ func TestGetTargetLabelsDoesNotMutateInput(t *testing.T) {
 			for _, name := range tt.targetNames {
 				target := &workload.Target{TargetRef: corev1.ObjectReference{Name: name}}
 				selector, err := GetTargetLabels(target, podSource)
-				assert.NoError(t, err)
-				assert.NotNil(t, selector)
+				require.NoError(t, err)
+				require.NotNil(t, selector)
 				gotSelectors = append(gotSelectors, (*selector).String())
 				assert.Empty(t, target.TargetRef.Kind)
 			}

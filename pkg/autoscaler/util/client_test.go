@@ -18,10 +18,10 @@ package util
 
 import (
 	"context"
-	"reflect"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	clientsetfake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
 	workloadlisters "github.com/volcano-sh/kthena/client-go/listers/workload/v1alpha1"
@@ -229,72 +229,52 @@ func TestGetTargetLabels(t *testing.T) {
 }
 
 func TestGetTargetLabelsDoesNotMutateInput(t *testing.T) {
-	newPodSource := func() *workload.PodMetricSource {
-		return &workload.PodMetricSource{
-			LabelSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "my-app"},
+	configured := map[string]string{"app": "my-app"}
+
+	tests := []struct {
+		name          string
+		targetNames   []string
+		wantSelectors []string
+	}{
+		{
+			name:        "one target",
+			targetNames: []string{"serving-a"},
+			wantSelectors: []string{
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-a",
 			},
-		}
+		},
+		{
+			name:        "two targets sharing the pod source",
+			targetNames: []string{"serving-a", "serving-b"},
+			wantSelectors: []string{
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-a",
+				"app=my-app," + workload.EntryLabelKey + "=" + Entry + "," + workload.ModelServingNameLabelKey + "=serving-b",
+			},
+		},
 	}
 
-	t.Run("the caller label selector is unchanged", func(t *testing.T) {
-		podSource := newPodSource()
-		target := &workload.Target{TargetRef: corev1.ObjectReference{Name: "serving-a"}}
-
-		if _, err := GetTargetLabels(target, podSource); err != nil {
-			t.Fatalf("GetTargetLabels() error = %v", err)
-		}
-
-		want := map[string]string{"app": "my-app"}
-		if !reflect.DeepEqual(podSource.LabelSelector.MatchLabels, want) {
-			t.Errorf("matchLabels = %v, want %v", podSource.LabelSelector.MatchLabels, want)
-		}
-		if target.TargetRef.Kind != "" {
-			t.Errorf("targetRef.kind = %q, want it left empty", target.TargetRef.Kind)
-		}
-	})
-
-	t.Run("the returned selector still carries the model serving labels", func(t *testing.T) {
-		podSource := newPodSource()
-		target := &workload.Target{TargetRef: corev1.ObjectReference{Name: "serving-a"}}
-
-		got, err := GetTargetLabels(target, podSource)
-		if err != nil {
-			t.Fatalf("GetTargetLabels() error = %v", err)
-		}
-		if got == nil {
-			t.Fatal("GetTargetLabels() returned no selector")
-		}
-		for _, want := range []string{"app=my-app", workload.ModelServingNameLabelKey + "=serving-a", workload.EntryLabelKey + "=" + Entry} {
-			if !strings.Contains((*got).String(), want) {
-				t.Errorf("selector %q is missing %q", (*got).String(), want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podSource := &workload.PodMetricSource{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "my-app"},
+				},
 			}
-		}
-	})
 
-	t.Run("two targets sharing a pod source do not collide", func(t *testing.T) {
-		podSource := newPodSource()
+			gotSelectors := make([]string, 0, len(tt.targetNames))
+			for _, name := range tt.targetNames {
+				target := &workload.Target{TargetRef: corev1.ObjectReference{Name: name}}
+				selector, err := GetTargetLabels(target, podSource)
+				assert.NoError(t, err)
+				assert.NotNil(t, selector)
+				gotSelectors = append(gotSelectors, (*selector).String())
+				assert.Empty(t, target.TargetRef.Kind)
+			}
 
-		first, err := GetTargetLabels(&workload.Target{TargetRef: corev1.ObjectReference{Name: "serving-a"}}, podSource)
-		if err != nil {
-			t.Fatalf("GetTargetLabels() error = %v", err)
-		}
-		second, err := GetTargetLabels(&workload.Target{TargetRef: corev1.ObjectReference{Name: "serving-b"}}, podSource)
-		if err != nil {
-			t.Fatalf("GetTargetLabels() error = %v", err)
-		}
-
-		want := map[string]string{"app": "my-app"}
-		if !reflect.DeepEqual(podSource.LabelSelector.MatchLabels, want) {
-			t.Errorf("after two targets matchLabels = %v, want %v", podSource.LabelSelector.MatchLabels, want)
-		}
-		if !strings.Contains((*first).String(), workload.ModelServingNameLabelKey+"=serving-a") {
-			t.Errorf("first selector %q lost its target name", (*first).String())
-		}
-		if !strings.Contains((*second).String(), workload.ModelServingNameLabelKey+"=serving-b") {
-			t.Errorf("second selector %q lost its target name", (*second).String())
-		}
-	})
+			assert.Equal(t, tt.wantSelectors, gotSelectors)
+			assert.Equal(t, configured, podSource.LabelSelector.MatchLabels)
+		})
+	}
 }
 
 func TestGetMetricPods(t *testing.T) {

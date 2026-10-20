@@ -18,14 +18,93 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 )
+
+var (
+	accessLogTextSelectedPodRE = regexp.MustCompile(`selected_pod=([^\s]+)`)
+	accessLogJSONSelectedPodRE = regexp.MustCompile(`"selected_pod"\s*:\s*"([^"]*)"`)
+)
+
+type selectedBackend struct {
+	pod         string
+	modelServer string
+}
+
+// SelectedPodAfterChatURLHeaders sends a chat request and reads selected_pod from router logs.
+func SelectedPodAfterChatURLHeaders(t *testing.T, kube kubernetes.Interface, kthenaNamespace, url, modelName string, messages []ChatMessage, extra map[string]string) string {
+	t.Helper()
+	return selectedBackendAfterChatURLHeaders(t, kube, kthenaNamespace, url, modelName, messages, extra).pod
+}
+
+func selectedBackendAfterChatURLHeaders(t *testing.T, kube kubernetes.Interface, kthenaNamespace, url, modelName string, messages []ChatMessage, extra map[string]string) selectedBackend {
+	t.Helper()
+	requestID := "e2e-router-" + RandomString(16)
+	headers := map[string]string{"x-request-id": requestID}
+	for k, v := range extra {
+		headers[k] = v
+	}
+	_ = CheckChatCompletionsWithURLAndHeaders(t, url, modelName, messages, headers)
+
+	ctx := context.Background()
+	deadline := time.Now().Add(45 * time.Second)
+	tailLines := int64(4000)
+	for time.Now().Before(deadline) {
+		for _, pod := range GetReadyRouterPods(t, kube, kthenaNamespace) {
+			tl := tailLines
+			raw, err := kube.CoreV1().Pods(kthenaNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tl}).Do(ctx).Raw()
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(string(raw), "\n") {
+				if backend := selectedBackendFromAccessLogLine(line, requestID); backend.pod != "" {
+					return backend
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	require.Failf(t, "selected_pod not found in router access logs", "request_id=%s", requestID)
+	return selectedBackend{}
+}
+
+func selectedBackendFromAccessLogLine(line, requestID string) selectedBackend {
+	entry, ok := ParseRouterAccessLogLine([]byte(line))
+	if ok && entry.RequestID == requestID && entry.SelectedPod != "" {
+		return selectedBackend{pod: entry.SelectedPod, modelServer: entry.ModelServer}
+	}
+	// Fallback for lines that only match the request-id + selected_pod regexes.
+	if pod := selectedPodFromAccessLogLine(line, requestID); pod != "" {
+		return selectedBackend{pod: pod}
+	}
+	return selectedBackend{}
+}
+
+func selectedPodFromAccessLogLine(line, requestID string) string {
+	if !strings.Contains(line, "request_id="+requestID) &&
+		!strings.Contains(line, `"request_id":"`+requestID+`"`) {
+		return ""
+	}
+	if m := accessLogTextSelectedPodRE.FindStringSubmatch(line); len(m) > 1 {
+		return m[1]
+	}
+	if m := accessLogJSONSelectedPodRE.FindStringSubmatch(line); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
 
 // ParseRouterAccessLogLine parses either supported Router access-log format.
 func ParseRouterAccessLogLine(line []byte) (accesslog.AccessLogEntry, bool) {

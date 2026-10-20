@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -49,11 +47,6 @@ const (
 
 	// SessionStickyLogBindingExpired matches MemoryStore background sweep of expired bindings.
 	SessionStickyLogBindingExpired = "session sticky: binding expired"
-)
-
-var (
-	sessionStickyAccessLogTextPodRE = regexp.MustCompile(`selected_pod=([^\s]+)`)
-	sessionStickyAccessLogJSONPodRE = regexp.MustCompile(`"selected_pod"\s*:\s*"([^"]*)"`)
 )
 
 // SessionStickyE2ERouterYAMLMemory returns router config for in-process session sticky store.
@@ -97,65 +90,14 @@ type SessionStickyBackend struct {
 // SessionStickySelectedPodAfterChatURLHeaders sends a chat request to url and reads selected_pod from router logs.
 func SessionStickySelectedPodAfterChatURLHeaders(t *testing.T, kube kubernetes.Interface, kthenaNamespace, url, modelName string, messages []ChatMessage, extra map[string]string) string {
 	t.Helper()
-	return SessionStickySelectedBackendAfterChatURLHeaders(t, kube, kthenaNamespace, url, modelName, messages, extra).Pod
+	return SelectedPodAfterChatURLHeaders(t, kube, kthenaNamespace, url, modelName, messages, extra)
 }
 
 // SessionStickySelectedBackendAfterChatURLHeaders sends a chat request and reads selected_pod + model_server from router logs.
 func SessionStickySelectedBackendAfterChatURLHeaders(t *testing.T, kube kubernetes.Interface, kthenaNamespace, url, modelName string, messages []ChatMessage, extra map[string]string) SessionStickyBackend {
 	t.Helper()
-	requestID := "e2e-ss-" + RandomString(16)
-	headers := map[string]string{"x-request-id": requestID}
-	for k, v := range extra {
-		headers[k] = v
-	}
-	_ = CheckChatCompletionsWithURLAndHeaders(t, url, modelName, messages, headers)
-
-	ctx := context.Background()
-	deadline := time.Now().Add(45 * time.Second)
-	tailLines := int64(4000)
-	for time.Now().Before(deadline) {
-		for _, pod := range GetReadyRouterPods(t, kube, kthenaNamespace) {
-			tl := tailLines
-			raw, err := kube.CoreV1().Pods(kthenaNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tl}).Do(ctx).Raw()
-			if err != nil {
-				continue
-			}
-			for _, line := range strings.Split(string(raw), "\n") {
-				if backend := sessionStickyParseBackendFromAccessLogLine(line, requestID); backend.Pod != "" {
-					return backend
-				}
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	require.Failf(t, "selected_pod not found in router access logs", "request_id=%s", requestID)
-	return SessionStickyBackend{}
-}
-
-func sessionStickyParseBackendFromAccessLogLine(line, requestID string) SessionStickyBackend {
-	entry, ok := ParseRouterAccessLogLine([]byte(line))
-	if ok && entry.RequestID == requestID && entry.SelectedPod != "" {
-		return SessionStickyBackend{Pod: entry.SelectedPod, ModelServer: entry.ModelServer}
-	}
-	// Fallback for lines that only match the sticky request-id + selected_pod regexes.
-	if pod := sessionStickyParseSelectedPodFromAccessLogLine(line, requestID); pod != "" {
-		return SessionStickyBackend{Pod: pod}
-	}
-	return SessionStickyBackend{}
-}
-
-func sessionStickyParseSelectedPodFromAccessLogLine(line, requestID string) string {
-	if !strings.Contains(line, "request_id="+requestID) &&
-		!strings.Contains(line, `"request_id":"`+requestID+`"`) {
-		return ""
-	}
-	if m := sessionStickyAccessLogTextPodRE.FindStringSubmatch(line); len(m) > 1 {
-		return m[1]
-	}
-	if m := sessionStickyAccessLogJSONPodRE.FindStringSubmatch(line); len(m) > 1 {
-		return m[1]
-	}
-	return ""
+	backend := selectedBackendAfterChatURLHeaders(t, kube, kthenaNamespace, url, modelName, messages, extra)
+	return SessionStickyBackend{Pod: backend.pod, ModelServer: backend.modelServer}
 }
 
 // SessionStickyWaitBindingExpiredLog waits for router pod logs after a binding TTL eviction.

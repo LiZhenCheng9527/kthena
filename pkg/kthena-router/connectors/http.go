@@ -77,13 +77,13 @@ func (h *HTTPConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, pr
 	var err error
 	h.decodeRequest, err = BuildDecodeRequest(c, c.Request, decodeBody)
 	if err != nil {
-		return 0, fmt.Errorf("failed to build decode request: %w", err)
+		return 0, &NonRetryableError{Err: fmt.Errorf("failed to build decode request: %w", err)}
 	}
 
 	prefillBody := cloneReqBody(reqBody)
 	h.prefillRequest, err = buildPrefillRequest(c, c.Request, prefillBody)
 	if err != nil {
-		return 0, fmt.Errorf("failed to build prefill request: %w", err)
+		return 0, &NonRetryableError{Err: fmt.Errorf("failed to build prefill request: %w", err)}
 	}
 
 	// --- Prefill phase ---

@@ -1577,6 +1577,10 @@ func (r *Router) proxyToPDDisaggregated(
 			if c.Writer.Written() {
 				return err
 			}
+			var nonRetryable *connectors.NonRetryableError
+			if errors.As(err, &nonRetryable) {
+				return err
+			}
 			var responsesErr *connectors.DecodeUpstreamError
 			if errors.As(err, &responsesErr) {
 				lastResponsesErr = responsesErr

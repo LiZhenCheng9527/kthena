@@ -328,6 +328,18 @@ func TestPreparePrefillBodyProtocolAware(t *testing.T) {
 			want: map[string]interface{}{"model": "m", "max_tokens": 1, "max_completion_tokens": 1},
 		},
 		{
+			name: "chat completions caps min_tokens alongside max_tokens",
+			path: "/v1/chat/completions",
+			in:   map[string]interface{}{"model": "m", "max_tokens": 512, "min_tokens": 512},
+			want: map[string]interface{}{"model": "m", "max_tokens": 1, "min_tokens": 1},
+		},
+		{
+			name: "chat completions caps min_completion_tokens when present",
+			path: "/v1/chat/completions",
+			in:   map[string]interface{}{"model": "m", "min_completion_tokens": 100},
+			want: map[string]interface{}{"model": "m", "max_tokens": 1, "min_completion_tokens": 1},
+		},
+		{
 			name: "legacy/non-v1 path keeps chat completions behavior",
 			path: "/test",
 			in:   map[string]interface{}{"model": "m", "stream": true},

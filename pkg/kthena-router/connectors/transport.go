@@ -190,7 +190,9 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration, rt h
 // request: it disables streaming and caps the prefill output to a single token.
 // The output-cap field is protocol-specific: the OpenAI Responses API uses
 // max_output_tokens, while Chat Completions uses max_tokens (and
-// max_completion_tokens when the client already set it).
+// max_completion_tokens when the client already set it). min_tokens (and
+// min_completion_tokens when set) are capped to 1 as well to avoid a
+// min_tokens > max_tokens conflict.
 func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	delete(reqBody, "stream")
 	delete(reqBody, "stream_options")
@@ -201,8 +203,14 @@ func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	}
 
 	reqBody["max_tokens"] = 1
+	if reqBody["min_tokens"] != nil {
+		reqBody["min_tokens"] = 1
+	}
 	if reqBody["max_completion_tokens"] != nil {
 		reqBody["max_completion_tokens"] = 1
+	}
+	if reqBody["min_completion_tokens"] != nil {
+		reqBody["min_completion_tokens"] = 1
 	}
 }
 

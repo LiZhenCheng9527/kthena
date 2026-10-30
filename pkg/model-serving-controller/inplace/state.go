@@ -151,8 +151,7 @@ func Completed(pod *corev1.Pod) bool {
 		if status == nil || status.ContainerID == "" || status.ContainerID == patched.PrevContainerID {
 			return false
 		}
-		// Some runtimes report a digest instead of the image name; a changed image ID then proves the new image.
-		if !sameImage(status.Image, patched.Image) && status.ImageID == patched.PrevImageID {
+		if !sameImage(status.Image, patched.Image) && !imageIDChanged(status.ImageID, patched.PrevImageID) {
 			return false
 		}
 	}
@@ -221,10 +220,20 @@ func sameImage(a, b string) bool {
 	return normalizeImage(a) == normalizeImage(b)
 }
 
+// imageIDChanged is the fallback for runtimes that report a digest instead of the image
+// name. Without a known previous ID (the container never started) it proves nothing.
+func imageIDChanged(current, previous string) bool {
+	return current != "" && previous != "" && current != previous
+}
+
 func normalizeImage(image string) string {
 	named, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
 		return image
+	}
+	if digested, ok := named.(reference.Digested); ok {
+		// The digest identifies the image; a tag next to it is informational.
+		return named.Name() + "@" + digested.Digest().String()
 	}
 	return reference.TagNameOnly(named).String()
 }
@@ -286,6 +295,14 @@ func Complete(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod,
 		state = &State{Revision: revision, StartedAt: metav1.Now()}
 	}
 	state.Done = true
+	// Drop allowances the update did not use (first start, coalesced patches),
+	// otherwise a later real crash would hide behind them.
+	for name := range state.Patched {
+		if status := containerStatus(pod, name); status != nil && status.RestartCount < state.Expected[name] {
+			state.Expected[name] = status.RestartCount
+		}
+	}
+	state.Patched = nil
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err

@@ -566,8 +566,14 @@ func TestUpdatePodRecoversCrashDuringInPlaceUpdate(t *testing.T) {
 
 	f.controller.updatePod(nil, pod)
 
-	_, loaded := f.controller.graceMap.Load(getPodGracePeriodKey(pod))
-	assert.True(t, loaded, "a crash during the update must enter recovery")
+	assert.Eventually(t, func() bool {
+		for _, action := range f.kubeClient.Actions() {
+			if action.Matches("delete", "pods") {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond, "a crash during the update must trigger recovery")
 }
 
 func TestUpdateServingGroupRevisionLookup(t *testing.T) {
@@ -636,6 +642,48 @@ func TestCompleteInPlaceUpdatesRevertedToSourceRevisionRecreates(t *testing.T) {
 
 	// The user reverts the spec while the Pod already runs the patched image.
 	require.NoError(t, f.controller.completeInPlaceUpdates(ctx, f.oldMS, f.oldRev))
+
+	assert.Equal(t, datastore.ServingGroupDeleting, f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup))
+}
+
+func TestCompleteInPlaceUpdatesRepairsStoreAfterLostCompleteResponse(t *testing.T) {
+	f := newInPlaceFixture(t, nil, nil)
+	ctx := context.Background()
+	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+	require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
+
+	// The Complete patch reached the API server, but the controller never recorded it.
+	pod := f.syncPodFromAPI(t)
+	kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
+	require.NoError(t, inplace.Complete(ctx, f.kubeClient, pod, f.newRev, ""))
+	f.syncPodFromAPI(t)
+	revision, _ := f.controller.store.GetServingGroupRevision(utils.GetNamespaceName(f.newMS), inPlaceTestGroup)
+	require.Equal(t, f.oldRev, revision)
+
+	require.NoError(t, f.controller.completeInPlaceUpdates(ctx, f.newMS, f.newRev))
+
+	revision, _ = f.controller.store.GetServingGroupRevision(utils.GetNamespaceName(f.newMS), inPlaceTestGroup)
+	assert.Equal(t, f.newRev, revision)
+}
+
+func TestCompleteInPlaceUpdatesStillRunsAfterSwitchToRecreate(t *testing.T) {
+	f := newInPlaceFixture(t, func(ms *workloadv1alpha1.ModelServing) {
+		ms.Spec.RolloutStrategy.ProgressDeadlineSeconds = ptr.To[int32](60)
+	}, nil)
+	ctx := context.Background()
+	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+	require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
+	pod := f.syncPodFromAPI(t).DeepCopy()
+	state := inplace.StateOf(pod)
+	state.StartedAt = metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	pod.Annotations[workloadv1alpha1.InPlaceUpdateStateAnnotationKey] = marshalState(t, state)
+	_, err := f.kubeClient.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	f.syncPodFromAPI(t)
+
+	switched := f.newMS.DeepCopy()
+	switched.Spec.RolloutStrategy.UpdateMethod = workloadv1alpha1.RecreateUpdateMethod
+	require.NoError(t, f.controller.completeInPlaceUpdates(ctx, switched, f.newRev))
 
 	assert.Equal(t, datastore.ServingGroupDeleting, f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup))
 }

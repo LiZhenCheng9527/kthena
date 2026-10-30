@@ -52,6 +52,8 @@ func podWithState(t *testing.T, state *State, ready bool, status corev1.Containe
 	return pod
 }
 
+const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func TestStatePredicates(t *testing.T) {
 	// "main" was patched to v2 while running container c1 with image id1, after one earlier update restart.
 	started := &State{
@@ -98,6 +100,16 @@ func TestStatePredicates(t *testing.T) {
 			name: "first start after fixing a bad image has no restart", wantInProgress: true, wantCompleted: true, ready: true,
 			state:  &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}, Expected: map[string]int32{"main": 1}},
 			status: corev1.ContainerStatus{ContainerID: "c1", Image: "docker.io/library/app:v2", ImageID: "id2"},
+		},
+		{
+			name: "patched before first start, old image started meanwhile", ready: true, wantInProgress: true, wantUpdating: true,
+			state:  &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}, Expected: map[string]int32{"main": 1}},
+			status: corev1.ContainerStatus{ContainerID: "c1", Image: "sha256:old", ImageID: "id1"},
+		},
+		{
+			name: "digest-pinned target matches a tagless runtime report", ready: true, wantInProgress: true, wantCompleted: true,
+			state:  &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2@sha256:" + digest, PrevContainerID: "c1", PrevImageID: "id1"}}, Expected: map[string]int32{"main": 2}},
+			status: corev1.ContainerStatus{RestartCount: 2, ContainerID: "c2", Image: "docker.io/library/app@sha256:" + digest, ImageID: "id2"},
 		},
 		{name: "done, only the expected restarts", state: done, ready: true, status: updated},
 		{name: "done, crashed afterwards", state: done, ready: true, status: corev1.ContainerStatus{RestartCount: 3}, wantUnexpectedRestart: true},
@@ -212,6 +224,35 @@ func TestStateOfMigratesLegacyAnnotation(t *testing.T) {
 			assert.Equal(t, tt.wantInProgress, InProgress(pod))
 			assert.Equal(t, tt.wantCompleted, Completed(pod))
 			assert.Equal(t, tt.wantUnexpected, UnexpectedRestart(pod))
+		})
+	}
+}
+
+func TestCompleteDropsUnusedRestartAllowance(t *testing.T) {
+	tests := []struct {
+		name         string
+		restartCount int32
+		want         int32
+	}{
+		{name: "first start needed no restart", restartCount: 0, want: 0},
+		{name: "the update restart was used", restartCount: 1, want: 1},
+		{name: "extra crash is not absorbed", restartCount: 3, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}, Expected: map[string]int32{"main": 1}}
+			pod := podWithState(t, state, true, corev1.ContainerStatus{RestartCount: tt.restartCount, ContainerID: "c1"})
+			pod.Namespace, pod.Name = "ns", "p"
+			client := kubefake.NewSimpleClientset(pod)
+
+			require.NoError(t, Complete(context.Background(), client, pod, "v2", ""))
+
+			got, err := client.CoreV1().Pods("ns").Get(context.Background(), "p", metav1.GetOptions{})
+			require.NoError(t, err)
+			done := StateOf(got)
+			require.NotNil(t, done)
+			assert.True(t, done.Done)
+			assert.Equal(t, tt.want, done.Expected["main"])
 		})
 	}
 }

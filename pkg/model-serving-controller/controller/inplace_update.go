@@ -265,10 +265,9 @@ type inPlaceUnit struct {
 
 // completeInPlaceUpdates finishes in-place updates. It is level-triggered: it only
 // reads Pod state, so it is safe to run after a controller restart or repeatedly.
+// It also runs when the update method was switched away from InPlace, so a unit
+// left unfinished by an earlier in-place update still completes or hits its deadline.
 func (c *ModelServingController) completeInPlaceUpdates(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
-	if inplace.UpdateMethodOf(ms) != workloadv1alpha1.InPlaceUpdateMethod {
-		return nil
-	}
 	groups, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
 	if err != nil {
 		return nil
@@ -340,6 +339,7 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 		}
 	}
 	if !inProgress {
+		c.repairInPlaceRevision(ms, unit, revision)
 		return nil
 	}
 
@@ -360,6 +360,24 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 		fmt.Sprintf("In-place update of ServingGroup %s to revision %s completed", unit.groupName, revision))
 	c.enqueueModelServing(ms)
 	return nil
+}
+
+// repairInPlaceRevision re-records the revision of a unit whose Pods were all flipped
+// by an in-place update, in case the store missed it (for example the final Complete
+// patch persisted but its response was lost, and the retry found nothing in progress).
+func (c *ModelServingController) repairInPlaceRevision(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, revision string) {
+	flipped := false
+	for _, pod := range unit.pods {
+		if utils.ObjectRevision(pod) != revision {
+			return
+		}
+		if state := inplace.StateOf(pod); state != nil && state.Done && state.Revision == revision {
+			flipped = true
+		}
+	}
+	if flipped {
+		c.recordInPlaceRevision(ms, unit, revision)
+	}
 }
 
 // unitCompleted is true once every Pod has restarted with its new image and is Ready.

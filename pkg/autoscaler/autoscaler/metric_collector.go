@@ -286,8 +286,7 @@ func evaluatePodsReadiness(pods []*corev1.Pod) (unreadyPods sets.Set[string], fa
 		if !inferControllerUtils.IsPodRunningAndReady(pod) {
 			unreadyPods.Insert(metricPodKey(pod))
 		}
-		// Restarts caused by an in-place update are expected and are not failures.
-		if util.IsPodFailed(pod) || inplace.ClassifyRestart(pod) == inplace.UnexpectedRestart {
+		if util.IsPodFailed(pod) || inplace.UnexpectedRestart(pod) {
 			failed = true
 		}
 	}

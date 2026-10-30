@@ -23,7 +23,6 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
@@ -279,44 +278,4 @@ func TestOnlyRoleImagesChanged(t *testing.T) {
 			assert.Equal(t, tt.want, OnlyRoleImagesChanged(oldMS, newMS, tt.roleName))
 		})
 	}
-}
-
-func TestPlanUpdate(t *testing.T) {
-	podOf := func(role string, entry bool) *corev1.Pod {
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{workloadv1alpha1.RoleLabelKey: role}}}
-		if entry {
-			pod.Labels[workloadv1alpha1.EntryLabelKey] = "true"
-		}
-		return pod
-	}
-	source := newEligibilityModelServing()
-	withPrefill(source)
-
-	t.Run("changed images of each template", func(t *testing.T) {
-		target := source.DeepCopy()
-		setEntryImage(target, 0, "example.com/engine:v2")
-		plan := PlanUpdate(source, target, "rev-1", "rev-2", "")
-		require.Nil(t, plan.Unsupported)
-		assert.Equal(t, map[string]string{"engine": "example.com/engine:v2"}, plan.ImagesForPod(podOf("decode", true)))
-		assert.Empty(t, plan.ImagesForPod(podOf("decode", false)), "the worker template did not change")
-		assert.Empty(t, plan.ImagesForPod(podOf("prefill", true)), "another Role did not change")
-	})
-
-	t.Run("only the planned Role", func(t *testing.T) {
-		target := source.DeepCopy()
-		setEntryImage(target, 0, "example.com/engine:v2")
-		target.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Env[0].Value = "m2"
-		plan := PlanUpdate(source, target, "rev-1", "rev-2", "decode")
-		require.Nil(t, plan.Unsupported, "a change in another Role does not matter")
-		assert.Equal(t, map[string]string{"engine": "example.com/engine:v2"}, plan.ImagesForPod(podOf("decode", true)))
-	})
-
-	t.Run("unsupported change", func(t *testing.T) {
-		target := source.DeepCopy()
-		target.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env[0].Value = "m2"
-		plan := PlanUpdate(source, target, "rev-1", "rev-2", "")
-		require.NotNil(t, plan.Unsupported)
-		assert.Equal(t, ReasonIneligible, plan.Unsupported.Reason)
-		assert.Contains(t, plan.Unsupported.Message, "revision rev-2 changes fields other than regular-container images from revision rev-1")
-	})
 }

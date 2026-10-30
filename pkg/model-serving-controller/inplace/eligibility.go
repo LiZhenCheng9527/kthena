@@ -19,8 +19,6 @@ package inplace
 import (
 	"bytes"
 
-	corev1 "k8s.io/api/core/v1"
-
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
@@ -65,62 +63,6 @@ func OnlyRoleImagesChanged(oldMS, newMS *workloadv1alpha1.ModelServing, roleName
 	patched := oldRole.DeepCopy()
 	copyImages(patched, newRole)
 	return utils.CalRoleTemplateHash(*patched) == utils.CalRoleTemplateHash(*newRole)
-}
-
-type UpdatePlan struct {
-	Unsupported *Fallback
-	images      map[templateKey]map[string]string
-}
-
-// PlanUpdate returns the changed regular-container images of each Pod template, or why they cannot be updated in place.
-// With roleName set, it compares only that Role.
-func PlanUpdate(source, target *workloadv1alpha1.ModelServing, sourceRevision, targetRevision, roleName string) UpdatePlan {
-	var eligible bool
-	var err error
-	if roleName != "" {
-		eligible = OnlyRoleImagesChanged(source, target, roleName)
-	} else {
-		eligible, err = OnlyImagesChanged(source, target)
-	}
-	switch {
-	case err != nil:
-		return UpdatePlan{Unsupported: fallback(ReasonIneligible, "revision %s cannot be compared with revision %s: %v", sourceRevision, targetRevision, err)}
-	case !eligible:
-		return UpdatePlan{Unsupported: fallback(ReasonIneligible, "revision %s changes fields other than regular-container images from revision %s", targetRevision, sourceRevision)}
-	}
-	plan := UpdatePlan{images: map[templateKey]map[string]string{}}
-	for i := range target.Spec.Template.Roles {
-		role := &target.Spec.Template.Roles[i]
-		if roleName != "" && role.Name != roleName {
-			continue
-		}
-		sourceRole := findRole(source, role.Name)
-		plan.addImages(templateKey{role: role.Name, entry: true}, &sourceRole.EntryTemplate, &role.EntryTemplate)
-		if role.WorkerTemplate != nil {
-			plan.addImages(templateKey{role: role.Name}, sourceRole.WorkerTemplate, role.WorkerTemplate)
-		}
-	}
-	return plan
-}
-
-func (p *UpdatePlan) addImages(key templateKey, source, target *workloadv1alpha1.PodTemplateSpec) {
-	sourceImages := make(map[string]string, len(source.Spec.Containers))
-	for _, container := range source.Spec.Containers {
-		sourceImages[container.Name] = container.Image
-	}
-	for _, container := range target.Spec.Containers {
-		if sourceImages[container.Name] == container.Image {
-			continue
-		}
-		if p.images[key] == nil {
-			p.images[key] = map[string]string{}
-		}
-		p.images[key][container.Name] = container.Image
-	}
-}
-
-func (p UpdatePlan) ImagesForPod(pod *corev1.Pod) map[string]string {
-	return p.images[templateKeyForPod(pod)]
 }
 
 func findRole(ms *workloadv1alpha1.ModelServing, roleName string) *workloadv1alpha1.Role {

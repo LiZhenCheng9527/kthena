@@ -122,15 +122,6 @@ func GetControllerRevision(
 	return cr, nil
 }
 
-func ListControllerRevisions(ctx context.Context, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing) ([]appsv1.ControllerRevision, error) {
-	selector := labels.SelectorFromSet(map[string]string{ControllerRevisionLabelKey: ms.Name})
-	list, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list ControllerRevisions: %v", err)
-	}
-	return list.Items, nil
-}
-
 // GetRolesFromControllerRevision extracts roles template data from a ControllerRevision
 func GetRolesFromControllerRevision(cr *appsv1.ControllerRevision) ([]workloadv1alpha1.Role, error) {
 	if cr == nil || cr.Data.Raw == nil {

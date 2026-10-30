@@ -425,10 +425,10 @@ spec:
 
 - With `ServingGroupRollingUpdate`, each `ServingGroup` is updated as one unit. With `RoleRollingUpdate`, each Role instance (its entry Pod and its workers) is updated as one unit, and only Roles whose template changed are updated. A unit returns to service once all of its Pods are Ready on the new image, and uses one slot of `maxUnavailable` while it is updated.
 - `RoleRollingUpdate` uses each Role's `maxUnavailable` and `partition`, as with `Recreate`. A Role without `maxUnavailable` updates all of its outdated instances at once.
-- A unit that cannot be updated in place is recreated instead, as with `Recreate`, and an `InPlaceUpdateFallback` event explains why. This happens when its update changes anything other than regular-container images, when a Pod does not have `restartPolicy: Always` or a container sets its own restart policy, or when the target of an unfinished in-place update changes.
+- A unit that cannot be updated in place is recreated instead, as with `Recreate`, and an `InPlaceUpdateFallback` event explains why. This happens when its update changes anything other than regular-container images, when a Pod does not have `restartPolicy: Always` or a container sets its own restart policy.
 - Every outdated resource is recreated when a plugin does not support in-place updates, or when `maxUnavailable` resolves to `0`. Under `RoleRollingUpdate`, a Role whose `maxUnavailable` resolves to `0` is recreated. The `lws-standard-labels` plugin supports in-place updates.
 - `maxSurge` only applies when every outdated resource is recreated, as described above. A single unit that cannot be updated in place is recreated within `maxUnavailable`, without a surge unit.
-- If a unit is not Ready on the new image within `progressDeadlineSeconds` (default 1800), its Pods that are not Ready follow the `recoveryPolicy`. With `recoveryPolicy: None`, patched Pods are kept, and a unit with a Pod that was never patched is recreated.
+- If a unit is not Ready on the new image within `progressDeadlineSeconds` (default 1800), it is recreated, as with `Recreate`, and a warning `InPlaceUpdateFallback` event is emitted.
 - You can switch back to `updateMethod: Recreate` at any time. A unit whose in-place update is unfinished then counts as outdated and is recreated by the rolling update.
 
 :::note

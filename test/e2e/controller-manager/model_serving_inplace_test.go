@@ -267,12 +267,19 @@ func TestModelServingInPlaceUpdateFallsBackToRecreate(t *testing.T) {
 			})
 
 			updatedRole := ms.Spec.Template.Roles[0].Name
+			// Walk the original Pods, so a Pod that is temporarily absent cannot pass the check.
+			var originals []string
+			for name, snapshot := range before {
+				if snapshot.role == updatedRole {
+					originals = append(originals, name)
+				}
+			}
+			require.NotEmpty(t, originals, "role %s should have Pods before the update", updatedRole)
 			require.Eventually(t, func() bool {
-				for name, pod := range listPodsByName(t, ctx, kubeClient, ms.Name) {
-					if before[name].role != updatedRole {
-						continue
-					}
-					if pod.UID == before[name].uid || !isPodReady(pod) || pod.Spec.Containers[0].Image != nginxAlpineImage {
+				current := listPodsByName(t, ctx, kubeClient, ms.Name)
+				for _, name := range originals {
+					pod, ok := current[name]
+					if !ok || pod.UID == before[name].uid || !isPodReady(pod) || pod.Spec.Containers[0].Image != nginxAlpineImage {
 						return false
 					}
 				}

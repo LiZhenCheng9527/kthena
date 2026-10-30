@@ -88,15 +88,18 @@ func (c *ModelServingController) updateServingGroup(ctx context.Context, ms *wor
 	if !c.updatesInPlace(ms) {
 		return c.deleteServingGroup(ctx, ms, sg.Name)
 	}
-	pods, err := c.getPodsByIndex(GroupNameKey, fmt.Sprintf("%s/%s", ms.Namespace, sg.Name))
+	pods, err := c.ownedPodsByIndex(ms, GroupNameKey, fmt.Sprintf("%s/%s", ms.Namespace, sg.Name))
 	if err != nil {
 		return err
 	}
 	revision := utils.ModelServingRevision(ms)
-	decision, reason := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, _ *corev1.Pod) bool {
+	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, _ *corev1.Pod) bool {
 		same, err := inplace.OnlyImagesChanged(oldMS, ms)
 		return err == nil && same
 	})
+	if err != nil {
+		return err
+	}
 	switch decision {
 	case decisionWait:
 		return nil
@@ -114,14 +117,17 @@ func (c *ModelServingController) updateRole(ctx context.Context, ms *workloadv1a
 		c.DeleteRole(ctx, ms, groupName, roleName, roleID)
 		return nil
 	}
-	pods, err := c.getPodsByIndex(RoleIDKey, fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, roleName, roleID))
+	pods, err := c.ownedPodsByIndex(ms, RoleIDKey, fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, roleName, roleID))
 	if err != nil {
 		return err
 	}
 	revision := utils.ModelServingRevision(ms)
-	decision, reason := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool {
+	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool {
 		return inplace.OnlyRoleImagesChanged(oldMS, ms, utils.GetRoleName(pod))
 	})
+	if err != nil {
+		return err
+	}
 	switch decision {
 	case decisionWait:
 		return nil
@@ -142,17 +148,17 @@ func (c *ModelServingController) decideInPlace(
 	pods []*corev1.Pod,
 	revision string,
 	imagesOnly func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool,
-) (inPlaceDecision, string) {
+) (inPlaceDecision, string, error) {
 	if len(pods) == 0 {
-		return decisionRecreate, "no pods found"
+		return decisionRecreate, "no pods found", nil
 	}
 	sources := map[string]*workloadv1alpha1.ModelServing{}
 	for _, pod := range pods {
 		if utils.IsPodTerminating(pod) {
-			return decisionWait, ""
+			return decisionWait, "", nil
 		}
-		if pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
-			return decisionRecreate, fmt.Sprintf("pod %s restartPolicy is not Always", pod.Name)
+		if reason := restartPolicyBlocksInPlace(pod); reason != "" {
+			return decisionRecreate, reason, nil
 		}
 		podRevision := utils.ObjectRevision(pod)
 		if podRevision == revision {
@@ -160,36 +166,73 @@ func (c *ModelServingController) decideInPlace(
 		}
 		oldMS, ok := sources[podRevision]
 		if !ok {
-			var err error
-			if oldMS, err = c.modelServingAtRevision(ctx, ms, podRevision); err != nil {
-				return decisionRecreate, fmt.Sprintf("cannot read revision %s: %v", podRevision, err)
+			cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, podRevision)
+			if err != nil {
+				// A transient API failure must not turn into a recreate; retry instead.
+				return decisionWait, "", err
+			}
+			if cr == nil {
+				return decisionRecreate, fmt.Sprintf("ControllerRevision of revision %s not found", podRevision), nil
+			}
+			if oldMS, err = utils.ModelServingAtRevision(ms, cr); err != nil {
+				return decisionRecreate, fmt.Sprintf("cannot read revision %s: %v", podRevision, err), nil
 			}
 			sources[podRevision] = oldMS
 		}
 		if !imagesOnly(oldMS, pod) {
-			return decisionRecreate, "changes other than container images"
+			return decisionRecreate, "changes other than container images", nil
 		}
 	}
-	return decisionInPlace, ""
+	return decisionInPlace, "", nil
 }
 
-func (c *ModelServingController) modelServingAtRevision(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) (*workloadv1alpha1.ModelServing, error) {
-	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+// restartPolicyBlocksInPlace returns why the kubelet may not restart a container
+// after its image changed, or "" when it always does.
+func restartPolicyBlocksInPlace(pod *corev1.Pod) string {
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
+		return fmt.Sprintf("pod %s restartPolicy is not Always", pod.Name)
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.RestartPolicy != nil && *container.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			return fmt.Sprintf("container %s of pod %s has restartPolicy %s", container.Name, pod.Name, *container.RestartPolicy)
+		}
+		if len(container.RestartPolicyRules) > 0 {
+			return fmt.Sprintf("container %s of pod %s has restartPolicyRules", container.Name, pod.Name)
+		}
+	}
+	return ""
+}
+
+// ownedPodsByIndex lists Pods from an index and drops those owned by a different
+// ModelServing incarnation, which must never be patched.
+func (c *ModelServingController) ownedPodsByIndex(ms *workloadv1alpha1.ModelServing, index, key string) ([]*corev1.Pod, error) {
+	pods, err := c.getPodsByIndex(index, key)
 	if err != nil {
 		return nil, err
 	}
-	if cr == nil {
-		return nil, fmt.Errorf("ControllerRevision not found")
+	owned := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if utils.IsOwnedByModelServingWithUID(pod, ms.UID) {
+			owned = append(owned, pod)
+		}
 	}
-	return utils.ModelServingAtRevision(ms, cr)
+	return owned, nil
 }
 
 // startInPlaceUpdate patches every Pod of the unit and marks it unavailable at once,
 // so the rollout budget accounts for the unit before the kubelet has restarted anything.
 func (c *ModelServingController) startInPlaceUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, pods []*corev1.Pod, revision string) error {
 	// Persist the target template so a later recovery never depends on the mutable spec.
-	if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, revision, ms.Spec.Template.Roles); err != nil {
+	// An existing revision is kept as is: role replicas are not part of the revision hash,
+	// so re-creating it mid-rollout would fail on a data mismatch.
+	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+	if err != nil {
 		return err
+	}
+	if cr == nil {
+		if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, revision, ms.Spec.Template.Roles); err != nil {
+			return err
+		}
 	}
 	for _, pod := range pods {
 		if utils.ObjectRevision(pod) == revision && !inplace.InProgress(pod) {
@@ -284,6 +327,11 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 		}
 		inProgress = true
 		if state.Revision != revision {
+			if utils.ObjectRevision(pod) == revision {
+				// The spec went back to the revision the Pod is labelled with, so the rollout
+				// treats it as up to date although its images were already patched away.
+				return c.recreateInPlaceUnit(ctx, ms, unit)
+			}
 			// The desired revision moved on; the regular rollout re-patches this unit.
 			return nil
 		}
@@ -343,6 +391,10 @@ func (c *ModelServingController) enforceInPlaceDeadline(ctx context.Context, ms 
 	}
 	c.emitRoleStatusEvent(ms, corev1.EventTypeWarning, "InPlaceUpdateFallback",
 		fmt.Sprintf("In-place update of ServingGroup %s exceeded progress deadline %s, recreating", unit.groupName, deadline))
+	return c.recreateInPlaceUnit(ctx, ms, unit)
+}
+
+func (c *ModelServingController) recreateInPlaceUnit(ctx context.Context, ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit) error {
 	if unit.roleName == "" {
 		return c.deleteServingGroup(ctx, ms, unit.groupName)
 	}

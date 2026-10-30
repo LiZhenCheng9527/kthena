@@ -359,7 +359,14 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 	}
 
 	switch {
-	case inplace.Updating(newPod) && !utils.IsPodFailed(newPod):
+	case inplace.InProgress(newPod) && (utils.IsPodFailed(newPod) || inplace.UnexpectedRestart(newPod)):
+		// A crash during an in-place update is not covered by the expected restarts and must be recovered.
+		klog.V(4).Infof("handleErrorPod: %s/%s", newPod.Namespace, newPod.Name)
+		err = c.handleErrorPod(ms, servingGroupName, newPod)
+		if err != nil {
+			klog.Errorf("handle error pod %s/%s failed for ModelServing %s/%s: %v", newPod.Namespace, newPod.Name, ms.Namespace, ms.Name, err)
+		}
+	case inplace.Updating(newPod):
 		c.handleInPlaceUpdatingPod(ms, servingGroupName, newPod)
 	case utils.IsPodRunningAndReady(newPod):
 		klog.V(4).Infof("handleReadyPod: %s/%s", newPod.Namespace, newPod.Name)

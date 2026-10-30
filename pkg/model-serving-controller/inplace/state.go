@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/distribution/reference"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -39,21 +40,92 @@ type State struct {
 	Revision string `json:"revision"`
 	// StartedAt is used for the progress deadline.
 	StartedAt metav1.Time `json:"startedAt"`
-	// Baseline holds the restart count of every patched container before the patch.
-	Baseline map[string]int32 `json:"baseline,omitempty"`
+	// Patched holds, per container patched by the unfinished update, the target
+	// image and the container that was running before the patch.
+	Patched map[string]PatchedContainer `json:"patched,omitempty"`
+	// Expected is the restart count each container may have because of in-place
+	// updates. It accumulates over updates; anything above it is a crash.
+	Expected map[string]int32 `json:"expected,omitempty"`
 	// Done is set together with the revision label flip.
 	Done bool `json:"done,omitempty"`
 }
 
+// PatchedContainer identifies the container instance an image patch replaces.
+type PatchedContainer struct {
+	Image string `json:"image"`
+	// PrevContainerID and PrevImageID are empty when the container never started.
+	PrevContainerID string `json:"prevContainerID,omitempty"`
+	PrevImageID     string `json:"prevImageID,omitempty"`
+}
+
 // StateOf returns the Pod's in-place update state, or nil when there is none.
+// Annotations written by the earlier state machine (versioned, with a phase) are
+// migrated, so a controller upgrade keeps finished and unfinished updates intact.
 func StateOf(pod *corev1.Pod) *State {
 	raw, ok := pod.Annotations[workloadv1alpha1.InPlaceUpdateStateAnnotationKey]
 	if !ok {
 		return nil
 	}
+	var probe struct {
+		Version int    `json:"version"`
+		Phase   string `json:"phase"`
+	}
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return nil
+	}
+	if probe.Version != 0 || probe.Phase != "" {
+		return migrateLegacyState(raw)
+	}
 	state := &State{}
 	if err := json.Unmarshal([]byte(raw), state); err != nil {
 		return nil
+	}
+	return state
+}
+
+// legacyState is the annotation schema of the earlier in-place update implementation.
+type legacyState struct {
+	TargetRevision string      `json:"targetRevision"`
+	Phase          string      `json:"phase"`
+	StartedAt      metav1.Time `json:"startedAt"`
+	// Baseline holds restart counts at patch time, or after completion once the phase is Done.
+	Baseline map[string]struct {
+		ContainerID  string `json:"containerID,omitempty"`
+		RestartCount int32  `json:"restartCount"`
+	} `json:"baseline,omitempty"`
+	// Patched holds the containers the last patch changed; ImageID is the one before the patch.
+	Patched map[string]struct {
+		Image   string `json:"image"`
+		ImageID string `json:"imageID,omitempty"`
+	} `json:"patched,omitempty"`
+}
+
+func migrateLegacyState(raw string) *State {
+	legacy := &legacyState{}
+	if err := json.Unmarshal([]byte(raw), legacy); err != nil {
+		return nil
+	}
+	state := &State{
+		Revision:  legacy.TargetRevision,
+		StartedAt: legacy.StartedAt,
+		Done:      legacy.Phase == "Done",
+		Expected:  map[string]int32{},
+	}
+	for name, baseline := range legacy.Baseline {
+		state.Expected[name] = baseline.RestartCount
+	}
+	if state.Done {
+		return state
+	}
+	state.Patched = map[string]PatchedContainer{}
+	for name, patched := range legacy.Patched {
+		// The restart of a patched container is expected on top of its baseline.
+		state.Expected[name] = legacy.Baseline[name].RestartCount + 1
+		state.Patched[name] = PatchedContainer{
+			Image:           patched.Image,
+			PrevContainerID: legacy.Baseline[name].ContainerID,
+			PrevImageID:     patched.ImageID,
+		}
 	}
 	return state
 }
@@ -64,17 +136,23 @@ func InProgress(pod *corev1.Pod) bool {
 	return state != nil && !state.Done
 }
 
-// Completed reports whether every patched container has restarted with the new
-// image and the Pod is Ready again. Checking restart counts guards against the
-// stale Ready condition that remains until kubelet notices the image change.
+// Completed reports whether every patched container runs a new container instance
+// with the target image and the Pod is Ready again. Comparing container IDs and
+// images, instead of counting restarts, rejects both the stale Ready condition
+// kept until kubelet notices the patch and a crash of the old container, and it
+// also covers a container that never started before (restart count stays 0).
 func Completed(pod *corev1.Pod) bool {
 	state := StateOf(pod)
 	if state == nil || state.Done || !utils.IsPodRunningAndReady(pod) {
 		return false
 	}
-	restarts := restartCounts(pod)
-	for name, base := range state.Baseline {
-		if restarts[name] <= base {
+	for name, patched := range state.Patched {
+		status := containerStatus(pod, name)
+		if status == nil || status.ContainerID == "" || status.ContainerID == patched.PrevContainerID {
+			return false
+		}
+		// Some runtimes report a digest instead of the image name; a changed image ID then proves the new image.
+		if !sameImage(status.Image, patched.Image) && status.ImageID == patched.PrevImageID {
 			return false
 		}
 	}
@@ -87,13 +165,10 @@ func Updating(pod *corev1.Pod) bool {
 }
 
 // UnexpectedRestart replaces a plain "container restarted" check. Restarts
-// caused by an in-place update are expected and must not trigger recovery.
+// caused by an in-place update are expected and must not trigger recovery;
+// any restart beyond them is a crash, also while an update is in progress.
 func UnexpectedRestart(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending {
-		return false
-	}
-	state := StateOf(pod)
-	if state != nil && !state.Done {
 		return false
 	}
 	for _, status := range pod.Status.InitContainerStatuses {
@@ -101,14 +176,13 @@ func UnexpectedRestart(pod *corev1.Pod) bool {
 			return true
 		}
 	}
-	for name, count := range restartCounts(pod) {
+	state := StateOf(pod)
+	for _, status := range pod.Status.ContainerStatuses {
 		expected := int32(0)
 		if state != nil {
-			if base, ok := state.Baseline[name]; ok {
-				expected = base + 1
-			}
+			expected = state.Expected[status.Name]
 		}
-		if count > expected {
+		if status.RestartCount > expected {
 			return true
 		}
 	}
@@ -132,12 +206,27 @@ func TargetImages(ms *workloadv1alpha1.ModelServing, pod *corev1.Pod) map[string
 	return images
 }
 
-func restartCounts(pod *corev1.Pod) map[string]int32 {
-	counts := make(map[string]int32, len(pod.Status.ContainerStatuses))
-	for _, status := range pod.Status.ContainerStatuses {
-		counts[status.Name] = status.RestartCount
+func containerStatus(pod *corev1.Pod, name string) *corev1.ContainerStatus {
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == name {
+			return &pod.Status.ContainerStatuses[i]
+		}
 	}
-	return counts
+	return nil
+}
+
+// sameImage compares image references after normalization, because the runtime
+// reports "docker.io/library/nginx:latest" for a spec that says "nginx".
+func sameImage(a, b string) bool {
+	return normalizeImage(a) == normalizeImage(b)
+}
+
+func normalizeImage(image string) string {
+	named, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return image
+	}
+	return reference.TagNameOnly(named).String()
 }
 
 // Start patches the images of pod and records the update state atomically.
@@ -147,15 +236,30 @@ func Start(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, im
 	if state := StateOf(pod); state != nil && !state.Done && state.Revision == revision {
 		return false, nil
 	}
-	state := State{Revision: revision, StartedAt: metav1.NewTime(now), Baseline: map[string]int32{}}
-	restarts := restartCounts(pod)
+	state := State{Revision: revision, StartedAt: metav1.NewTime(now), Patched: map[string]PatchedContainer{}, Expected: map[string]int32{}}
+	if prior := StateOf(pod); prior != nil {
+		for name, count := range prior.Expected {
+			state.Expected[name] = count
+		}
+		if !prior.Done {
+			// Containers patched earlier must still be verified when the target is retargeted.
+			for name, patched := range prior.Patched {
+				state.Patched[name] = patched
+			}
+		}
+	}
 	containers := make([]map[string]string, 0, len(pod.Spec.Containers))
 	for _, container := range pod.Spec.Containers {
 		image, ok := images[container.Name]
 		if !ok || image == container.Image {
 			continue
 		}
-		state.Baseline[container.Name] = restarts[container.Name]
+		patched := PatchedContainer{Image: image}
+		if status := containerStatus(pod, container.Name); status != nil {
+			patched.PrevContainerID, patched.PrevImageID = status.ContainerID, status.ImageID
+		}
+		state.Patched[container.Name] = patched
+		state.Expected[container.Name]++
 		containers = append(containers, map[string]string{"name": container.Name, "image": image})
 	}
 	raw, err := json.Marshal(state)
@@ -163,10 +267,9 @@ func Start(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, im
 		return false, err
 	}
 	patch := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"resourceVersion": pod.ResourceVersion,
-			"annotations":     map[string]string{workloadv1alpha1.InPlaceUpdateStateAnnotationKey: string(raw)},
-		},
+		"metadata": preconditionedMetadata(pod, map[string]interface{}{
+			"annotations": map[string]string{workloadv1alpha1.InPlaceUpdateStateAnnotationKey: string(raw)},
+		}),
 	}
 	if len(containers) > 0 {
 		patch["spec"] = map[string]interface{}{"containers": containers}
@@ -192,11 +295,24 @@ func Complete(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod,
 		podLabels[workloadv1alpha1.RoleTemplateHashLabelKey] = roleHash
 	}
 	return applyPatch(ctx, client, pod, map[string]interface{}{
-		"metadata": map[string]interface{}{
+		"metadata": preconditionedMetadata(pod, map[string]interface{}{
 			"labels":      podLabels,
 			"annotations": map[string]string{workloadv1alpha1.InPlaceUpdateStateAnnotationKey: string(raw)},
-		},
+		}),
 	})
+}
+
+// preconditionedMetadata pins the patch to the observed Pod instance. A conflict
+// is retried with fresh state, and a Pod recreated under the same name is never
+// marked done by a decision made about its predecessor.
+func preconditionedMetadata(pod *corev1.Pod, metadata map[string]interface{}) map[string]interface{} {
+	if pod.ResourceVersion != "" {
+		metadata["resourceVersion"] = pod.ResourceVersion
+	}
+	if pod.UID != "" {
+		metadata["uid"] = pod.UID
+	}
+	return metadata
 }
 
 func applyPatch(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, patch map[string]interface{}) error {

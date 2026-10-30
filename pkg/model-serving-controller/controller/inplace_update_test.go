@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -27,9 +28,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	kthenafake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
@@ -119,7 +122,7 @@ func newInPlaceFixture(t *testing.T, newMutate func(*workloadv1alpha1.ModelServi
 		Status: corev1.PodStatus{
 			Phase:             corev1.PodRunning,
 			Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
-			ContainerStatuses: []corev1.ContainerStatus{{Name: "prefill-container", RestartCount: 0}},
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "prefill-container", Image: "img:v1", ImageID: "id-v1", ContainerID: "containerd://old"}},
 		},
 	}
 	if podMutate != nil {
@@ -138,6 +141,16 @@ func (f *inPlaceFixture) syncPodFromAPI(t *testing.T) *corev1.Pod {
 	require.NoError(t, err)
 	require.NoError(t, f.controller.podsInformer.GetIndexer().Update(pod))
 	return pod
+}
+
+// kubeletRestart simulates kubelet restarting the container on the given image.
+func kubeletRestart(image, imageID string) func(*corev1.ContainerStatus) {
+	return func(status *corev1.ContainerStatus) {
+		status.RestartCount++
+		status.ContainerID = "containerd://" + imageID
+		status.Image = image
+		status.ImageID = imageID
+	}
 }
 
 func TestUpdateServingGroupInPlaceOrRecreate(t *testing.T) {
@@ -179,6 +192,30 @@ func TestUpdateServingGroupInPlaceOrRecreate(t *testing.T) {
 			wantRecreated: true,
 		},
 		{
+			name: "container restartPolicy OnFailure is recreated",
+			podMutate: func(pod *corev1.Pod) {
+				pod.Spec.Containers[0].RestartPolicy = ptr.To(corev1.ContainerRestartPolicyOnFailure)
+			},
+			wantRecreated: true,
+		},
+		{
+			name: "container restartPolicyRules are recreated",
+			podMutate: func(pod *corev1.Pod) {
+				pod.Spec.Containers[0].RestartPolicyRules = []corev1.ContainerRestartRule{{
+					Action:    corev1.ContainerRestartRuleActionRestart,
+					ExitCodes: &corev1.ContainerRestartRuleOnExitCodes{Operator: corev1.ContainerRestartRuleOnExitCodesOpIn, Values: []int32{1}},
+				}}
+			},
+			wantRecreated: true,
+		},
+		{
+			name: "pod of another ModelServing is ignored and the group recreated",
+			podMutate: func(pod *corev1.Pod) {
+				pod.OwnerReferences[0].UID = "other-uid"
+			},
+			wantRecreated: true,
+		},
+		{
 			name: "terminating pod waits",
 			podMutate: func(pod *corev1.Pod) {
 				now := metav1.Now()
@@ -209,7 +246,10 @@ func TestUpdateServingGroupInPlaceOrRecreate(t *testing.T) {
 			state := inplace.StateOf(pod)
 			require.NotNil(t, state)
 			assert.Equal(t, f.newRev, state.Revision)
-			assert.Equal(t, map[string]int32{"prefill-container": 0}, state.Baseline)
+			assert.Equal(t, map[string]inplace.PatchedContainer{
+				"prefill-container": {Image: "img:v2", PrevContainerID: "containerd://old", PrevImageID: "id-v1"},
+			}, state.Patched)
+			assert.Equal(t, map[string]int32{"prefill-container": 1}, state.Expected)
 			assert.Equal(t, datastore.ServingGroupCreating, status, "group must count against the unavailable budget")
 		})
 	}
@@ -220,26 +260,35 @@ func TestCompleteInPlaceUpdates(t *testing.T) {
 		name         string
 		deadline     *int32
 		startedAgo   time.Duration
-		restartCount int32
+		status       func(*corev1.ContainerStatus)
 		wantFlipped  bool
 		wantDeleting bool
 	}{
 		{
-			name:         "restarted and ready flips the revision",
-			startedAgo:   time.Minute,
-			restartCount: 1,
-			wantFlipped:  true,
+			name:        "restarted and ready flips the revision",
+			startedAgo:  time.Minute,
+			status:      kubeletRestart("img:v2", "id-v2"),
+			wantFlipped: true,
 		},
 		{
-			name:         "stale ready without restart keeps waiting",
-			startedAgo:   time.Minute,
-			restartCount: 0,
+			name:        "runtime reports a normalized image name",
+			startedAgo:  time.Minute,
+			status:      kubeletRestart("docker.io/library/img:v2", "id-v2"),
+			wantFlipped: true,
+		},
+		{
+			name:       "stale ready without restart keeps waiting",
+			startedAgo: time.Minute,
+		},
+		{
+			name:       "crash of the old image is not completion",
+			startedAgo: time.Minute,
+			status:     kubeletRestart("img:v1", "id-v1"),
 		},
 		{
 			name:         "expired deadline falls back to recreate",
 			deadline:     ptr.To[int32](60),
 			startedAgo:   2 * time.Minute,
-			restartCount: 0,
 			wantDeleting: true,
 		},
 	}
@@ -259,7 +308,9 @@ func TestCompleteInPlaceUpdates(t *testing.T) {
 			state.StartedAt = metav1.NewTime(time.Now().Add(-tt.startedAgo))
 			pod = pod.DeepCopy()
 			pod.Annotations[workloadv1alpha1.InPlaceUpdateStateAnnotationKey] = marshalState(t, state)
-			pod.Status.ContainerStatuses[0].RestartCount = tt.restartCount
+			if tt.status != nil {
+				tt.status(&pod.Status.ContainerStatuses[0])
+			}
 			pod.Status.Phase = corev1.PodRunning
 			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 			_, err := f.kubeClient.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{})
@@ -321,7 +372,7 @@ func TestUpdatePodDoesNotRecoverInPlaceUpdatingPod(t *testing.T) {
 	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
 	require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
 	pod := f.syncPodFromAPI(t)
-	pod.Status.ContainerStatuses[0].RestartCount = 1
+	kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
 	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
 
 	f.controller.updatePod(nil, pod)
@@ -449,7 +500,7 @@ func TestManageRollingUpdateInPlaceEndToEnd(t *testing.T) {
 
 			// kubelet restarts the container and the Pod becomes Ready again.
 			pod = pod.DeepCopy()
-			pod.Status.ContainerStatuses[0].RestartCount = 1
+			kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
 			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 			_, err := f.kubeClient.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{})
 			require.NoError(t, err)
@@ -496,4 +547,95 @@ func TestCompleteInPlaceUpdatesRoleDeadlineRecreatesRoleOnly(t *testing.T) {
 
 	assert.Equal(t, datastore.RoleDeleting, f.roleStatus())
 	assert.NotEqual(t, datastore.ServingGroupDeleting, f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup), "only the Role is recreated")
+}
+
+func TestUpdatePodRecoversCrashDuringInPlaceUpdate(t *testing.T) {
+	f := newInPlaceFixture(t, nil, nil)
+	ctx := context.Background()
+	f.controller.initialSync.Store(true)
+	require.NoError(t, f.controller.modelServingsInformer.GetIndexer().Add(f.newMS))
+	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+	require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
+
+	pod := f.syncPodFromAPI(t)
+	// One restart for the update and one crash on top of it.
+	kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
+	kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	require.True(t, inplace.UnexpectedRestart(pod))
+
+	f.controller.updatePod(nil, pod)
+
+	_, loaded := f.controller.graceMap.Load(getPodGracePeriodKey(pod))
+	assert.True(t, loaded, "a crash during the update must enter recovery")
+}
+
+func TestUpdateServingGroupRevisionLookup(t *testing.T) {
+	tests := []struct {
+		name          string
+		prepare       func(f *inPlaceFixture)
+		wantErr       bool
+		wantInPlace   bool
+		wantRecreated bool
+	}{
+		{
+			name: "API error is retried, not recreated",
+			prepare: func(f *inPlaceFixture) {
+				f.kubeClient.PrependReactor("get", "controllerrevisions", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("etcd timeout")
+				})
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing source revision is recreated",
+			prepare: func(f *inPlaceFixture) {
+				require.NoError(t, f.kubeClient.AppsV1().ControllerRevisions("default").Delete(context.Background(),
+					utils.GenerateControllerRevisionName("ms", f.oldRev), metav1.DeleteOptions{}))
+			},
+			wantRecreated: true,
+		},
+		{
+			name: "existing target revision with other replicas does not block the update",
+			prepare: func(f *inPlaceFixture) {
+				other := f.newMS.DeepCopy()
+				other.Spec.Template.Roles[0].Replicas = ptr.To[int32](5)
+				_, err := utils.CreateControllerRevision(context.Background(), f.kubeClient, other, f.newRev, other.Spec.Template.Roles)
+				require.NoError(t, err)
+			},
+			wantInPlace: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newInPlaceFixture(t, nil, nil)
+			tt.prepare(f)
+			sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+
+			err := f.controller.updateServingGroup(context.Background(), f.newMS, sg)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			status := f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup)
+			assert.Equal(t, tt.wantRecreated, status == datastore.ServingGroupDeleting)
+			pod := f.syncPodFromAPI(t)
+			assert.Equal(t, tt.wantInPlace, inplace.InProgress(pod))
+		})
+	}
+}
+
+func TestCompleteInPlaceUpdatesRevertedToSourceRevisionRecreates(t *testing.T) {
+	f := newInPlaceFixture(t, nil, nil)
+	ctx := context.Background()
+	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+	require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
+	f.syncPodFromAPI(t)
+
+	// The user reverts the spec while the Pod already runs the patched image.
+	require.NoError(t, f.controller.completeInPlaceUpdates(ctx, f.oldMS, f.oldRev))
+
+	assert.Equal(t, datastore.ServingGroupDeleting, f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup))
 }

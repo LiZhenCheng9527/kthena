@@ -388,6 +388,11 @@ func TestImagesToPatch(t *testing.T) {
 			pod:        pod(map[string]string{"main": "app:hotfix"}, &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}}),
 			wantImages: map[string]string{}, wantDrift: []string{"main"},
 		},
+		{
+			name: "container already at the target without an update of ours is drift", target: target, source: source,
+			pod:        pod(map[string]string{"main": "app:v2", "sidecar": "side:v1"}, nil),
+			wantImages: map[string]string{}, wantDrift: []string{"main"},
+		},
 		{name: "no source patches only earlier patched containers", pod: pod(source, nil), target: target, wantImages: map[string]string{}, wantDrift: []string{"main"}},
 	}
 	for _, tt := range tests {

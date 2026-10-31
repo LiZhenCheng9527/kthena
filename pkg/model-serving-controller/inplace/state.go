@@ -274,11 +274,19 @@ func ImagesToPatch(pod *corev1.Pod, target, source map[string]string) (images ma
 	images = map[string]string{}
 	for _, container := range pod.Spec.Containers {
 		want, ok := target[container.Name]
-		if !ok || want == container.Image {
+		if !ok {
 			continue
 		}
 		earlier, patchedBefore := prior.patchedContainer(container.Name)
 		src, known := source[container.Name]
+		if want == container.Image {
+			// Already at the target without an update of ours: the runtime may still run the
+			// old image and nothing would verify the switch, so it is not trusted.
+			if known && src != want && !patchedBefore {
+				drift = append(drift, container.Name)
+			}
+			continue
+		}
 		switch {
 		// An earlier patch only proves ownership while the live image is still what it wrote.
 		case (patchedBefore && container.Image == earlier.Image) || (known && container.Image == src):

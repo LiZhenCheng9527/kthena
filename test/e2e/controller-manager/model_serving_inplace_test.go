@@ -153,6 +153,10 @@ func trackUnavailableUnits(t *testing.T, ctx context.Context, kubeClient *kubern
 		pods := map[string]corev1.Pod{}
 		for event := range watcher.ResultChan() {
 			if event.Type == watch.Error {
+				if watchCtx.Err() != nil {
+					// Stopping the tracker itself breaks the stream.
+					return
+				}
 				mu.Lock()
 				watchErr = fmt.Errorf("watch error: %v", apierrors.FromObject(event.Object))
 				mu.Unlock()

@@ -488,7 +488,7 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 	}
 
 	if retargeted {
-		if unitSettled(ms, unit) {
+		if unitSettled(ms, unit, revision) {
 			return nil
 		}
 		return c.enforceInPlaceDeadline(ctx, ms, unit, revision, earliest)
@@ -579,8 +579,13 @@ func hasUnpatchedOutdatedPod(unit *inPlaceUnit, revision string) bool {
 	return false
 }
 
-// unitSettled is true when every Pod that is mid-update has finished its own update.
-func unitSettled(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit) bool {
+// unitSettled is true when no member is left unpatched and every Pod that is mid-update has finished its own update.
+func unitSettled(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, revision string) bool {
+	// A member that was never patched keeps the unit half updated, and the partition may keep
+	// the rollout from selecting it again, so it must stay under the deadline.
+	if hasUnpatchedOutdatedPod(unit, revision) {
+		return false
+	}
 	for i, pod := range unit.pods {
 		if unit.states[i].InProgress() && !podFinished(ms, unit.states[i], pod) {
 			return false

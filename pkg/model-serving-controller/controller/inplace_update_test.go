@@ -829,6 +829,38 @@ func TestRetargetedUnitStillHitsDeadline(t *testing.T) {
 	}
 }
 
+func TestRetargetedHalfPatchedUnitHitsDeadline(t *testing.T) {
+	f := newInPlaceFixture(t, func(ms *workloadv1alpha1.ModelServing) {
+		ms.Spec.RolloutStrategy.ProgressDeadlineSeconds = ptr.To[int32](60)
+		ms.Spec.RecoveryPolicy = workloadv1alpha1.RoleRecreate
+	}, nil)
+	ctx := context.Background()
+	second := f.syncPodFromAPI(t).DeepCopy()
+	second.Name, second.UID, second.ResourceVersion = "ms-0-prefill-0-extra", "pod-uid-2", ""
+	_, err := f.kubeClient.CoreV1().Pods("default").Create(ctx, second, metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, f.controller.podsInformer.GetIndexer().Add(second))
+
+	// Only the first Pod was patched, and it finished; then the spec moved on to v3.
+	_, err = inplace.Start(ctx, f.kubeClient, f.syncPodFromAPI(t), map[string]string{"prefill-container": "img:v2"}, f.newRev, time.Now())
+	require.NoError(t, err)
+	pod := f.syncPodFromAPI(t).DeepCopy()
+	kubeletRestart("img:v2", "id-v2")(&pod.Status.ContainerStatuses[0])
+	_, err = f.kubeClient.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	expireInPlaceDeadline(t, f)
+	third := newInPlaceModelServing("img:v3", func(ms *workloadv1alpha1.ModelServing) {
+		ms.Spec.RolloutStrategy.ProgressDeadlineSeconds = ptr.To[int32](60)
+		ms.Spec.RecoveryPolicy = workloadv1alpha1.RoleRecreate
+	})
+	f.kubeClient.ClearActions()
+
+	require.NoError(t, f.controller.completeInPlaceUpdates(ctx, third, utils.ModelServingRevision(third)))
+
+	_, err = f.kubeClient.CoreV1().Pods("default").Get(ctx, second.Name, metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "the never patched Pod is not left behind")
+}
+
 func TestUpdateServingGroupAlreadyStartedMakesNoAPICalls(t *testing.T) {
 	f := newInPlaceFixture(t, nil, nil)
 	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupCreating}

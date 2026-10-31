@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/distribution/reference"
@@ -132,21 +133,48 @@ func migrateLegacyState(raw string) *State {
 
 // InProgress reports whether an in-place update was started on the Pod and not yet finished.
 func InProgress(pod *corev1.Pod) bool {
-	state := StateOf(pod)
-	return state != nil && !state.Done
+	return StateOf(pod).InProgress()
 }
 
 // Completed reports whether every patched container runs a new container instance
-// with the target image and the Pod is Ready again. Comparing container IDs and
-// images, instead of counting restarts, rejects both the stale Ready condition
-// kept until kubelet notices the patch and a crash of the old container, and it
-// also covers a container that never started before (restart count stays 0).
+// with the target image and the Pod is Ready again.
 func Completed(pod *corev1.Pod) bool {
-	state := StateOf(pod)
-	if state == nil || state.Done || !utils.IsPodRunningAndReady(pod) {
+	return StateOf(pod).Completed(pod)
+}
+
+// Updating reports whether the Pod is mid-update: started, but not yet Completed.
+func Updating(pod *corev1.Pod) bool {
+	return StateOf(pod).Updating(pod)
+}
+
+// UnexpectedRestart reports a restart not caused by an in-place update.
+func UnexpectedRestart(pod *corev1.Pod) bool {
+	return StateOf(pod).UnexpectedRestart(pod)
+}
+
+// The methods below take a State decoded once by StateOf, so a caller that needs
+// several predicates for one Pod parses the annotation a single time. They are
+// safe on a nil State, which stands for a Pod without in-place update state.
+
+// InProgress is the method form of the package-level InProgress.
+func (s *State) InProgress() bool {
+	return s != nil && !s.Done
+}
+
+// Completed compares container IDs and images, instead of counting restarts. That
+// rejects both the stale Ready condition kept until kubelet notices the patch and
+// a crash of the old container, and it also covers a container that never started
+// before (restart count stays 0).
+func (s *State) Completed(pod *corev1.Pod) bool {
+	if !s.InProgress() || !utils.IsPodRunningAndReady(pod) {
 		return false
 	}
-	for name, patched := range state.Patched {
+	for name, patched := range s.Patched {
+		// The live spec must still ask for the target image: a Pod edited meanwhile
+		// could otherwise pass the runtime checks below while running another image.
+		if !specRequests(pod, name, patched.Image) {
+			return false
+		}
 		status := containerStatus(pod, name)
 		if status == nil || status.ContainerID == "" || status.ContainerID == patched.PrevContainerID {
 			return false
@@ -158,15 +186,15 @@ func Completed(pod *corev1.Pod) bool {
 	return true
 }
 
-// Updating reports whether the Pod is mid-update: started, but not yet Completed.
-func Updating(pod *corev1.Pod) bool {
-	return InProgress(pod) && !Completed(pod)
+// Updating is the method form of the package-level Updating.
+func (s *State) Updating(pod *corev1.Pod) bool {
+	return s.InProgress() && !s.Completed(pod)
 }
 
 // UnexpectedRestart replaces a plain "container restarted" check. Restarts
 // caused by an in-place update are expected and must not trigger recovery;
 // any restart beyond them is a crash, also while an update is in progress.
-func UnexpectedRestart(pod *corev1.Pod) bool {
+func (s *State) UnexpectedRestart(pod *corev1.Pod) bool {
 	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending {
 		return false
 	}
@@ -175,11 +203,10 @@ func UnexpectedRestart(pod *corev1.Pod) bool {
 			return true
 		}
 	}
-	state := StateOf(pod)
 	for _, status := range pod.Status.ContainerStatuses {
 		expected := int32(0)
-		if state != nil {
-			expected = state.Expected[status.Name]
+		if s != nil {
+			expected = s.Expected[status.Name]
 		}
 		if status.RestartCount > expected {
 			return true
@@ -203,6 +230,35 @@ func TargetImages(ms *workloadv1alpha1.ModelServing, pod *corev1.Pod) map[string
 		images[container.Name] = container.Image
 	}
 	return images
+}
+
+func specRequests(pod *corev1.Pod, name, image string) bool {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == name {
+			return container.Image == image
+		}
+	}
+	return false
+}
+
+// MissingContainers returns the containers of the target template that the live Pod
+// does not have, for example after admission renamed them. Such a Pod cannot be patched.
+func MissingContainers(ms *workloadv1alpha1.ModelServing, pod *corev1.Pod) []string {
+	var missing []string
+	for name := range TargetImages(ms, pod) {
+		found := false
+		for _, container := range pod.Spec.Containers {
+			if container.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 func containerStatus(pod *corev1.Pod, name string) *corev1.ContainerStatus {
@@ -268,6 +324,10 @@ func Start(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, im
 			patched.PrevContainerID, patched.PrevImageID = status.ContainerID, status.ImageID
 		}
 		state.Patched[container.Name] = patched
+		// Restarts that happened before the patch stay behind the baseline; only the update restart is added.
+		if status := containerStatus(pod, container.Name); status != nil && status.RestartCount > state.Expected[container.Name] {
+			state.Expected[container.Name] = status.RestartCount
+		}
 		state.Expected[container.Name]++
 		containers = append(containers, map[string]string{"name": container.Name, "image": image})
 	}

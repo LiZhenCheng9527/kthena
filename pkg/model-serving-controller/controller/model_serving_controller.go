@@ -358,19 +358,20 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		return
 	}
 
+	inPlaceState := inplace.StateOf(newPod)
 	switch {
-	case inplace.InProgress(newPod) && (utils.IsPodFailed(newPod) || inplace.UnexpectedRestart(newPod)):
+	case inPlaceState.InProgress() && (utils.IsPodFailed(newPod) || inPlaceState.UnexpectedRestart(newPod)):
 		// A crash during an in-place update is not covered by the expected restarts and must be recovered.
 		klog.V(4).Infof("handleErrorPod: %s/%s", newPod.Namespace, newPod.Name)
 		err = c.handleErrorPod(ms, servingGroupName, newPod)
 		if err != nil {
 			klog.Errorf("handle error pod %s/%s failed for ModelServing %s/%s: %v", newPod.Namespace, newPod.Name, ms.Namespace, ms.Name, err)
 		}
-	case inplace.Updating(newPod):
+	case inPlaceState.Updating(newPod):
 		c.handleInPlaceUpdatingPod(ms, servingGroupName, newPod)
 	case utils.IsPodRunningAndReady(newPod):
 		klog.V(4).Infof("handleReadyPod: %s/%s", newPod.Namespace, newPod.Name)
-		if inplace.InProgress(newPod) {
+		if inPlaceState.InProgress() {
 			// Every patched container restarted: let the rollout finish the update.
 			defer c.enqueueModelServing(ms)
 		}
@@ -379,7 +380,7 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		if err != nil {
 			klog.Errorf("handle running pod %s/%s failed for ModelServing %s/%s: %v", newPod.Namespace, newPod.Name, ms.Namespace, ms.Name, err)
 		}
-	case utils.IsPodFailed(newPod) || inplace.UnexpectedRestart(newPod):
+	case utils.IsPodFailed(newPod) || inPlaceState.UnexpectedRestart(newPod):
 		klog.V(4).Infof("handleErrorPod: %s/%s", newPod.Namespace, newPod.Name)
 		err = c.handleErrorPod(ms, servingGroupName, newPod)
 		if err != nil {
@@ -1401,6 +1402,7 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 //  3. For ServingGroupRollingUpdate, enforce the ServingGroup-level maxUnavailable budget.
 //  4. For RoleRollingUpdate, update outdated roles using each Role's maxUnavailable budget.
 func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
+	ctx = withInPlaceRound(ctx)
 	// Finish in-place updates first so their budget is released before selecting new units.
 	if err := c.completeInPlaceUpdates(ctx, ms, revision); err != nil {
 		return err
@@ -1865,8 +1867,8 @@ func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.Mo
 			return
 		}
 
-		if !utils.IsPodRunningAndReady(newPod) {
-			// pod has not recovered after the grace period, needs to be rebuilt
+		if !utils.IsPodRunningAndReady(newPod) || inplace.Updating(newPod) {
+			// pod has not recovered after the grace period (an unfinished in-place update counts as not recovered), needs to be rebuilt
 			// After this pod has been deleted, we will rebuild the ServingGroup in deletePod function
 			err = c.kubeClientSet.CoreV1().Pods(ms.Namespace).Delete(context.TODO(), newPod.Name, *metav1.NewPreconditionDeleteOptions(string(errPod.UID)))
 			if err != nil {

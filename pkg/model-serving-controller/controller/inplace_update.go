@@ -44,6 +44,51 @@ const (
 	decisionRecreate
 )
 
+// inPlaceRound memoizes what is identical for every unit of one reconcile: the
+// ControllerRevision lookups, the "only images changed" verdicts, whether in-place
+// updates are usable at all, and the target ControllerRevision. It lives in the
+// context of a single manageRollingUpdate call and is used by one goroutine only.
+type inPlaceRound struct {
+	enabled *bool
+	sources map[string]sourceRevision
+	// imagesOnly is keyed by source revision, plus the Role name in Role mode.
+	imagesOnly   map[string]bool
+	targetStored bool
+}
+
+// sourceRevision is the outcome of reading the ControllerRevision a Pod was created from.
+type sourceRevision struct {
+	ms *workloadv1alpha1.ModelServing
+	// recreateReason is set when the revision cannot be used for an in-place update.
+	recreateReason string
+}
+
+type inPlaceRoundKey struct{}
+
+func withInPlaceRound(ctx context.Context) context.Context {
+	return context.WithValue(ctx, inPlaceRoundKey{}, &inPlaceRound{
+		sources:    map[string]sourceRevision{},
+		imagesOnly: map[string]bool{},
+	})
+}
+
+// roundOf returns the round of ctx, or a throwaway one when ctx carries none.
+func roundOf(ctx context.Context) *inPlaceRound {
+	if round, ok := ctx.Value(inPlaceRoundKey{}).(*inPlaceRound); ok {
+		return round
+	}
+	return &inPlaceRound{sources: map[string]sourceRevision{}, imagesOnly: map[string]bool{}}
+}
+
+// enabledFor is updatesInPlace, evaluated once per round.
+func (r *inPlaceRound) enabledFor(c *ModelServingController, ms *workloadv1alpha1.ModelServing) bool {
+	if r.enabled == nil {
+		enabled := c.updatesInPlace(ms)
+		r.enabled = &enabled
+	}
+	return *r.enabled
+}
+
 // updatesInPlace reports whether the rolling update of ms may use in-place updates.
 // When it is false the controller behaves exactly as for the Recreate method.
 func (c *ModelServingController) updatesInPlace(ms *workloadv1alpha1.ModelServing) bool {
@@ -69,9 +114,10 @@ func (c *ModelServingController) updatesInPlace(ms *workloadv1alpha1.ModelServin
 
 // roleUpdatesInPlace is updatesInPlace for RoleRollingUpdate, where each Role owns its budget.
 func (c *ModelServingController) roleUpdatesInPlace(ms *workloadv1alpha1.ModelServing, roleName string) bool {
-	if !c.updatesInPlace(ms) {
-		return false
-	}
+	return c.updatesInPlace(ms) && roleBudgetAllowsInPlace(ms, roleName)
+}
+
+func roleBudgetAllowsInPlace(ms *workloadv1alpha1.ModelServing, roleName string) bool {
 	for _, role := range ms.Spec.Template.Roles {
 		if role.Name != roleName {
 			continue
@@ -85,7 +131,8 @@ func (c *ModelServingController) roleUpdatesInPlace(ms *workloadv1alpha1.ModelSe
 // updateServingGroup replaces deleting an outdated ServingGroup. It patches the
 // images in place when that is possible and otherwise recreates the group.
 func (c *ModelServingController) updateServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup) error {
-	if !c.updatesInPlace(ms) {
+	round := roundOf(ctx)
+	if !round.enabledFor(c, ms) {
 		return c.deleteServingGroup(ctx, ms, sg.Name)
 	}
 	pods, err := c.ownedPodsByIndex(ms, GroupNameKey, fmt.Sprintf("%s/%s", ms.Namespace, sg.Name))
@@ -93,7 +140,7 @@ func (c *ModelServingController) updateServingGroup(ctx context.Context, ms *wor
 		return err
 	}
 	revision := utils.ModelServingRevision(ms)
-	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, _ *corev1.Pod) bool {
+	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, false, func(oldMS *workloadv1alpha1.ModelServing, _ *corev1.Pod) bool {
 		same, err := inplace.OnlyImagesChanged(oldMS, ms)
 		return err == nil && same
 	})
@@ -113,7 +160,7 @@ func (c *ModelServingController) updateServingGroup(ctx context.Context, ms *wor
 
 // updateRole is updateServingGroup for a single Role replica.
 func (c *ModelServingController) updateRole(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string) error {
-	if !c.roleUpdatesInPlace(ms, roleName) {
+	if !roundOf(ctx).enabledFor(c, ms) || !roleBudgetAllowsInPlace(ms, roleName) {
 		c.DeleteRole(ctx, ms, groupName, roleName, roleID)
 		return nil
 	}
@@ -122,7 +169,7 @@ func (c *ModelServingController) updateRole(ctx context.Context, ms *workloadv1a
 		return err
 	}
 	revision := utils.ModelServingRevision(ms)
-	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool {
+	decision, reason, err := c.decideInPlace(ctx, ms, pods, revision, true, func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool {
 		return inplace.OnlyRoleImagesChanged(oldMS, ms, utils.GetRoleName(pod))
 	})
 	if err != nil {
@@ -142,17 +189,25 @@ func (c *ModelServingController) updateRole(ctx context.Context, ms *workloadv1a
 
 // decideInPlace checks every Pod of an update unit. imagesOnly compares the
 // template the Pod was created from (its labelled revision) with the desired one.
+// perRole tells whether that verdict also depends on the Pod's Role. Source revisions
+// and verdicts are memoized in the round, as all units of a rollout share them.
 func (c *ModelServingController) decideInPlace(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
 	pods []*corev1.Pod,
 	revision string,
+	perRole bool,
 	imagesOnly func(oldMS *workloadv1alpha1.ModelServing, pod *corev1.Pod) bool,
 ) (inPlaceDecision, string, error) {
 	if len(pods) == 0 {
 		return decisionRecreate, "no pods found", nil
 	}
-	sources := map[string]*workloadv1alpha1.ModelServing{}
+	if allPatchedFor(pods, revision) {
+		// The unit was already patched for this revision and is only waiting for the
+		// kubelet, so nothing is evaluated or read again.
+		return decisionInPlace, "", nil
+	}
+	round := roundOf(ctx)
 	for _, pod := range pods {
 		if utils.IsPodTerminating(pod) {
 			return decisionWait, "", nil
@@ -164,7 +219,10 @@ func (c *ModelServingController) decideInPlace(
 		if podRevision == revision {
 			continue
 		}
-		oldMS, ok := sources[podRevision]
+		if missing := inplace.MissingContainers(ms, pod); len(missing) > 0 {
+			return decisionRecreate, fmt.Sprintf("pod %s has no container %v of the target template", pod.Name, missing), nil
+		}
+		source, ok := round.sources[podRevision]
 		if !ok {
 			cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, podRevision)
 			if err != nil {
@@ -172,18 +230,39 @@ func (c *ModelServingController) decideInPlace(
 				return decisionWait, "", err
 			}
 			if cr == nil {
-				return decisionRecreate, fmt.Sprintf("ControllerRevision of revision %s not found", podRevision), nil
+				source.recreateReason = fmt.Sprintf("ControllerRevision of revision %s not found", podRevision)
+			} else if source.ms, err = utils.ModelServingAtRevision(ms, cr); err != nil {
+				source.recreateReason = fmt.Sprintf("cannot read revision %s: %v", podRevision, err)
 			}
-			if oldMS, err = utils.ModelServingAtRevision(ms, cr); err != nil {
-				return decisionRecreate, fmt.Sprintf("cannot read revision %s: %v", podRevision, err), nil
-			}
-			sources[podRevision] = oldMS
+			round.sources[podRevision] = source
 		}
-		if !imagesOnly(oldMS, pod) {
+		if source.recreateReason != "" {
+			return decisionRecreate, source.recreateReason, nil
+		}
+		key := podRevision
+		if perRole {
+			key += "/" + utils.GetRoleName(pod)
+		}
+		same, ok := round.imagesOnly[key]
+		if !ok {
+			same = imagesOnly(source.ms, pod)
+			round.imagesOnly[key] = same
+		}
+		if !same {
 			return decisionRecreate, "changes other than container images", nil
 		}
 	}
 	return decisionInPlace, "", nil
+}
+
+// allPatchedFor is true when every Pod has an unfinished in-place update to revision.
+func allPatchedFor(pods []*corev1.Pod, revision string) bool {
+	for _, pod := range pods {
+		if state := inplace.StateOf(pod); !state.InProgress() || state.Revision != revision || utils.IsPodTerminating(pod) {
+			return false
+		}
+	}
+	return len(pods) > 0
 }
 
 // restartPolicyBlocksInPlace returns why the kubelet may not restart a container
@@ -222,9 +301,49 @@ func (c *ModelServingController) ownedPodsByIndex(ms *workloadv1alpha1.ModelServ
 // startInPlaceUpdate patches every Pod of the unit and marks it unavailable at once,
 // so the rollout budget accounts for the unit before the kubelet has restarted anything.
 func (c *ModelServingController) startInPlaceUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, pods []*corev1.Pod, revision string) error {
-	// Persist the target template so a later recovery never depends on the mutable spec.
-	// An existing revision is kept as is: role replicas are not part of the revision hash,
-	// so re-creating it mid-rollout would fail on a data mismatch.
+	started := false
+	for _, pod := range pods {
+		state := inplace.StateOf(pod)
+		if utils.ObjectRevision(pod) == revision && !state.InProgress() {
+			continue
+		}
+		if state.InProgress() && state.Revision == revision {
+			// Already patched by an earlier sync; only keep it accounted as unavailable.
+			if err := c.markPodUnavailable(ms, groupName, pod); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := c.ensureTargetRevision(ctx, ms, revision); err != nil {
+			return err
+		}
+		patched, err := inplace.Start(ctx, c.kubeClientSet, pod, inplace.TargetImages(ms, pod), revision, time.Now())
+		if err != nil {
+			return err
+		}
+		if patched {
+			started = true
+			klog.V(2).Infof("Pod %s/%s is updated in place to revision %s", pod.Namespace, pod.Name, revision)
+		}
+		if err := c.markPodUnavailable(ms, groupName, pod); err != nil {
+			return err
+		}
+	}
+	if started {
+		c.emitRoleStatusEvent(ms, corev1.EventTypeNormal, "InPlaceUpdateStarted",
+			fmt.Sprintf("Updating images in place in ServingGroup %s to revision %s", groupName, revision))
+	}
+	return nil
+}
+
+// ensureTargetRevision persists the target template so a later recovery never depends
+// on the mutable spec. An existing revision is kept as is: role replicas are not part
+// of the revision hash, so re-creating it mid-rollout would fail on a data mismatch.
+func (c *ModelServingController) ensureTargetRevision(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
+	round := roundOf(ctx)
+	if round.targetStored {
+		return nil
+	}
 	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
 	if err != nil {
 		return err
@@ -234,23 +353,7 @@ func (c *ModelServingController) startInPlaceUpdate(ctx context.Context, ms *wor
 			return err
 		}
 	}
-	for _, pod := range pods {
-		if utils.ObjectRevision(pod) == revision && !inplace.InProgress(pod) {
-			continue
-		}
-		started, err := inplace.Start(ctx, c.kubeClientSet, pod, inplace.TargetImages(ms, pod), revision, time.Now())
-		if err != nil {
-			return err
-		}
-		if started {
-			klog.V(2).Infof("Pod %s/%s is updated in place to revision %s", pod.Namespace, pod.Name, revision)
-		}
-		if err := c.markPodUnavailable(ms, groupName, pod); err != nil {
-			return err
-		}
-	}
-	c.emitRoleStatusEvent(ms, corev1.EventTypeNormal, "InPlaceUpdateStarted",
-		fmt.Sprintf("Updating images in place in ServingGroup %s to revision %s", groupName, revision))
+	round.targetStored = true
 	return nil
 }
 
@@ -261,6 +364,8 @@ type inPlaceUnit struct {
 	roleName string
 	roleID   string
 	pods     []*corev1.Pod
+	// states[i] is the decoded in-place state of pods[i], nil when it has none.
+	states []*inplace.State
 }
 
 // completeInPlaceUpdates finishes in-place updates. It is level-triggered: it only
@@ -309,30 +414,33 @@ func splitInPlaceUnits(ms *workloadv1alpha1.ModelServing, groupName string, pods
 			units = append(units, unit)
 		}
 		unit.pods = append(unit.pods, pod)
+		unit.states = append(unit.states, inplace.StateOf(pod))
 	}
 	return units
 }
 
 func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, revision string) error {
 	var earliest time.Time
-	inProgress := false
-	for _, pod := range unit.pods {
+	inProgress, retargeted := false, false
+	for i, pod := range unit.pods {
 		if utils.IsPodTerminating(pod) {
 			return nil
 		}
-		state := inplace.StateOf(pod)
+		state := unit.states[i]
 		if state == nil || state.Done {
 			continue
 		}
 		inProgress = true
 		if state.Revision != revision {
-			if utils.ObjectRevision(pod) == revision {
+			if utils.ObjectRevision(pod) == revision || c.roleRevertedTo(ms, unit, pod) {
 				// The spec went back to the revision the Pod is labelled with, so the rollout
 				// treats it as up to date although its images were already patched away.
 				return c.recreateInPlaceUnit(ctx, ms, unit)
 			}
 			// The desired revision moved on; the regular rollout re-patches this unit.
-			return nil
+			// It may never select it (for example a raised partition), so keep the
+			// deadline running meanwhile, but never complete it towards the new revision.
+			retargeted = true
 		}
 		if earliest.IsZero() || state.StartedAt.Time.Before(earliest) {
 			earliest = state.StartedAt.Time
@@ -343,12 +451,24 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 		return nil
 	}
 
-	if !unitCompleted(unit.pods, revision) {
+	if !retargeted && hasUnpatchedOutdatedPod(unit, revision) {
+		// Resume independently of the rollout budget and partition, so a unit never stays half patched.
+		return c.resumeInPlaceUnit(ctx, ms, unit)
+	}
+
+	if retargeted {
+		if unitSettled(unit) {
+			return nil
+		}
 		return c.enforceInPlaceDeadline(ctx, ms, unit, earliest)
 	}
 
-	for _, pod := range unit.pods {
-		if !inplace.InProgress(pod) {
+	if !unitCompleted(unit, revision) {
+		return c.enforceInPlaceDeadline(ctx, ms, unit, earliest)
+	}
+
+	for i, pod := range unit.pods {
+		if !unit.states[i].InProgress() {
 			continue
 		}
 		if err := inplace.Complete(ctx, c.kubeClientSet, pod, revision, c.roleTemplateHashOf(ms, pod)); err != nil {
@@ -367,11 +487,11 @@ func (c *ModelServingController) reconcileInPlaceUnit(ctx context.Context, ms *w
 // patch persisted but its response was lost, and the retry found nothing in progress).
 func (c *ModelServingController) repairInPlaceRevision(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, revision string) {
 	flipped := false
-	for _, pod := range unit.pods {
+	for i, pod := range unit.pods {
 		if utils.ObjectRevision(pod) != revision {
 			return
 		}
-		if state := inplace.StateOf(pod); state != nil && state.Done && state.Revision == revision {
+		if state := unit.states[i]; state != nil && state.Done && state.Revision == revision {
 			flipped = true
 		}
 	}
@@ -382,15 +502,47 @@ func (c *ModelServingController) repairInPlaceRevision(ms *workloadv1alpha1.Mode
 
 // unitCompleted is true once every Pod has restarted with its new image and is Ready.
 // Pods that were never part of the update must already carry the target revision.
-func unitCompleted(pods []*corev1.Pod, revision string) bool {
-	for _, pod := range pods {
-		if inplace.InProgress(pod) {
-			if !inplace.Completed(pod) {
+func unitCompleted(unit *inPlaceUnit, revision string) bool {
+	for i, pod := range unit.pods {
+		if unit.states[i].InProgress() {
+			if !unit.states[i].Completed(pod) {
 				return false
 			}
 			continue
 		}
 		if utils.ObjectRevision(pod) != revision {
+			return false
+		}
+	}
+	return true
+}
+
+// roleRevertedTo detects a revert at Role level: the spec went back to the template the Role
+// was created from, while other Roles changed, so the overall revision differs from the Pod's.
+// The rollout would skip the Role as up to date although its images were already patched away.
+func (c *ModelServingController) roleRevertedTo(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, pod *corev1.Pod) bool {
+	if unit.roleName == "" {
+		return false
+	}
+	hash := utils.ObjectRoleTemplateHash(pod)
+	return hash != "" && hash == c.roleTemplateHashOf(ms, pod)
+}
+
+// hasUnpatchedOutdatedPod is true when some Pod of a unit, whose other Pods were patched,
+// still has to be patched for revision (an earlier Start failed halfway).
+func hasUnpatchedOutdatedPod(unit *inPlaceUnit, revision string) bool {
+	for i, pod := range unit.pods {
+		if !unit.states[i].InProgress() && utils.ObjectRevision(pod) != revision && !utils.IsPodTerminating(pod) {
+			return true
+		}
+	}
+	return false
+}
+
+// unitSettled is true when every Pod that is mid-update has finished its own update.
+func unitSettled(unit *inPlaceUnit) bool {
+	for i, pod := range unit.pods {
+		if unit.states[i].InProgress() && !unit.states[i].Completed(pod) {
 			return false
 		}
 	}
@@ -407,9 +559,35 @@ func (c *ModelServingController) enforceInPlaceDeadline(ctx context.Context, ms 
 		c.enqueueModelServingAfter(ms, remaining)
 		return nil
 	}
-	c.emitRoleStatusEvent(ms, corev1.EventTypeWarning, "InPlaceUpdateFallback",
-		fmt.Sprintf("In-place update of ServingGroup %s exceeded progress deadline %s, recreating", unit.groupName, deadline))
-	return c.recreateInPlaceUnit(ctx, ms, unit)
+	return c.handleInPlaceTimeout(ms, unit, deadline)
+}
+
+// handleInPlaceTimeout treats the Pods that did not finish in time as error Pods, so the
+// recovery policy decides what happens: ServingGroupRecreate and RoleRecreate go through
+// handleErrorPod (grace period, deletion, then recreation of the Role or ServingGroup),
+// while None leaves the Pods alone like a plain Deployment would.
+func (c *ModelServingController) handleInPlaceTimeout(ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit, deadline time.Duration) error {
+	c.emitRoleStatusEvent(ms, corev1.EventTypeWarning, "InPlaceUpdateTimeout",
+		fmt.Sprintf("In-place update of ServingGroup %s exceeded progress deadline %s, applying recovery policy %s", unit.groupName, deadline, ms.Spec.RecoveryPolicy))
+	if ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy {
+		return nil
+	}
+	for i, pod := range unit.pods {
+		if !unit.states[i].InProgress() || unit.states[i].Completed(pod) {
+			continue
+		}
+		if err := c.handleErrorPod(ms, unit.groupName, pod); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ModelServingController) resumeInPlaceUnit(ctx context.Context, ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit) error {
+	if unit.roleName == "" {
+		return c.updateServingGroup(ctx, ms, datastore.ServingGroup{Name: unit.groupName})
+	}
+	return c.updateRole(ctx, ms, unit.groupName, unit.roleName, unit.roleID)
 }
 
 func (c *ModelServingController) recreateInPlaceUnit(ctx context.Context, ms *workloadv1alpha1.ModelServing, unit *inPlaceUnit) error {

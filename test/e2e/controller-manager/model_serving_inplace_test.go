@@ -18,6 +18,7 @@ package controller_manager
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 
@@ -45,20 +47,23 @@ type podSnapshot struct {
 	role string
 }
 
-func newInPlaceModelServing(name string, strategy workload.RolloutStrategyType) *workload.ModelServing {
-	prefill := createRole("prefill", 2, 0)
+// newInPlaceModelServing builds a ModelServing with servingGroups ServingGroups. With
+// ServingGroupRollingUpdate maxUnavailable limits the ServingGroups updated at once; with
+// RoleRollingUpdate it limits the prefill Role replicas (prefillReplicas) updated at once.
+func newInPlaceModelServing(name string, strategy workload.RolloutStrategyType, servingGroups, prefillReplicas int32, maxUnavailable int) *workload.ModelServing {
+	prefill := createRole("prefill", prefillReplicas, 0)
 	decode := createRole("decode", 1, 0)
 	rollout := &workload.RolloutStrategy{
 		Type:         strategy,
 		UpdateMethod: workload.InPlaceUpdateMethod,
 	}
 	if strategy == workload.RoleRollingUpdate {
-		prefill.MaxUnavailable = ptr.To(intstr.FromInt(1))
+		prefill.MaxUnavailable = ptr.To(intstr.FromInt(maxUnavailable))
 		decode.MaxUnavailable = ptr.To(intstr.FromInt(1))
 	} else {
-		rollout.RollingUpdateConfiguration = &workload.RollingUpdateConfiguration{MaxUnavailable: ptr.To(intstr.FromInt(1))}
+		rollout.RollingUpdateConfiguration = &workload.RollingUpdateConfiguration{MaxUnavailable: ptr.To(intstr.FromInt(maxUnavailable))}
 	}
-	ms := createBasicModelServing(name, 2, 0, prefill, decode)
+	ms := createBasicModelServing(name, servingGroups, 0, prefill, decode)
 	ms.Spec.RecoveryPolicy = workload.RoleRecreate
 	ms.Spec.RolloutStrategy = rollout
 	return ms
@@ -124,6 +129,64 @@ func waitForInPlaceUpdated(t *testing.T, ctx context.Context, kubeClient *kubern
 		}
 		return true
 	}, inPlaceUpdateTimeout, 2*time.Second, "pods of roles %v should be updated in place to %s", updatedRoles, image)
+}
+
+// trackUnavailableUnits watches the Pods of a ModelServing and records the largest number of update
+// units that were unavailable at the same time. unitOf maps a Pod to its unit (a ServingGroup or a
+// Role replica) and reports false for Pods that are not part of the update. A unit is unavailable
+// while any of its Pods is not Ready or has an unfinished in-place update. The returned function
+// stops the watch and returns the peak.
+func trackUnavailableUnits(t *testing.T, ctx context.Context, kubeClient *kubernetes.Clientset, msName string, unitOf func(corev1.Pod) (string, bool)) func() int {
+	t.Helper()
+	watchCtx, cancel := context.WithCancel(ctx)
+	watcher, err := kubeClient.CoreV1().Pods(testNamespace).Watch(watchCtx, metav1.ListOptions{LabelSelector: modelServingLabelSelector(msName)})
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	peak := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pods := map[string]corev1.Pod{}
+		for event := range watcher.ResultChan() {
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			if event.Type == watch.Deleted {
+				delete(pods, pod.Name)
+			} else {
+				pods[pod.Name] = *pod
+			}
+			unavailable := map[string]bool{}
+			for _, p := range pods {
+				if unit, ok := unitOf(p); ok && (!isPodReady(p) || inplace.InProgress(&p)) {
+					unavailable[unit] = true
+				}
+			}
+			mu.Lock()
+			if len(unavailable) > peak {
+				peak = len(unavailable)
+			}
+			mu.Unlock()
+		}
+	}()
+	return func() int {
+		cancel()
+		watcher.Stop()
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		return peak
+	}
+}
+
+// assertUpdateSteps checks that units were never unavailable beyond maxUnavailable, and that
+// more than one unit was updated at once, so the update ran in batches and not one by one.
+func assertUpdateSteps(t *testing.T, peak, maxUnavailable int, units string) {
+	t.Helper()
+	assert.LessOrEqual(t, peak, maxUnavailable, "%s exceeded maxUnavailable", units)
+	assert.Greater(t, peak, 1, "%s were updated one at a time instead of in steps of maxUnavailable", units)
 }
 
 // assertNoPodRecreated fails when a Pod from before the update is gone or has a new UID.
@@ -193,15 +256,20 @@ func createInPlaceModelServing(t *testing.T, ctx context.Context, kthenaClient *
 // image-only change patches the existing Pods of every ServingGroup instead of recreating them.
 func TestModelServingInPlaceUpdateServingGroup(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
-	ms := newInPlaceModelServing("test-inplace-servinggroup", workload.ServingGroupRollingUpdate)
+	const servingGroups, maxUnavailable = 4, 2
+	ms := newInPlaceModelServing("test-inplace-servinggroup", workload.ServingGroupRollingUpdate, servingGroups, 2, maxUnavailable)
 	createInPlaceModelServing(t, ctx, kthenaClient, ms)
 
 	before := snapshotPods(t, ctx, kubeClient, ms.Name)
+	stopTracking := trackUnavailableUnits(t, ctx, kubeClient, ms.Name, func(pod corev1.Pod) (string, bool) {
+		return pod.Labels[workload.GroupNameLabelKey], true
+	})
 	t.Logf("Updating image of all roles in place, %d pods before update", len(before))
 	updateModelServingWithRetry(t, ctx, kthenaClient, ms.Name, setImages(nginxAlpineImage))
 
 	waitForInPlaceUpdated(t, ctx, kubeClient, ms.Name, nginxAlpineImage, "prefill", "decode")
 	utilsWaitReady(t, ctx, kthenaClient, ms.Name)
+	assertUpdateSteps(t, stopTracking(), maxUnavailable, "ServingGroups")
 
 	assertNoPodRecreated(t, ctx, kubeClient, ms.Name, before)
 	for _, pod := range listPodsByName(t, ctx, kubeClient, ms.Name) {
@@ -215,15 +283,23 @@ func TestModelServingInPlaceUpdateServingGroup(t *testing.T) {
 // Role whose image changed are restarted, and that they are patched rather than recreated.
 func TestModelServingInPlaceUpdateRole(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
-	ms := newInPlaceModelServing("test-inplace-role", workload.RoleRollingUpdate)
+	const prefillReplicas, maxUnavailable = 4, 2
+	ms := newInPlaceModelServing("test-inplace-role", workload.RoleRollingUpdate, 1, prefillReplicas, maxUnavailable)
 	createInPlaceModelServing(t, ctx, kthenaClient, ms)
 
 	before := snapshotPods(t, ctx, kubeClient, ms.Name)
+	stopTracking := trackUnavailableUnits(t, ctx, kubeClient, ms.Name, func(pod corev1.Pod) (string, bool) {
+		if pod.Labels[workload.RoleLabelKey] != "prefill" {
+			return "", false
+		}
+		return pod.Labels[workload.GroupNameLabelKey] + "/" + pod.Labels[workload.RoleIDKey], true
+	})
 	t.Log("Updating image of the prefill role in place")
 	updateModelServingWithRetry(t, ctx, kthenaClient, ms.Name, setImages(nginxAlpineImage, "prefill"))
 
 	waitForInPlaceUpdated(t, ctx, kubeClient, ms.Name, nginxAlpineImage, "prefill")
 	utilsWaitReady(t, ctx, kthenaClient, ms.Name)
+	assertUpdateSteps(t, stopTracking(), maxUnavailable, "prefill Role replicas")
 
 	assertNoPodRecreated(t, ctx, kubeClient, ms.Name, before)
 	for name, pod := range listPodsByName(t, ctx, kubeClient, ms.Name) {
@@ -256,7 +332,7 @@ func TestModelServingInPlaceUpdateFallsBackToRecreate(t *testing.T) {
 			ms := newInPlaceModelServing("test-inplace-fallback-"+map[workload.RolloutStrategyType]string{
 				workload.ServingGroupRollingUpdate: "sg",
 				workload.RoleRollingUpdate:         "role",
-			}[tt.strategy], tt.strategy)
+			}[tt.strategy], tt.strategy, 2, 2, 1)
 			createInPlaceModelServing(t, ctx, kthenaClient, ms)
 
 			before := snapshotPods(t, ctx, kubeClient, ms.Name)

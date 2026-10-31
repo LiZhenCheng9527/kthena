@@ -48,6 +48,8 @@ func podWithState(t *testing.T, state *State, ready bool, status corev1.Containe
 		raw, err := json.Marshal(state)
 		require.NoError(t, err)
 		pod.Annotations[workloadv1alpha1.InPlaceUpdateStateAnnotationKey] = string(raw)
+		// The live spec carries the image the update asked for.
+		pod.Spec.Containers = []corev1.Container{{Name: "main", Image: state.Patched["main"].Image}}
 	}
 	return pod
 }
@@ -189,6 +191,7 @@ func TestStateOfMigratesLegacyAnnotation(t *testing.T) {
 	annotate := func(raw string) *corev1.Pod {
 		pod := podWithState(t, nil, true, corev1.ContainerStatus{RestartCount: 1, ContainerID: "c2", Image: "app:v2", ImageID: "id2"})
 		pod.Annotations[workloadv1alpha1.InPlaceUpdateStateAnnotationKey] = raw
+		pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "app:v2"}}
 		return pod
 	}
 	tests := []struct {
@@ -253,6 +256,95 @@ func TestCompleteDropsUnusedRestartAllowance(t *testing.T) {
 			require.NotNil(t, done)
 			assert.True(t, done.Done)
 			assert.Equal(t, tt.want, done.Expected["main"])
+		})
+	}
+}
+
+func TestStartBaselinesEarlierRestarts(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p", UID: "uid", ResourceVersion: "1"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "app:v1"}, {Name: "side", Image: "side:v1"}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "main", RestartCount: 1, ContainerID: "c1", ImageID: "id1"},
+				{Name: "side", ContainerID: "s1"},
+			},
+		},
+	}
+	client := kubefake.NewSimpleClientset(pod)
+
+	_, err := Start(context.Background(), client, pod, map[string]string{"main": "app:v2", "side": "side:v1"}, "v2", time.Now())
+	require.NoError(t, err)
+	got, err := client.CoreV1().Pods("ns").Get(context.Background(), "p", metav1.GetOptions{})
+	require.NoError(t, err)
+	state := StateOf(got)
+	require.NotNil(t, state)
+	assert.Equal(t, map[string]int32{"main": 2}, state.Expected, "earlier restart plus the update restart")
+
+	// kubelet restarts main for the update, which is not a crash.
+	got.Status = pod.Status
+	kubeletRestart := &got.Status.ContainerStatuses[0]
+	kubeletRestart.RestartCount, kubeletRestart.ContainerID, kubeletRestart.Image, kubeletRestart.ImageID = 2, "c2", "app:v2", "id2"
+	assert.False(t, UnexpectedRestart(got))
+	assert.True(t, Completed(got))
+}
+
+func TestCompletedRequiresLiveSpecToKeepTargetImage(t *testing.T) {
+	state := &State{
+		Revision: "v2",
+		Patched:  map[string]PatchedContainer{"main": {Image: "registry/app:v2", PrevContainerID: "c1", PrevImageID: "id1"}},
+		Expected: map[string]int32{"main": 1},
+	}
+	// A new container with a changed image ID would pass the runtime checks on its own.
+	status := corev1.ContainerStatus{RestartCount: 1, ContainerID: "c2", Image: "registry/app:v3", ImageID: "id3"}
+	tests := []struct {
+		name       string
+		containers []corev1.Container
+		want       bool
+	}{
+		{name: "spec still asks for the target image", containers: []corev1.Container{{Name: "main", Image: "registry/app:v2"}}, want: true},
+		{name: "spec was edited to another image", containers: []corev1.Container{{Name: "main", Image: "registry/app:v3"}}},
+		{name: "container is gone from the spec", containers: []corev1.Container{{Name: "other", Image: "registry/app:v2"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := podWithState(t, state, true, status)
+			pod.Spec.Containers = tt.containers
+			assert.Equal(t, tt.want, Completed(pod))
+		})
+	}
+}
+
+func TestMissingContainers(t *testing.T) {
+	ms := &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{
+		Roles: []workloadv1alpha1.Role{{Name: "prefill", EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "a", Image: "i:2"}, {Name: "b", Image: "j:2"}}},
+		}}},
+	}}}
+	pod := func(names ...string) *corev1.Pod {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			workloadv1alpha1.RoleLabelKey: "prefill", workloadv1alpha1.EntryLabelKey: "true",
+		}}}
+		for _, name := range names {
+			p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: name})
+		}
+		return p
+	}
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want []string
+	}{
+		{name: "all containers exist", pod: pod("a", "b")},
+		{name: "extra injected container is fine", pod: pod("a", "b", "sidecar")},
+		{name: "renamed container", pod: pod("a", "renamed"), want: []string{"b"}},
+		{name: "all missing", pod: pod("x"), want: []string{"a", "b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, MissingContainers(ms, tt.pod))
 		})
 	}
 }

@@ -18,6 +18,7 @@ package controller_manager
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -144,11 +146,18 @@ func trackUnavailableUnits(t *testing.T, ctx context.Context, kubeClient *kubern
 
 	var mu sync.Mutex
 	peak := 0
+	var watchErr error
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		pods := map[string]corev1.Pod{}
 		for event := range watcher.ResultChan() {
+			if event.Type == watch.Error {
+				mu.Lock()
+				watchErr = fmt.Errorf("watch error: %v", apierrors.FromObject(event.Object))
+				mu.Unlock()
+				return
+			}
 			pod, ok := event.Object.(*corev1.Pod)
 			if !ok {
 				continue
@@ -170,6 +179,11 @@ func trackUnavailableUnits(t *testing.T, ctx context.Context, kubeClient *kubern
 			}
 			mu.Unlock()
 		}
+		if watchCtx.Err() == nil {
+			mu.Lock()
+			watchErr = fmt.Errorf("watch closed before the update finished")
+			mu.Unlock()
+		}
 	}()
 	return func() int {
 		cancel()
@@ -177,6 +191,8 @@ func trackUnavailableUnits(t *testing.T, ctx context.Context, kubeClient *kubern
 		<-done
 		mu.Lock()
 		defer mu.Unlock()
+		// A broken watch means the peak may be incomplete, so it cannot prove the budget held.
+		require.NoError(t, watchErr, "the unavailable-unit tracker lost its watch")
 		return peak
 	}
 }

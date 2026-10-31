@@ -83,8 +83,12 @@ func TestStatePredicates(t *testing.T) {
 		{name: "started, restarted but not ready", state: started, status: updated, wantInProgress: true, wantUpdating: true},
 		{name: "started, restarted and ready", state: started, ready: true, status: updated, wantInProgress: true, wantCompleted: true},
 		{
-			name: "started, old image crashed and restarted", state: started, ready: true, wantInProgress: true, wantUpdating: true,
+			name: "started, old image crashed and restarted", state: started, ready: true, wantInProgress: true, wantUpdating: true, wantUnexpectedRestart: true,
 			status: corev1.ContainerStatus{RestartCount: 2, ContainerID: "c2", Image: "registry/app:v1", ImageID: "id1"},
+		},
+		{
+			name: "started, extra crash on the target image is not completed", state: started, ready: true, wantInProgress: true, wantUpdating: true, wantUnexpectedRestart: true,
+			status: corev1.ContainerStatus{RestartCount: 3, ContainerID: "c3", Image: "registry/app:v2", ImageID: "id2"},
 		},
 		{
 			name: "started, runtime reports normalized name", state: started, ready: true, wantInProgress: true, wantCompleted: true,
@@ -347,4 +351,61 @@ func TestMissingContainers(t *testing.T) {
 			assert.Equal(t, tt.want, MissingContainers(ms, tt.pod))
 		})
 	}
+}
+
+func TestImagesToPatch(t *testing.T) {
+	pod := func(images map[string]string, state *State) *corev1.Pod {
+		p := podWithState(t, state, true, corev1.ContainerStatus{})
+		p.Spec.Containers = nil
+		for _, name := range []string{"main", "sidecar"} {
+			if image, ok := images[name]; ok {
+				p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: name, Image: image})
+			}
+		}
+		return p
+	}
+	target := map[string]string{"main": "app:v2", "sidecar": "side:v1"}
+	source := map[string]string{"main": "app:v1", "sidecar": "side:v1"}
+
+	tests := []struct {
+		name       string
+		pod        *corev1.Pod
+		target     map[string]string
+		source     map[string]string
+		wantImages map[string]string
+		wantDrift  []string
+	}{
+		{name: "changed container on the source image", pod: pod(source, nil), target: target, source: source, wantImages: map[string]string{"main": "app:v2"}},
+		{name: "unchanged container rewritten by a webhook is kept", pod: pod(map[string]string{"main": "app:v1", "sidecar": "side:injected"}, nil), target: target, source: source, wantImages: map[string]string{"main": "app:v2"}},
+		{name: "changed container rewritten by a webhook is drift", pod: pod(map[string]string{"main": "app:injected", "sidecar": "side:v1"}, nil), target: target, source: source, wantImages: map[string]string{}, wantDrift: []string{"main"}},
+		{
+			name: "container patched by an unfinished update is patched again", target: map[string]string{"main": "app:v3"}, source: source,
+			pod:        pod(map[string]string{"main": "app:v2"}, &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}}),
+			wantImages: map[string]string{"main": "app:v3"},
+		},
+		{
+			name: "earlier patched container edited externally is drift", target: map[string]string{"main": "app:v3"}, source: source,
+			pod:        pod(map[string]string{"main": "app:hotfix"}, &State{Revision: "v2", Patched: map[string]PatchedContainer{"main": {Image: "app:v2"}}}),
+			wantImages: map[string]string{}, wantDrift: []string{"main"},
+		},
+		{name: "no source patches only earlier patched containers", pod: pod(source, nil), target: target, wantImages: map[string]string{}, wantDrift: []string{"main"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			images, drift := ImagesToPatch(tt.pod, tt.target, tt.source)
+			assert.Equal(t, tt.wantImages, images)
+			assert.Equal(t, tt.wantDrift, drift)
+		})
+	}
+}
+
+func TestOnTargetIgnoresCrashes(t *testing.T) {
+	state := &State{
+		Revision: "v2",
+		Patched:  map[string]PatchedContainer{"main": {Image: "registry/app:v2", PrevContainerID: "c1", PrevImageID: "id1"}},
+		Expected: map[string]int32{"main": 2},
+	}
+	pod := podWithState(t, state, true, corev1.ContainerStatus{RestartCount: 3, ContainerID: "c3", Image: "registry/app:v2", ImageID: "id2"})
+	assert.True(t, OnTarget(pod))
+	assert.False(t, Completed(pod))
 }

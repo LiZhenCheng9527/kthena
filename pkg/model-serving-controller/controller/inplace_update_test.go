@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -267,9 +268,28 @@ func TestCompleteInPlaceUpdates(t *testing.T) {
 	tests := []struct {
 		name        string
 		startedAgo  time.Duration
+		policy      workloadv1alpha1.RecoveryPolicy
 		status      func(*corev1.ContainerStatus)
 		wantFlipped bool
 	}{
+		{
+			name:       "extra crash on the target image waits for recovery",
+			startedAgo: time.Minute,
+			status: func(s *corev1.ContainerStatus) {
+				kubeletRestart("img:v2", "id-v2")(s)
+				kubeletRestart("img:v2", "id-v2b")(s)
+			},
+		},
+		{
+			name:       "extra crash on the target image completes with recoveryPolicy None",
+			startedAgo: time.Minute,
+			policy:     workloadv1alpha1.NoneRestartPolicy,
+			status: func(s *corev1.ContainerStatus) {
+				kubeletRestart("img:v2", "id-v2")(s)
+				kubeletRestart("img:v2", "id-v2b")(s)
+			},
+			wantFlipped: true,
+		},
 		{
 			name:        "restarted and ready flips the revision",
 			startedAgo:  time.Minute,
@@ -295,7 +315,11 @@ func TestCompleteInPlaceUpdates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newInPlaceFixture(t, nil, nil)
+			f := newInPlaceFixture(t, func(ms *workloadv1alpha1.ModelServing) {
+				if tt.policy != "" {
+					ms.Spec.RecoveryPolicy = tt.policy
+				}
+			}, nil)
 			ctx := context.Background()
 			sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
 			require.NoError(t, f.controller.updateServingGroup(ctx, f.newMS, sg))
@@ -325,7 +349,9 @@ func TestCompleteInPlaceUpdates(t *testing.T) {
 				revision, ok := f.controller.store.GetServingGroupRevision(utils.GetNamespaceName(f.newMS), inPlaceTestGroup)
 				assert.True(t, ok)
 				assert.Equal(t, f.newRev, revision)
-				assert.False(t, inplace.UnexpectedRestart(got), "the expected restart must not trigger recovery")
+				if tt.policy != workloadv1alpha1.NoneRestartPolicy {
+					assert.False(t, inplace.UnexpectedRestart(got), "the expected restart must not trigger recovery")
+				}
 			}
 		})
 	}
@@ -865,6 +891,63 @@ func TestPartiallyStartedUnitIsResumed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "img:v2", got.Spec.Containers[0].Image)
 	assert.True(t, inplace.InProgress(got))
+}
+
+func TestCompleteInPlaceUpdatesFailsOnUnknownStoreError(t *testing.T) {
+	f := newInPlaceFixture(t, nil, nil)
+	f.controller.store = datastore.New()
+	require.NoError(t, f.controller.completeInPlaceUpdates(context.Background(), f.newMS, f.newRev), "no ServingGroup yet is not an error")
+}
+
+func TestImageRewrittenAfterCreationIsRecreated(t *testing.T) {
+	f := newInPlaceFixture(t, nil, func(pod *corev1.Pod) { pod.Spec.Containers[0].Image = "img:webhook" })
+	sg := datastore.ServingGroup{Name: inPlaceTestGroup, Revision: f.oldRev, Status: datastore.ServingGroupRunning}
+
+	require.NoError(t, f.controller.updateServingGroup(context.Background(), f.newMS, sg))
+
+	assert.Equal(t, datastore.ServingGroupDeleting, f.controller.store.GetServingGroupStatus(utils.GetNamespaceName(f.newMS), inPlaceTestGroup))
+	assert.Nil(t, inplace.StateOf(f.syncPodFromAPI(t)))
+}
+
+func TestHalfPatchedUnitHitsDeadline(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     workloadv1alpha1.RecoveryPolicy
+		wantDelete bool
+	}{
+		{name: "RoleRecreate deletes the never patched Pod", policy: workloadv1alpha1.RoleRecreate, wantDelete: true},
+		{name: "None keeps resuming", policy: workloadv1alpha1.NoneRestartPolicy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newInPlaceFixture(t, func(ms *workloadv1alpha1.ModelServing) {
+				ms.Spec.RolloutStrategy.ProgressDeadlineSeconds = ptr.To[int32](60)
+				ms.Spec.RecoveryPolicy = tt.policy
+			}, nil)
+			ctx := context.Background()
+			second := f.syncPodFromAPI(t).DeepCopy()
+			second.Name, second.UID, second.ResourceVersion = "ms-0-prefill-0-extra", "pod-uid-2", ""
+			_, err := f.kubeClient.CoreV1().Pods("default").Create(ctx, second, metav1.CreateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, f.controller.podsInformer.GetIndexer().Add(second))
+			_, err = inplace.Start(ctx, f.kubeClient, f.syncPodFromAPI(t), map[string]string{"prefill-container": "img:v2"}, f.newRev, time.Now())
+			require.NoError(t, err)
+			expireInPlaceDeadline(t, f)
+			f.kubeClient.ClearActions()
+
+			require.NoError(t, f.controller.completeInPlaceUpdates(ctx, f.newMS, f.newRev))
+
+			got, err := f.kubeClient.CoreV1().Pods("default").Get(ctx, second.Name, metav1.GetOptions{})
+			if tt.wantDelete {
+				assert.True(t, podDeleted(f))
+				assert.True(t, apierrors.IsNotFound(err))
+				return
+			}
+			require.NoError(t, err)
+			assert.False(t, podDeleted(f))
+			assert.True(t, inplace.InProgress(got), "None retries the patch")
+		})
+	}
 }
 
 func TestGraceTimeKeepsOnlyPodsThatFinishedTheUpdate(t *testing.T) {

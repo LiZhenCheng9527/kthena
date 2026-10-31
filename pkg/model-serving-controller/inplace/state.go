@@ -142,6 +142,11 @@ func Completed(pod *corev1.Pod) bool {
 	return StateOf(pod).Completed(pod)
 }
 
+// OnTarget is the package-level form of State.OnTarget.
+func OnTarget(pod *corev1.Pod) bool {
+	return StateOf(pod).OnTarget(pod)
+}
+
 // Updating reports whether the Pod is mid-update: started, but not yet Completed.
 func Updating(pod *corev1.Pod) bool {
 	return StateOf(pod).Updating(pod)
@@ -166,6 +171,14 @@ func (s *State) InProgress() bool {
 // a crash of the old container, and it also covers a container that never started
 // before (restart count stays 0).
 func (s *State) Completed(pod *corev1.Pod) bool {
+	// A crash on top of the update restart must go through recovery first.
+	return s.OnTarget(pod) && !s.UnexpectedRestart(pod)
+}
+
+// OnTarget is Completed without the crash check: every patched container runs its target
+// image in a fresh instance and the Pod is Ready. It lets recoveryPolicy None, which never
+// restarts a crashed Pod, finish an update whose containers recovered by themselves.
+func (s *State) OnTarget(pod *corev1.Pod) bool {
 	if !s.InProgress() || !utils.IsPodRunningAndReady(pod) {
 		return false
 	}
@@ -175,15 +188,20 @@ func (s *State) Completed(pod *corev1.Pod) bool {
 		if !specRequests(pod, name, patched.Image) {
 			return false
 		}
-		status := containerStatus(pod, name)
-		if status == nil || status.ContainerID == "" || status.ContainerID == patched.PrevContainerID {
-			return false
-		}
-		if !sameImage(status.Image, patched.Image) && !imageIDChanged(status.ImageID, patched.PrevImageID) {
+		if status := containerStatus(pod, name); status == nil || !ranTarget(status, patched) {
 			return false
 		}
 	}
 	return true
+}
+
+// ranTarget reports whether the current container instance was started after the patch
+// and runs the target image.
+func ranTarget(status *corev1.ContainerStatus, patched PatchedContainer) bool {
+	if status.ContainerID == "" || status.ContainerID == patched.PrevContainerID {
+		return false
+	}
+	return sameImage(status.Image, patched.Image) || imageIDChanged(status.ImageID, patched.PrevImageID)
 }
 
 // Updating is the method form of the package-level Updating.
@@ -211,8 +229,22 @@ func (s *State) UnexpectedRestart(pod *corev1.Pod) bool {
 		if status.RestartCount > expected {
 			return true
 		}
+		// The allowance is used up, but by a crash of the old container instead of the
+		// update restart when the new instance does not run the target image.
+		if patched, ok := s.patchedContainer(status.Name); ok && status.RestartCount == expected &&
+			status.ContainerID != patched.PrevContainerID && status.ContainerID != "" && !ranTarget(&status, patched) {
+			return true
+		}
 	}
 	return false
+}
+
+func (s *State) patchedContainer(name string) (PatchedContainer, bool) {
+	if !s.InProgress() {
+		return PatchedContainer{}, false
+	}
+	patched, ok := s.Patched[name]
+	return patched, ok
 }
 
 // TargetImages returns the images the Pod's containers should run in ms.
@@ -230,6 +262,34 @@ func TargetImages(ms *workloadv1alpha1.ModelServing, pod *corev1.Pod) map[string
 		images[container.Name] = container.Image
 	}
 	return images
+}
+
+// ImagesToPatch selects, out of the target images, the containers that really have to
+// change: those the update patched before, and those still running the image of the
+// source template. A container whose live image matches neither was rewritten after
+// creation (for example by a webhook). It is left alone when the template does not
+// change it, and reported as drift otherwise, because overwriting it would be a guess.
+func ImagesToPatch(pod *corev1.Pod, target, source map[string]string) (images map[string]string, drift []string) {
+	prior := StateOf(pod)
+	images = map[string]string{}
+	for _, container := range pod.Spec.Containers {
+		want, ok := target[container.Name]
+		if !ok || want == container.Image {
+			continue
+		}
+		earlier, patchedBefore := prior.patchedContainer(container.Name)
+		src, known := source[container.Name]
+		switch {
+		// An earlier patch only proves ownership while the live image is still what it wrote.
+		case (patchedBefore && container.Image == earlier.Image) || (known && container.Image == src):
+			images[container.Name] = want
+		case known && src == want:
+		default:
+			drift = append(drift, container.Name)
+		}
+	}
+	sort.Strings(drift)
+	return images, drift
 }
 
 func specRequests(pod *corev1.Pod, name, image string) bool {
